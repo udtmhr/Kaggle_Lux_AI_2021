@@ -1,0 +1,9 @@
+defaults:
+- survival_strategic
+- _self_
+
+name: conv16_matched_v1
+model_arch: conv16_matched
+hidden_dim: 68
+attention_blocks: 0
+n_heads: 1

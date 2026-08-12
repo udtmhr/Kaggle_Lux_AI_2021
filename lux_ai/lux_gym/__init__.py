@@ -42,7 +42,13 @@ def create_flexible_obs_space(flags, teacher_flags: Optional) -> obs_spaces.Base
         return flags.obs_space(**flags.obs_space_kwargs)
 
 
-def create_env(flags, device: torch.device, teacher_flags: Optional = None, seed: Optional[int] = None) -> DictEnv:
+def create_env(
+    flags,
+    device: torch.device,
+    teacher_flags: Optional = None,
+    seed: Optional[int] = None,
+    reward_game_counter=None,
+) -> DictEnv:
     if seed is None:
         seed = flags.seed
     envs = []
@@ -52,7 +58,7 @@ def create_env(flags, device: torch.device, teacher_flags: Optional = None, seed
             obs_space=create_flexible_obs_space(flags, teacher_flags),
             seed=seed
         )
-        reward_space = create_reward_space(flags)
+        reward_space = create_reward_space(flags, reward_game_counter=reward_game_counter)
         env = RewardSpaceWrapper(env, reward_space)
         env = env.obs_space.wrap_env(env)
         env = PadFixedShapeEnv(env)
@@ -64,11 +70,15 @@ def create_env(flags, device: torch.device, teacher_flags: Optional = None, seed
     return env
 
 
-def create_reward_space(flags) -> reward_spaces.BaseRewardSpace:
+def create_reward_space(flags, reward_game_counter=None) -> reward_spaces.BaseRewardSpace:
     if flags.reward_space is multi_subtask.MultiSubtask:
         assert "subtasks" in flags.reward_space_kwargs and "subtask_sampler" in flags.reward_space_kwargs
         subtasks = [SUBTASKS_DICT[s] for s in flags.reward_space_kwargs["subtasks"]]
         subtask_sampler = SUBTASK_SAMPLERS_DICT[flags.reward_space_kwargs["subtask_sampler"]]
-        return flags.reward_space(subtasks, subtask_sampler)
+        reward_space = flags.reward_space(subtasks, subtask_sampler)
+    else:
+        reward_space = flags.reward_space(**flags.reward_space_kwargs)
 
-    return flags.reward_space(**flags.reward_space_kwargs)
+    if reward_game_counter is not None and hasattr(reward_space, "set_global_game_counter"):
+        reward_space.set_global_game_counter(reward_game_counter)
+    return reward_space

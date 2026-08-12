@@ -1,10 +1,13 @@
 from contextlib import redirect_stdout
 import io
+
 # Silence "Loading environment football failed: No module named 'gfootball'" message
 with redirect_stdout(io.StringIO()):
-    import kaggle_environments
+    import kaggle_environments  # noqa: F401
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import get_original_cwd
 import logging
 import os
 from omegaconf import OmegaConf, DictConfig
@@ -14,14 +17,13 @@ import wandb
 
 from lux_ai.utils import flags_to_namespace
 from lux_ai.torchbeast.monobeast import train
+from lux_ai.strategic_rl.resume import merge_resume_config
 
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
 logging.basicConfig(
-    format=(
-        "[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] " "%(message)s"
-    ),
+    format=("[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] %(message)s"),
     level=0,
 )
 
@@ -38,11 +40,17 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("use_mixed_precision", True)
     flags.setdefault("discounting", 0.999)
     flags.setdefault("reduction", "mean")
-    flags.setdefault("clip_grads", 10.)
-    flags.setdefault("checkpoint_freq", 10.)
+    flags.setdefault("clip_grads", 10.0)
+    flags.setdefault("checkpoint_freq", 10.0)
     flags.setdefault("num_learner_threads", 1)
     flags.setdefault("use_teacher", False)
-    flags.setdefault("teacher_baseline_cost", flags.get("teacher_kl_cost", 0.) / 2.)
+    flags.setdefault("teacher_baseline_cost", flags.get("teacher_kl_cost", 0.0) / 2.0)
+    flags.setdefault("actor_policy_tta_rot180", False)
+    flags.setdefault("teacher_policy_tta_rot180", False)
+    flags.setdefault("league_enabled", False)
+    flags.setdefault("league_opponents", [])
+    flags.setdefault("league_config_version", 0)
+    flags.setdefault("reward_config_version", 0)
 
     # Model params
     flags.setdefault("use_index_select", True)
@@ -64,10 +72,15 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
 
 @hydra.main(config_path="conf", config_name="resume_config")
 def main(flags: DictConfig):
-    cli_conf = OmegaConf.from_cli()
+    selected_flags = flags
+    # Read only Hydra task overrides. OmegaConf.from_cli() also sees Hydra's
+    # own arguments (for example ``--config-name``) and treats them as config
+    # keys, which breaks structured-config merges when resuming a full run.
+    cli_overrides = [override.lstrip("+") for override in HydraConfig.get().overrides.task]
+    cli_conf = OmegaConf.from_dotlist(cli_overrides)
     if Path("config.yaml").exists():
         new_flags = OmegaConf.load("config.yaml")
-        flags = OmegaConf.merge(new_flags, cli_conf)
+        flags = merge_resume_config(new_flags, selected_flags, cli_conf)
 
     if flags.get("load_dir", None) and not flags.get("weights_only", False):
         # this ignores the local config.yaml and replaces it completely with saved one
@@ -75,11 +88,19 @@ def main(flags: DictConfig):
         # this is useful e.g. if you did total_steps=N before and want to increase it
         logging.info("Loading existing configuration, we're continuing a previous run")
         new_flags = OmegaConf.load(Path(flags.load_dir) / "config.yaml")
-        # Overwrite some parameters
-        new_flags = OmegaConf.merge(new_flags, flags)
-        flags = OmegaConf.merge(new_flags, cli_conf)
+        # Preserve every saved setting and apply only explicitly supplied task
+        # overrides. Merging the selected base config here can silently reset
+        # options such as use_teacher when resuming.
+        flags = merge_resume_config(new_flags, selected_flags, cli_conf)
 
     flags = get_default_flags(flags)
+    original_cwd = Path(get_original_cwd())
+    for opponent in flags.league_opponents:
+        for key in ("config", "checkpoint"):
+            if opponent.get(key):
+                path = Path(opponent[key])
+                if not path.is_absolute():
+                    opponent[key] = str(original_cwd / path)
     logging.info(OmegaConf.to_yaml(flags, resolve=True))
     OmegaConf.save(flags, "config.yaml")
     if not flags.disable_wandb:

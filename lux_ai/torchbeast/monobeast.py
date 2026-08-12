@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import math
+import numpy as np
 from omegaconf import OmegaConf
 import os
 from pathlib import Path
@@ -33,27 +34,40 @@ from torch import nn
 from torch.nn import functional as F
 
 from .core import prof, td_lambda, upgo, vtrace
-from .core.buffer_utils import Buffers, create_buffers, fill_buffers_inplace, stack_buffers, split_buffers, \
-    buffers_apply
+from .core.buffer_utils import (
+    Buffers,
+    create_buffers,
+    fill_buffers_inplace,
+    stack_buffers,
+    split_buffers,
+    buffers_apply,
+)
 from ..lux_gym import create_env
-from ..lux_gym.act_spaces import ACTION_MEANINGS
+from ..lux_gym.act_spaces import ACTION_MEANINGS, MAX_OVERLAPPING_ACTIONS
 from ..nns import create_model
+from ..nns.models import DictActor
 from ..utils import flags_to_namespace
+from ..strategic_rl.artifacts import atomic_torch_save
+from ..strategic_rl.league import (
+    LeagueSampler,
+    learner_player_mask,
+    merge_player_actions,
+    opponents_from_config,
+    rule_based_actions,
+)
+from ..strategic_rl.schedules import teacher_kl_coefficient
+from ..strategic_rl.tta import rot180_ensemble_outputs
 
 
 KL_DIV_LOSS = nn.KLDivLoss(reduction="none")
 logging.basicConfig(
-    format=(
-        "[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] " "%(message)s"
-    ),
+    format=("[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] %(message)s"),
     level=0,
 )
 
 
 def combine_policy_logits_to_log_probs(
-        behavior_policy_logits: torch.Tensor,
-        actions: torch.Tensor,
-        actions_taken_mask: torch.Tensor
+    behavior_policy_logits: torch.Tensor, actions: torch.Tensor, actions_taken_mask: torch.Tensor
 ) -> torch.Tensor:
     """
     Combines all policy_logits at a given step to get a single action_log_probs value for that step
@@ -68,26 +82,25 @@ def combine_policy_logits_to_log_probs(
     # Select the probabilities for actions that were taken by stacked agents and sum these
     selected_probs = torch.gather(probs, -1, actions)
     # Convert the probs to conditional probs, since we sample without replacement
-    remaining_probability_density = 1. - torch.cat([
-        torch.zeros(
-            (*selected_probs.shape[:-1], 1),
-            device=selected_probs.device,
-            dtype=selected_probs.dtype
-        ),
-        selected_probs[..., :-1].cumsum(dim=-1)
-    ], dim=-1)
+    remaining_probability_density = 1.0 - torch.cat(
+        [
+            torch.zeros((*selected_probs.shape[:-1], 1), device=selected_probs.device, dtype=selected_probs.dtype),
+            selected_probs[..., :-1].cumsum(dim=-1),
+        ],
+        dim=-1,
+    )
     # Avoid division by zero
     remaining_probability_density = remaining_probability_density + torch.where(
         remaining_probability_density == 0,
         torch.ones_like(remaining_probability_density),
-        torch.zeros_like(remaining_probability_density)
+        torch.zeros_like(remaining_probability_density),
     )
     conditional_selected_probs = selected_probs / remaining_probability_density
     # Remove 0-valued conditional_selected_probs in order to eliminate neg-inf valued log_probs
     conditional_selected_probs = conditional_selected_probs + torch.where(
         conditional_selected_probs == 0,
         torch.ones_like(conditional_selected_probs),
-        torch.zeros_like(conditional_selected_probs)
+        torch.zeros_like(conditional_selected_probs),
     )
     log_probs = torch.log(conditional_selected_probs)
     # Sum over actions, y and x dimensions to combine log_probs from different actions
@@ -95,10 +108,7 @@ def combine_policy_logits_to_log_probs(
     return torch.flatten(log_probs, start_dim=-3, end_dim=-1).sum(dim=-1).squeeze(dim=-2)
 
 
-def combine_policy_entropy(
-        policy_logits: torch.Tensor,
-        actions_taken_mask: torch.Tensor
-) -> torch.Tensor:
+def combine_policy_entropy(policy_logits: torch.Tensor, actions_taken_mask: torch.Tensor) -> torch.Tensor:
     """
     Computes and combines policy entropy for a given step.
     NB: We are just computing the sum of individual entropies, not the joint entropy, because I don't think there is
@@ -109,11 +119,7 @@ def combine_policy_entropy(
     """
     policy = F.softmax(policy_logits, dim=-1)
     log_policy = F.log_softmax(policy_logits, dim=-1)
-    log_policy_masked_zeroed = torch.where(
-        log_policy.isneginf(),
-        torch.zeros_like(log_policy),
-        log_policy
-    )
+    log_policy_masked_zeroed = torch.where(log_policy.isneginf(), torch.zeros_like(log_policy), log_policy)
     entropies = (policy * log_policy_masked_zeroed).sum(dim=-1)
     assert actions_taken_mask.shape == entropies.shape
     entropies_masked = entropies * actions_taken_mask.float()
@@ -122,20 +128,23 @@ def combine_policy_entropy(
 
 
 def compute_teacher_kl_loss(
-        learner_policy_logits: torch.Tensor,
-        teacher_policy_logits: torch.Tensor,
-        actions_taken_mask: torch.Tensor
+    learner_policy_logits: torch.Tensor, teacher_policy_logits: torch.Tensor, actions_taken_mask: torch.Tensor
 ) -> torch.Tensor:
     learner_policy_log_probs = F.log_softmax(learner_policy_logits, dim=-1)
+    teacher_policy_log_probs = F.log_softmax(teacher_policy_logits, dim=-1)
     teacher_policy = F.softmax(teacher_policy_logits, dim=-1)
-    kl_div = F.kl_div(
-        learner_policy_log_probs,
-        teacher_policy.detach(),
-        reduction="none",
-        log_target=False
-    ).sum(dim=-1)
+    # F.kl_div produces NaN for masked actions through 0 * (log(0) - -inf).
+    # Define those zero-probability terms as zero explicitly.
+    kl_terms = torch.where(
+        teacher_policy > 0,
+        teacher_policy.detach() * (teacher_policy_log_probs.detach() - learner_policy_log_probs),
+        torch.zeros_like(teacher_policy),
+    )
+    kl_div = kl_terms.sum(dim=-1)
     assert actions_taken_mask.shape == kl_div.shape
-    kl_div_masked = kl_div * actions_taken_mask.float()
+    # Invalid entities may have every action masked to -inf, which makes their
+    # softmax/KL NaN. Multiplication cannot mask NaN because 0 * NaN is NaN.
+    kl_div_masked = torch.where(actions_taken_mask, kl_div, torch.zeros_like(kl_div))
     # Sum over y, x, and action_planes dimensions to combine kl divergences from different actions
     return kl_div_masked.sum(dim=-1).sum(dim=-1).squeeze(dim=-2)
 
@@ -149,29 +158,131 @@ def reduce(losses: torch.Tensor, reduction: str) -> torch.Tensor:
         raise ValueError(f"Reduction must be one of 'sum' or 'mean', was: {reduction}")
 
 
-def compute_baseline_loss(values: torch.Tensor, value_targets: torch.Tensor, reduction: str) -> torch.Tensor:
+def compute_baseline_loss(
+    values: torch.Tensor,
+    value_targets: torch.Tensor,
+    reduction: str,
+    player_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     baseline_loss = F.smooth_l1_loss(values, value_targets.detach(), reduction="none")
+    if player_mask is not None:
+        baseline_loss = baseline_loss * player_mask
     return reduce(baseline_loss, reduction=reduction)
 
 
 def compute_policy_gradient_loss(
-        action_log_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        reduction: str
+    action_log_probs: torch.Tensor, advantages: torch.Tensor, reduction: str
 ) -> torch.Tensor:
     cross_entropy = -action_log_probs.view_as(advantages)
     return reduce(cross_entropy * advantages.detach(), reduction)
 
 
 @torch.no_grad()
+def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_output: Dict) -> Dict:
+    if not getattr(flags, "actor_policy_tta_rot180", False):
+        return actor_model(env_output)
+    output = rot180_ensemble_outputs(actor_model, env_output)
+    output["actions"] = {
+        entity: DictActor.logits_to_actions(
+            torch.flatten(logits, start_dim=0, end_dim=-2),
+            sample=True,
+            actions_per_square=MAX_OVERLAPPING_ACTIONS,
+        ).view(*logits.shape[:-1], -1)
+        for entity, logits in output["policy_logits"].items()
+    }
+    return output
+
+
+def _league_actions(
+    flags,
+    env,
+    env_output: Dict,
+    learner_actions: Dict[str, torch.Tensor],
+    opponents,
+    selected_opponents,
+    learner_players,
+    opponent_models,
+) -> Dict[str, torch.Tensor]:
+    merged = learner_actions
+    for opponent_index, opponent in enumerate(opponents):
+        if opponent.kind == "selfplay":
+            continue
+        env_indices = [i for i, selected in enumerate(selected_opponents) if selected == opponent_index]
+        if not env_indices:
+            continue
+        opponent_players = [1 - learner_players[i] for i in env_indices]
+        if opponent.kind == "rule_based":
+            opponent_actions = rule_based_actions(
+                env.unwrapped,
+                env_output["info"]["available_actions_mask"],
+                learner_actions,
+                env_indices,
+                opponent_players,
+            )
+        else:
+            model_input = buffers_apply(env_output, lambda value, indices=env_indices: value[indices])
+            if opponent.kind == "teacher" and getattr(flags, "teacher_policy_tta_rot180", False):
+                model_output = rot180_ensemble_outputs(opponent_models[opponent_index], model_input)
+                model_actions = {
+                    entity: DictActor.logits_to_actions(
+                        logits.flatten(start_dim=0, end_dim=-2),
+                        sample=False,
+                        actions_per_square=MAX_OVERLAPPING_ACTIONS,
+                    ).view(*logits.shape[:-1], -1)
+                    for entity, logits in model_output["policy_logits"].items()
+                }
+            else:
+                model_actions = opponent_models[opponent_index](model_input, sample=False)["actions"]
+            opponent_actions = {key: torch.zeros_like(value) for key, value in learner_actions.items()}
+            for local_index, env_index in enumerate(env_indices):
+                for entity in opponent_actions:
+                    opponent_actions[entity][env_index] = model_actions[entity][local_index]
+        merged = merge_player_actions(merged, opponent_actions, env_indices, opponent_players)
+    return merged
+
+
+def _set_learner_player_info(env_output, opponents, selected_opponents, learner_players, device):
+    mask = learner_player_mask(opponents, selected_opponents, learner_players, device)
+    env_output["info"]["learner_player_mask"] = mask
+    env_output["info"]["league_opponent_id"] = torch.as_tensor(
+        selected_opponents, dtype=torch.int64, device=device
+    )
+    action_mask = mask[:, None, :, None, None, None]
+    for entity in env_output["info"]["actions_taken"]:
+        env_output["info"]["actions_taken"][entity] &= action_mask
+
+
+def _load_league_opponent_models(flags, league_obs_flags, league_opponents):
+    models = {}
+    for opponent_index, opponent in enumerate(league_opponents):
+        if opponent.kind in {"selfplay", "rule_based"}:
+            continue
+        if opponent.kind == "teacher":
+            model_flags = flags_to_namespace(OmegaConf.to_container(OmegaConf.load(opponent.config)))
+            model = create_model(flags, flags.actor_device, teacher_model_flags=model_flags, is_teacher_model=True)
+        else:
+            model = create_model(
+                flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False
+            )
+        state = torch.load(Path(opponent.checkpoint), map_location=torch.device("cpu"), weights_only=False)
+        model.load_state_dict(state["model_state_dict"])
+        model.eval()
+        models[opponent_index] = model
+        logging.info("Actor league loaded %s from %s", opponent.name, opponent.checkpoint)
+    return models
+
+
+@torch.no_grad()
 def act(
-        flags: SimpleNamespace,
-        teacher_flags: Optional[SimpleNamespace],
-        actor_index: int,
-        free_queue: mp.SimpleQueue,
-        full_queue: mp.SimpleQueue,
-        actor_model: torch.nn.Module,
-        buffers: Buffers,
+    flags: SimpleNamespace,
+    teacher_flags: Optional[SimpleNamespace],
+    actor_index: int,
+    free_queue: mp.SimpleQueue,
+    full_queue: mp.SimpleQueue,
+    actor_model: torch.nn.Module,
+    league_opponents,
+    reward_game_counter,
+    buffers: Buffers,
 ):
     if flags.debug:
         catch_me = AssertionError
@@ -181,13 +292,26 @@ def act(
         logging.info("Actor %i started.", actor_index)
         timings = prof.Timings()
 
-        env = create_env(flags, device=flags.actor_device, teacher_flags=teacher_flags)
+        env = create_env(
+            flags,
+            device=flags.actor_device,
+            teacher_flags=teacher_flags,
+            reward_game_counter=reward_game_counter,
+        )
+        opponent_models = _load_league_opponent_models(flags, teacher_flags, league_opponents)
         if flags.seed is not None:
             env.seed(flags.seed + actor_index * flags.n_actor_envs)
         else:
             env.seed()
         env_output = env.reset(force=True)
-        agent_output = actor_model(env_output)
+        league_sampler = LeagueSampler(league_opponents)
+        league_rng = np.random.default_rng(None if flags.seed is None else flags.seed + 100000 + actor_index)
+        selected_opponents = [league_sampler.sample_index(league_rng) for _ in range(flags.n_actor_envs)]
+        learner_players = league_rng.integers(0, 2, size=flags.n_actor_envs).tolist()
+        _set_learner_player_info(
+            env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
+        )
+        agent_output = actor_model_output(flags, actor_model, env_output)
         while True:
             index = free_queue.get()
             if index is None:
@@ -200,17 +324,33 @@ def act(
             for t in range(flags.unroll_length):
                 timings.reset()
 
-                agent_output = actor_model(env_output)
+                agent_output = actor_model_output(flags, actor_model, env_output)
                 timings.time("model")
 
-                env_output = env.step(agent_output["actions"])
+                actions = _league_actions(
+                    flags,
+                    env,
+                    env_output,
+                    agent_output["actions"],
+                    league_opponents,
+                    selected_opponents,
+                    learner_players,
+                    opponent_models,
+                )
+                agent_output["actions"] = actions
+                env_output = env.step(actions)
+                _set_learner_player_info(
+                    env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
+                )
                 if env_output["done"].any():
                     # Cache reward, done, and info["actions_taken"] from the terminal step
                     cached_reward = env_output["reward"]
                     cached_done = env_output["done"]
                     cached_info_actions_taken = env_output["info"]["actions_taken"]
                     cached_info_logging = {
-                        key: val for key, val in env_output["info"].items() if key.startswith("LOGGING_")
+                        key: val
+                        for key, val in env_output["info"].items()
+                        if key.startswith("LOGGING_") or key in {"learner_player_mask", "league_opponent_id"}
                     }
 
                     env_output = env.reset()
@@ -218,6 +358,9 @@ def act(
                     env_output["done"] = cached_done
                     env_output["info"]["actions_taken"] = cached_info_actions_taken
                     env_output["info"].update(cached_info_logging)
+                    for env_index in env_output["done"].nonzero(as_tuple=False).flatten().tolist():
+                        selected_opponents[env_index] = league_sampler.sample_index(league_rng)
+                        learner_players[env_index] = int(league_rng.integers(0, 2))
                 timings.time("step")
 
                 fill_buffers_inplace(buffers[index], dict(**env_output, **agent_output), t + 1)
@@ -259,32 +402,36 @@ def get_batch(
 
 
 def learn(
-        flags: SimpleNamespace,
-        actor_model: nn.Module,
-        learner_model: nn.Module,
-        teacher_model: Optional[nn.Module],
-        batch: Dict[str, torch.Tensor],
-        optimizer: torch.optim.Optimizer,
-        grad_scaler: amp.grad_scaler,
-        lr_scheduler: torch.optim.lr_scheduler,
-        total_games_played: int,
-        baseline_only: bool = False,
-        lock=threading.Lock(),
+    flags: SimpleNamespace,
+    actor_model: nn.Module,
+    learner_model: nn.Module,
+    teacher_model: Optional[nn.Module],
+    batch: Dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    grad_scaler: amp.grad_scaler,
+    lr_scheduler: torch.optim.lr_scheduler,
+    total_games_played: int,
+    learner_step: int = 0,
+    baseline_only: bool = False,
+    lock=threading.Lock(),
 ) -> Tuple[Dict, int]:
     """Performs a learning (optimization) step."""
     with lock:
         with amp.autocast(enabled=flags.use_mixed_precision):
             flattened_batch = buffers_apply(batch, lambda x: torch.flatten(x, start_dim=0, end_dim=1))
             learner_outputs = learner_model(flattened_batch)
-            learner_outputs = buffers_apply(learner_outputs, lambda x: x.view(flags.unroll_length + 1,
-                                                                              flags.batch_size,
-                                                                              *x.shape[1:]))
+            learner_outputs = buffers_apply(
+                learner_outputs, lambda x: x.view(flags.unroll_length + 1, flags.batch_size, *x.shape[1:])
+            )
             if flags.use_teacher:
                 with torch.no_grad():
-                    teacher_outputs = teacher_model(flattened_batch)
-                    teacher_outputs = buffers_apply(teacher_outputs, lambda x: x.view(flags.unroll_length + 1,
-                                                                                      flags.batch_size,
-                                                                                      *x.shape[1:]))
+                    if getattr(flags, "teacher_policy_tta_rot180", False):
+                        teacher_outputs = rot180_ensemble_outputs(teacher_model, flattened_batch)
+                    else:
+                        teacher_outputs = teacher_model(flattened_batch)
+                    teacher_outputs = buffers_apply(
+                        teacher_outputs, lambda x: x.view(flags.unroll_length + 1, flags.batch_size, *x.shape[1:])
+                    )
             else:
                 teacher_outputs = None
 
@@ -298,8 +445,7 @@ def learn(
                 teacher_outputs = buffers_apply(teacher_outputs, lambda x: x[:-1])
 
             combined_behavior_action_log_probs = torch.zeros(
-                (flags.unroll_length, flags.batch_size, 2),
-                device=flags.learner_device
+                (flags.unroll_length, flags.batch_size, 2), device=flags.learner_device
             )
             combined_learner_action_log_probs = torch.zeros_like(combined_behavior_action_log_probs)
             combined_teacher_kl_loss = torch.zeros_like(combined_behavior_action_log_probs)
@@ -312,17 +458,13 @@ def learn(
 
                 behavior_policy_logits = batch["policy_logits"][act_space]
                 behavior_action_log_probs = combine_policy_logits_to_log_probs(
-                    behavior_policy_logits,
-                    actions,
-                    actions_taken_mask
+                    behavior_policy_logits, actions, actions_taken_mask
                 )
                 combined_behavior_action_log_probs = combined_behavior_action_log_probs + behavior_action_log_probs
 
                 learner_policy_logits = learner_outputs["policy_logits"][act_space]
                 learner_action_log_probs = combine_policy_logits_to_log_probs(
-                    learner_policy_logits,
-                    actions,
-                    actions_taken_mask
+                    learner_policy_logits, actions, actions_taken_mask
                 )
                 combined_learner_action_log_probs = combined_learner_action_log_probs + learner_action_log_probs
 
@@ -330,27 +472,30 @@ def learn(
                 any_actions_taken = actions_taken_mask.any(dim=-1)
                 if flags.use_teacher:
                     teacher_kl_loss = compute_teacher_kl_loss(
-                        learner_policy_logits,
-                        teacher_outputs["policy_logits"][act_space],
-                        any_actions_taken
+                        learner_policy_logits, teacher_outputs["policy_logits"][act_space], any_actions_taken
                     )
                 else:
                     teacher_kl_loss = torch.zeros_like(combined_teacher_kl_loss)
                 combined_teacher_kl_loss = combined_teacher_kl_loss + teacher_kl_loss
-                teacher_kl_losses[act_space] = (reduce(
-                    teacher_kl_loss,
-                    reduction="sum",
-                ) / any_actions_taken.sum()).detach().cpu().item()
-
-                learner_policy_entropy = combine_policy_entropy(
-                    learner_policy_logits,
-                    any_actions_taken
+                n_actions_taken = any_actions_taken.sum().clamp_min(1)
+                teacher_kl_losses[act_space] = (
+                    (
+                        reduce(
+                            teacher_kl_loss,
+                            reduction="sum",
+                        )
+                        / n_actions_taken
+                    )
+                    .detach()
+                    .cpu()
+                    .item()
                 )
+
+                learner_policy_entropy = combine_policy_entropy(learner_policy_logits, any_actions_taken)
                 combined_learner_entropy = combined_learner_entropy + learner_policy_entropy
-                entropies[act_space] = -(reduce(
-                    learner_policy_entropy,
-                    reduction="sum"
-                ) / any_actions_taken.sum()).detach().cpu().item()
+                entropies[act_space] = (
+                    -(reduce(learner_policy_entropy, reduction="sum") / n_actions_taken).detach().cpu().item()
+                )
 
             discounts = (~batch["done"]).float() * flags.discounting
             discounts = discounts.unsqueeze(-1).expand_as(combined_behavior_action_log_probs)
@@ -361,71 +506,68 @@ def learn(
                 discounts=discounts,
                 rewards=batch["reward"],
                 values=values,
-                bootstrap_value=bootstrap_value
+                bootstrap_value=bootstrap_value,
             )
             td_lambda_returns = td_lambda.td_lambda(
                 rewards=batch["reward"],
                 values=values,
                 bootstrap_value=bootstrap_value,
                 discounts=discounts,
-                lmb=flags.lmb
+                lmb=flags.lmb,
             )
             upgo_returns = upgo.upgo(
                 rewards=batch["reward"],
                 values=values,
                 bootstrap_value=bootstrap_value,
                 discounts=discounts,
-                lmb=flags.lmb
+                lmb=flags.lmb,
             )
 
             vtrace_pg_loss = compute_policy_gradient_loss(
-                combined_learner_action_log_probs,
-                vtrace_returns.pg_advantages,
-                reduction=flags.reduction
+                combined_learner_action_log_probs, vtrace_returns.pg_advantages, reduction=flags.reduction
             )
             upgo_clipped_importance = torch.minimum(
-                vtrace_returns.log_rhos.exp(),
-                torch.ones_like(vtrace_returns.log_rhos)
+                vtrace_returns.log_rhos.exp(), torch.ones_like(vtrace_returns.log_rhos)
             ).detach()
             upgo_pg_loss = compute_policy_gradient_loss(
                 combined_learner_action_log_probs,
                 upgo_clipped_importance * upgo_returns.advantages,
-                reduction=flags.reduction
+                reduction=flags.reduction,
             )
+            learner_player_mask_batch = batch["info"]["learner_player_mask"].to(values.dtype)
             baseline_loss = compute_baseline_loss(
                 values,
                 td_lambda_returns.vs,
-                reduction=flags.reduction
+                reduction=flags.reduction,
+                player_mask=learner_player_mask_batch,
             )
-            teacher_kl_loss = flags.teacher_kl_cost * reduce(
-                combined_teacher_kl_loss,
-                reduction=flags.reduction
-            )
+            teacher_kl_cost = teacher_kl_coefficient(flags, learner_step)
+            teacher_kl_loss = teacher_kl_cost * reduce(combined_teacher_kl_loss, reduction=flags.reduction)
             if flags.use_teacher:
                 teacher_baseline_loss = flags.teacher_baseline_cost * compute_baseline_loss(
                     values,
                     teacher_outputs["baseline"],
-                    reduction=flags.reduction
+                    reduction=flags.reduction,
+                    player_mask=learner_player_mask_batch,
                 )
             else:
                 teacher_baseline_loss = torch.zeros_like(baseline_loss)
-            entropy_loss = flags.entropy_cost * reduce(
-                combined_learner_entropy,
-                reduction=flags.reduction
-            )
+            entropy_loss = flags.entropy_cost * reduce(combined_learner_entropy, reduction=flags.reduction)
             if baseline_only:
                 total_loss = baseline_loss + teacher_baseline_loss
                 vtrace_pg_loss, upgo_pg_loss, teacher_kl_loss, entropy_loss = torch.zeros(4) + float("nan")
             else:
-                total_loss = (vtrace_pg_loss +
-                              upgo_pg_loss +
-                              baseline_loss +
-                              teacher_kl_loss +
-                              teacher_baseline_loss +
-                              entropy_loss)
+                total_loss = (
+                    vtrace_pg_loss
+                    + upgo_pg_loss
+                    + baseline_loss
+                    + teacher_kl_loss
+                    + teacher_baseline_loss
+                    + entropy_loss
+                )
 
             last_lr = lr_scheduler.get_last_lr()
-            assert len(last_lr) == 1, 'Logging per-parameter LR still needs support'
+            assert len(last_lr) == 1, "Logging per-parameter LR still needs support"
             last_lr = last_lr[0]
             action_distributions_flat = {
                 key[16:]: val[batch["done"]][~val[batch["done"]].isnan()].sum().item()
@@ -441,9 +583,7 @@ def learn(
                 if space == "city_tile":
                     action_distributions_aggregated[space] = dist
                 elif space in ("cart", "worker"):
-                    aggregated = {
-                        a: n for a, n in dist.items() if "TRANSFER" not in a and "MOVE" not in a
-                    }
+                    aggregated = {a: n for a, n in dist.items() if "TRANSFER" not in a and "MOVE" not in a}
                     aggregated["TRANSFER"] = sum({a: n for a, n in dist.items() if "TRANSFER" in a}.values())
                     aggregated["MOVE"] = sum({a: n for a, n in dist.items() if "MOVE" in a}.values())
                     action_distributions_aggregated[space] = aggregated
@@ -476,17 +616,24 @@ def learn(
                     "entropy_loss": entropy_loss.detach().item(),
                     "total_loss": total_loss.detach().item(),
                 },
-                "Entropy": {
-                    "overall": sum(e for e in entropies.values() if not math.isnan(e)),
-                    **entropies
-                },
+                "Entropy": {"overall": sum(e for e in entropies.values() if not math.isnan(e)), **entropies},
                 "Teacher_KL_Divergence": {
                     "overall": sum(tkld for tkld in teacher_kl_losses.values() if not math.isnan(tkld)),
-                    **teacher_kl_losses
+                    **teacher_kl_losses,
                 },
                 "Misc": {
                     "learning_rate": last_lr,
-                    "total_games_played": total_games_played
+                    "teacher_kl_cost": teacher_kl_cost,
+                    "actor_policy_tta_rot180": float(getattr(flags, "actor_policy_tta_rot180", False)),
+                    "teacher_policy_tta_rot180": float(getattr(flags, "teacher_policy_tta_rot180", False)),
+                    "total_games_played": total_games_played,
+                    "league_opponents": {
+                        opponent["name"]: (batch["info"]["league_opponent_id"] == opponent_index)
+                        .float()
+                        .mean()
+                        .item()
+                        for opponent_index, opponent in enumerate(flags.league_opponents)
+                    },
                 },
             }
 
@@ -505,7 +652,7 @@ def learn(
                 optimizer.step()
             if lr_scheduler is not None:
                 with warnings.catch_warnings():
-                    warnings.filterwarnings('ignore', category=UserWarning)
+                    warnings.filterwarnings("ignore", category=UserWarning)
                     lr_scheduler.step()
 
         # noinspection PyTypeChecker
@@ -525,32 +672,56 @@ def train(flags):
     t = flags.unroll_length
     b = flags.batch_size
 
+    league_opponents = opponents_from_config(flags.league_opponents) if flags.league_enabled else (
+        opponents_from_config([{"name": "selfplay", "kind": "selfplay", "weight": 1.0}])
+    )
+    legacy_opponents = [opponent for opponent in league_opponents if opponent.kind == "teacher"]
+
     if flags.use_teacher:
         teacher_flags = OmegaConf.load(Path(flags.teacher_load_dir) / "config.yaml")
         teacher_flags = flags_to_namespace(OmegaConf.to_container(teacher_flags))
     else:
         teacher_flags = None
 
-    example_env = create_env(flags, torch.device("cpu"), teacher_flags=teacher_flags)
-    buffers = create_buffers(
-        flags,
-        example_env.unwrapped[0].obs_space,
-        example_env.reset(force=True)["info"]
-    )
-    del example_env
+    league_obs_flags = teacher_flags
+    if legacy_opponents:
+        first_legacy_config = OmegaConf.load(legacy_opponents[0].config)
+        league_obs_flags = flags_to_namespace(OmegaConf.to_container(first_legacy_config))
+        for opponent in legacy_opponents[1:]:
+            other_config = OmegaConf.load(opponent.config)
+            if (
+                other_config.obs_space != first_legacy_config.obs_space
+                or other_config.get("obs_space_kwargs", {}) != first_legacy_config.get("obs_space_kwargs", {})
+            ):
+                raise ValueError("All teacher-kind league opponents must use the same observation space")
+        if teacher_flags is not None and teacher_flags.obs_space != league_obs_flags.obs_space:
+            raise ValueError("Online KL teacher and league teacher must use the same observation space")
 
     if flags.load_dir:
         checkpoint_state = torch.load(Path(flags.load_dir) / flags.checkpoint_file, map_location=torch.device("cpu"))
     else:
         checkpoint_state = None
+    restored_games = (
+        int(checkpoint_state.get("reward_games_completed", checkpoint_state.get("total_games_played", 0)))
+        if checkpoint_state is not None
+        else 0
+    )
+    reward_game_counter = mp.Value("q", restored_games)
 
-    actor_model = create_model(flags, flags.actor_device, teacher_model_flags=teacher_flags, is_teacher_model=False)
+    example_env = create_env(flags, torch.device("cpu"), teacher_flags=league_obs_flags)
+    example_output = example_env.reset(force=True)
+    example_output["info"]["learner_player_mask"] = torch.ones((flags.n_actor_envs, 2), dtype=torch.bool)
+    example_output["info"]["league_opponent_id"] = torch.zeros(flags.n_actor_envs, dtype=torch.int64)
+    buffers = create_buffers(flags, example_env.unwrapped[0].obs_space, example_output["info"])
+    del example_env
+
+    actor_model = create_model(flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False)
     if checkpoint_state is not None:
         actor_model.load_state_dict(checkpoint_state["model_state_dict"])
     actor_model.eval()
     actor_model.share_memory()
     n_trainable_params = sum(p.numel() for p in actor_model.parameters() if p.requires_grad)
-    logging.info(f'Training model with {n_trainable_params:,d} parameters.')
+    logging.info(f"Training model with {n_trainable_params:,d} parameters.")
 
     actor_processes = []
     free_queue = mp.SimpleQueue()
@@ -562,11 +733,13 @@ def train(flags):
             target=act,
             args=(
                 flags,
-                teacher_flags,
+                league_obs_flags,
                 i,
                 free_queue,
                 full_queue,
                 actor_model,
+                league_opponents,
+                reward_game_counter,
                 buffers,
             ),
         )
@@ -574,7 +747,9 @@ def train(flags):
         actor_processes.append(actor)
         time.sleep(0.5)
 
-    learner_model = create_model(flags, flags.learner_device, teacher_model_flags=teacher_flags, is_teacher_model=False)
+    learner_model = create_model(
+        flags, flags.learner_device, teacher_model_flags=league_obs_flags, is_teacher_model=False
+    )
     if checkpoint_state is not None:
         learner_model.load_state_dict(checkpoint_state["model_state_dict"])
     learner_model.train()
@@ -582,47 +757,45 @@ def train(flags):
     if not flags.disable_wandb:
         wandb.watch(learner_model, flags.model_log_freq, log="all", log_graph=True)
 
-    optimizer = flags.optimizer_class(
-        learner_model.parameters(),
-        **flags.optimizer_kwargs
-    )
+    optimizer = flags.optimizer_class(learner_model.parameters(), **flags.optimizer_kwargs)
     if checkpoint_state is not None and not flags.weights_only:
         optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
 
     # Load teacher model for KL loss
     if flags.use_teacher:
-        if flags.teacher_kl_cost <= 0. and flags.teacher_baseline_cost <= 0.:
-            raise ValueError("It does not make sense to use teacher when teacher_kl_cost <= 0 "
-                             "and teacher_baseline_cost <= 0")
+        if flags.teacher_kl_cost <= 0.0 and flags.teacher_baseline_cost <= 0.0:
+            raise ValueError(
+                "It does not make sense to use teacher when teacher_kl_cost <= 0 and teacher_baseline_cost <= 0"
+            )
         teacher_model = create_model(
-            flags,
-            flags.learner_device,
-            teacher_model_flags=teacher_flags,
-            is_teacher_model=True
+            flags, flags.learner_device, teacher_model_flags=teacher_flags, is_teacher_model=True
         )
         teacher_model.load_state_dict(
-            torch.load(
-                Path(flags.teacher_load_dir) / flags.teacher_checkpoint_file,
-                map_location=torch.device("cpu")
-            )["model_state_dict"]
+            torch.load(Path(flags.teacher_load_dir) / flags.teacher_checkpoint_file, map_location=torch.device("cpu"))[
+                "model_state_dict"
+            ]
         )
         teacher_model.eval()
     else:
         teacher_model = None
-        if flags.teacher_kl_cost > 0.:
-            logging.warning(f"flags.teacher_kl_cost is {flags.teacher_kl_cost}, but use_teacher is False. "
-                            f"Setting flags.teacher_kl_cost to 0.")
-        if flags.teacher_baseline_cost > 0.:
-            logging.warning(f"flags.teacher_baseline_cost is {flags.teacher_baseline_cost}, but use_teacher is False. "
-                            f"Setting flags.teacher_baseline_cost to 0.")
-        flags.teacher_kl_cost = 0.
-        flags.teacher_baseline_cost = 0.
+        if flags.teacher_kl_cost > 0.0:
+            logging.warning(
+                f"flags.teacher_kl_cost is {flags.teacher_kl_cost}, but use_teacher is False. "
+                f"Setting flags.teacher_kl_cost to 0."
+            )
+        if flags.teacher_baseline_cost > 0.0:
+            logging.warning(
+                f"flags.teacher_baseline_cost is {flags.teacher_baseline_cost}, but use_teacher is False. "
+                f"Setting flags.teacher_baseline_cost to 0."
+            )
+        flags.teacher_kl_cost = 0.0
+        flags.teacher_baseline_cost = 0.0
 
     def lr_lambda(epoch):
         min_pct = flags.min_lr_mod
         pct_complete = min(epoch * t * b, flags.total_steps) / flags.total_steps
-        scaled_pct_complete = pct_complete * (1. - min_pct)
-        return 1. - scaled_pct_complete
+        scaled_pct_complete = pct_complete * (1.0 - min_pct)
+        return 1.0 - scaled_pct_complete
 
     grad_scaler = amp.GradScaler()
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -670,6 +843,7 @@ def train(flags):
                     grad_scaler=grad_scaler,
                     lr_scheduler=scheduler,
                     total_games_played=total_games_played,
+                    learner_step=step,
                     baseline_only=step / (t * b) < flags.n_value_warmup_batches,
                 )
                 with lock:
@@ -685,29 +859,28 @@ def train(flags):
 
     learner_threads = []
     for i in range(flags.num_learner_threads):
-        thread = threading.Thread(
-            target=batch_and_learn, name=f"batch-and-learn-{i}", args=(i,)
-        )
+        thread = threading.Thread(target=batch_and_learn, name=f"batch-and-learn-{i}", args=(i,))
         thread.start()
         learner_threads.append(thread)
 
     def checkpoint(checkpoint_path: Union[str, Path]):
         logging.info(f"Saving checkpoint to {checkpoint_path}")
-        torch.save(
+        atomic_torch_save(
             {
                 "model_state_dict": actor_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": step,
                 "total_games_played": total_games_played,
+                "reward_games_completed": reward_game_counter.value,
             },
             checkpoint_path + ".pt",
         )
-        torch.save(
+        atomic_torch_save(
             {
                 "model_state_dict": actor_model.state_dict(),
             },
-            checkpoint_path + "_weights.pt"
+            checkpoint_path + "_weights.pt",
         )
 
     timer = timeit.default_timer

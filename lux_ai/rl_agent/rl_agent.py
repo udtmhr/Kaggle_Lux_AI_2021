@@ -20,12 +20,33 @@ from ..lux.game_constants import GAME_CONSTANTS
 from ..lux.game_objects import CityTile, Unit
 from ..lux import annotate
 
-MODEL_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 RL_AGENT_CONFIG_PATH = Path(__file__).parent / "rl_agent_config.yaml"
-CHECKPOINT_PATH, = list(Path(__file__).parent.glob('*.pt'))
 AGENT = None
 
 os.environ["OMP_NUM_THREADS"] = "1"
+
+
+def model_directory() -> Path:
+    explicit = os.environ.get("LUX_AGENT_MODEL_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+
+    model_name = os.environ.get("LUX_AGENT_MODEL")
+    if model_name:
+        if Path(model_name).name != model_name or model_name in {".", ".."}:
+            raise ValueError(f"LUX_AGENT_MODEL must be a model name, not a path: {model_name!r}")
+        return Path(__file__).resolve().parents[2] / "models" / model_name
+
+    # Backward-compatible Kaggle layout: config and one checkpoint live beside rl_agent.py.
+    return Path(__file__).parent
+
+
+def checkpoint_path(directory: Optional[Path] = None) -> Path:
+    directory = model_directory() if directory is None else directory
+    checkpoints = sorted(directory.glob("*.pt"))
+    if len(checkpoints) != 1:
+        raise ValueError(f"Expected exactly one agent checkpoint in {directory}, found {len(checkpoints)}: {checkpoints}")
+    return checkpoints[0]
 
 
 def pos_to_loc(pos: Tuple[int, int], board_dims: Tuple[int, int] = MAX_BOARD_SIZE) -> int:
@@ -34,7 +55,11 @@ def pos_to_loc(pos: Tuple[int, int], board_dims: Tuple[int, int] = MAX_BOARD_SIZ
 
 class RLAgent:
     def __init__(self, obs, conf):
-        with open(MODEL_CONFIG_PATH, 'r') as f:
+        model_dir = model_directory()
+        model_config_path = model_dir / "config.yaml"
+        if not model_config_path.is_file():
+            raise FileNotFoundError(f"Missing model config: {model_config_path}")
+        with open(model_config_path, 'r') as f:
             self.model_flags = flags_to_namespace(yaml.safe_load(f))
         with open(RL_AGENT_CONFIG_PATH, 'r') as f:
             self.agent_flags = SimpleNamespace(**yaml.safe_load(f))
@@ -71,7 +96,7 @@ class RLAgent:
 
         # Load the model
         self.model = create_model(self.model_flags, self.device)
-        checkpoint_states = torch.load(CHECKPOINT_PATH, map_location=self.device)
+        checkpoint_states = torch.load(checkpoint_path(model_dir), map_location=self.device)
         self.model.load_state_dict(checkpoint_states["model_state_dict"])
         self.model.eval()
 
@@ -161,7 +186,9 @@ class RLAgent:
             # you give the agent obs out of strict order
             self.game_state.turn = obs["step"]
             # I use this in the visualisation code, so need it to be set correctly
-            self.game_state.id = obs["player"]
+            # The official CLI exposes the player id as an attribute on its
+            # dict-like Observation object; it is not present as a mapping key.
+            self.game_state.id = obs.player
 
         self.me = self.game_state.players[obs.player]
         self.opp = self.game_state.players[(obs.player + 1) % 2]

@@ -1,0 +1,14 @@
+defaults:
+- survival_strategic
+- _self_
+
+name: survival_strategic_shaping_v1
+reward_config_version: 2
+reward_space: SurvivalPotentialReward
+reward_space_kwargs:
+  shaping_weight: 0.05
+  # Global completed games, restored from full-state checkpoints. At the
+  # current throughput this reaches zero near 4.8M-5.0M learner steps.
+  decay_games: 14000
+total_steps: 5000000
+teacher_kl_decay_steps: 5000000

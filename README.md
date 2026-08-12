@@ -1,5 +1,107 @@
 # Kaggle_Lux_AI_2021
 
+## Survival-strategic fork
+
+This fork adds a scratch-distilled student while preserving the original fast IMPALA environment and the complete
+19/17/4 worker/cart/city action schema. The first-place checkpoint is used only to generate target logits; its weights
+are never loaded into the student. New run checkpoints record both `scratch_initialization: true` and the teacher SHA.
+Offline teacher targets and online IMPALA teacher KL use original-plus-Rot180 averaged logits. Distillation also applies
+Rot180 training augmentation with probability 0.5, and the rollout actor samples from the same two-view ensemble.
+
+The new student combines masked local ConvNeXt-style blocks with axial attention at 8x8 and explicit city fuel,
+unit return, resource-control, and temporal observations. The original `conv_model` remains unchanged, and
+`conf/conv16_matched.yaml` is the parameter-matched architecture ablation (3.76M vs 3.80M parameters).
+
+Distillation cache schema v2 stores replay-level fp16/uint8 observations and only actionable entity logits using
+ragged positions and offsets. Schema v1 `.pt` shards are intentionally rejected; generate v2 into a new directory.
+
+Install and run a small data smoke test:
+
+```bash
+uv sync
+# The bundled teacher is tracked with Git LFS, so fetch its actual bytes first.
+git lfs pull
+uv run luxsr-prepare-data \
+  --replay-dir /path/to/replays \
+  --output-dir data/distillation_v1 \
+  --teacher-checkpoint internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt \
+  --teacher-config internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml \
+  --legacy-prepared-cache-dir /home/ueda/workspace/LuxPythonEnvGym/models/teachers/lux_2021_first_place/prepared \
+  --max-replays 1 --max-turns 2
+uv run luxsr-train-distill --dataset-dir data/distillation_v1 --output-dir outputs/distill_v1 --epochs 1
+uv run luxsr-validate-run outputs/distill_v1
+```
+
+Continue with IMPALA from the evaluated distilled `best.pt` (policy weights only), first with
+`survival_strategic_shaping`, then with `survival_strategic`. Enable the frozen online teacher only after filling
+`teacher_load_dir` and `teacher_checkpoint_file`. Its KL coefficient decays using the `teacher_kl_*` fields.
+The default strategic configs also enable an episode-level opponent league: current-policy self-play, the frozen
+first-place model, two historical checkpoints, and a deterministic economy rule bot. The learner side is randomized;
+external-opponent actions and values are excluded from the loss. Adjust `league_opponents[*].weight`, or set
+`league_enabled=false` to recover pure self-play.
+The v2 mixture is 40% self-play, 20% first-place, 20% mid-history (`28576448`), 10% late-history (`59822400`),
+and 10% rule-based. `league_config_version` upgrades older saved mixtures on full-state resume while retaining the
+checkpoint optimizer, scheduler, step, and game counters; explicit CLI overrides remain authoritative.
+Survival shaping decays against a process-shared global completed-game counter initialized from
+`total_games_played`; it therefore remains continuous across actors, vectorized environments, and full-state resumes.
+The shaping config uses 14,000 global games, calibrated to reach zero around the end of the current 5M-step stage.
+
+```bash
+uv run python run_monobeast.py --config-name survival_strategic_shaping \
+  load_dir=/absolute/path/to/outputs/distill_v1 checkpoint_file=best.pt weights_only=true
+```
+
+Use `latest.pt` only to resume the same distillation run; it also contains optimizer state.
+
+Promotion evaluation must use both orientations for every seed. Store one JSON object per game with `opponent`,
+`seed`, `candidate_player`, and `winner`, then aggregate it with:
+
+```bash
+uv run luxsr-run-matches --candidate /path/to/candidate/main.py --opponent /path/to/opponent/main.py \
+  --output-dir outputs/evaluation/candidate_vs_teacher --seeds 20
+uv run luxsr-evaluate --results-jsonl outputs/evaluation/candidate_vs_teacher/games.jsonl \
+  --output outputs/evaluation/candidate_vs_teacher/report.json
+```
+
+Do not promote from aggregate score alone: inspect opponent-specific paired delta, bootstrap lower bound, teacher
+non-regression, city survival, and stranded-fuel diagnostics.
+
+### Reusable official-CLI agent bundle
+
+Export the inference runtime once with an initial evaluated checkpoint. The archive contains observation construction,
+action masks, collision handling, model code, and the checkpoint/config pair:
+
+```bash
+uv run python tools/export_agent_bundle.py \
+  --checkpoint outputs/survival_strategic/2026-08-11/15-57-59/0659264_weights.pt \
+  --config outputs/survival_strategic/2026-08-11/15-57-59/config.yaml \
+  --model-name step-0659264 \
+  --output survival_strategic_agent.tar.gz
+```
+
+On the machine containing `Lux-Design-S1`, extract the archive and create the isolated agent environment once:
+
+```bash
+tar -xzf survival_strategic_agent.tar.gz -C /path/to/Lux-Design-S1/agents
+cd /path/to/Lux-Design-S1
+sh agents/survival_strategic_agent/setup_venv.sh
+```
+
+Later checkpoints do not require another export or environment setup. Register each checkpoint together with the
+config from the same run, then select it by name at match time:
+
+```bash
+python agents/survival_strategic_agent/install_model.py \
+  step-1040128 /path/to/1040128_weights.pt /path/to/that-run/config.yaml
+
+python agents/survival_strategic_agent/run_match.py \
+  step-1040128 kits/python/simple/main.py \
+  --candidate-player 0 --seed 2021 --out replays/step-1040128-p0.json
+```
+
+Run the second orientation with `--candidate-player 1`. The official CLI and opponent retain their existing Python;
+only `launcher.py` switches this agent process to the bundle-local `.venv`.
+
 This repository contains the code for the Lux AI Season 1 competition, hosted on Kaggle. The full write-up can be found on [Kaggle's forums](https://www.kaggle.com/c/lux-ai-2021/discussion/294993) and is copied below.
 
 # Toad Brigade’s Approach - Deep Reinforcement Learning

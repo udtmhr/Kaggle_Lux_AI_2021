@@ -6,11 +6,16 @@ from typing import Any, Dict, List, NoReturn, Tuple
 
 from .lux.game_map import Position
 from .lux_gym import ACT_SPACES_DICT, OBS_SPACES_DICT, REWARD_SPACES_DICT
+from .strategic_rl.obs import SurvivalStrategicObs
+from .strategic_rl.reward import SurvivalPotentialReward
 from .utility_constants import LOCAL_EVAL
 
 
 def flags_to_namespace(flags: Dict) -> SimpleNamespace:
     flags = SimpleNamespace(**flags)
+
+    OBS_SPACES_DICT.setdefault("SurvivalStrategicObs", SurvivalStrategicObs)
+    REWARD_SPACES_DICT.setdefault("SurvivalPotentialReward", SurvivalPotentialReward)
 
     # Env params
     flags.act_space = ACT_SPACES_DICT[flags.act_space]

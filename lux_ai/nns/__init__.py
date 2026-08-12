@@ -10,6 +10,7 @@ from .conv_blocks import ResidualBlock, ParallelDilationResidualBlock
 from .unet import UNET
 from ..lux_gym import create_flexible_obs_space, obs_spaces
 from ..utility_constants import MAX_BOARD_SIZE
+from ..strategic_rl.models import SurvivalStrategicBackbone, compatible_attention_heads
 
 
 def create_model(
@@ -52,7 +53,31 @@ def _create_model(
         use_index_select=flags.use_index_select,
         obs_space_prefix=obs_space_prefix
     )
-    if flags.model_arch == "conv_model":
+    if flags.model_arch == "survival_strategic":
+        global_channels = flags.hidden_dim * 2
+        base_model = nn.Sequential(
+            conv_embedding_input_layer,
+            SurvivalStrategicBackbone(
+                channels=flags.hidden_dim,
+                attention_blocks=getattr(flags, "attention_blocks", 4),
+                heads=compatible_attention_heads(global_channels, getattr(flags, "n_heads", 6)),
+            ),
+        )
+    elif flags.model_arch == "conv16_matched":
+        base_model = nn.Sequential(
+            conv_embedding_input_layer,
+            *[ResidualBlock(
+                in_channels=flags.hidden_dim,
+                out_channels=flags.hidden_dim,
+                height=MAX_BOARD_SIZE[0],
+                width=MAX_BOARD_SIZE[1],
+                kernel_size=flags.kernel_size,
+                normalize=flags.normalize,
+                activation=nn.LeakyReLU,
+                rescale_se_input=flags.rescale_se_input,
+            ) for _ in range(16)]
+        )
+    elif flags.model_arch == "conv_model":
         base_model = nn.Sequential(
             conv_embedding_input_layer,
             *[ResidualBlock(

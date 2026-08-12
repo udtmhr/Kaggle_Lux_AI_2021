@@ -1,0 +1,55 @@
+[project]
+name = "lux-strategic-rl"
+version = "0.1.0"
+description = "Scratch-distilled strategic RL agents for Lux AI 2021"
+readme = "README.md"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "fire",
+    "gym==0.26.2",
+    "hydra-colorlog",
+    "hydra-core",
+    "kaggle-environments==1.12.0",
+    "numpy==1.24.4",
+    "omegaconf",
+    "psutil",
+    "pyyaml",
+    "scipy",
+    "torch==2.7.1",
+    "tqdm>=4.66,<5",
+    "wandb",
+]
+
+[project.scripts]
+luxsr-prepare-data = "lux_ai.strategic_rl.prepare_data:main"
+luxsr-train-distill = "lux_ai.strategic_rl.train_distill:main"
+luxsr-evaluate = "lux_ai.strategic_rl.evaluate:main"
+luxsr-run-matches = "lux_ai.strategic_rl.run_matches:main"
+luxsr-validate-run = "lux_ai.strategic_rl.artifacts:main"
+
+[build-system]
+requires = ["setuptools==65.5.0", "wheel==0.38.4"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = ["pytest>=8.3,<8.4", "ruff>=0.15.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["lux_ai*"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-ignore = ["N999"]
