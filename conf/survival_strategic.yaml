@@ -97,6 +97,7 @@ sharing_strategy: file_descriptor
 seed: 2021
 num_buffers: 4
 use_mixed_precision: true
+actor_mixed_precision: false
 clip_grads: 10.0
 checkpoint_freq: 30.0
 num_learner_threads: 1

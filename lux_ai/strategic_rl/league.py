@@ -104,6 +104,18 @@ def merge_player_actions(
     return merged
 
 
+def merge_player_actions_inplace(
+    merged: Mapping[str, torch.Tensor],
+    opponent_actions: Mapping[str, torch.Tensor],
+    env_indices: Sequence[int],
+    opponent_players: Sequence[int],
+) -> None:
+    """Replace opponent actions without cloning the full action tensors again."""
+    for env_index, player in zip(env_indices, opponent_players):
+        for entity in merged:
+            merged[entity][env_index, :, player] = opponent_actions[entity][env_index, :, player]
+
+
 def learner_player_mask(
     opponents: Sequence[Opponent], selected: Sequence[int], learner_players: Sequence[int], device: torch.device
 ) -> torch.Tensor:

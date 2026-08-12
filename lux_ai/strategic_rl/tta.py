@@ -51,9 +51,36 @@ def rotate_model_input_180(model_input: Mapping) -> dict:
 
 
 def rot180_ensemble_outputs(model, model_input: Mapping) -> dict[str, object]:
-    """Average original and inverse-aligned 180-degree model logits/value."""
-    original = model(model_input, sample=False, actions_per_square=1)
-    rotated = model(rotate_model_input_180(model_input), sample=False, actions_per_square=1)
+    """Average both views using one larger forward instead of two small forwards."""
+    rotated_input = rotate_model_input_180(model_input)
+    batched_input = {
+        "obs": {
+            key: torch.cat((value, rotated_input["obs"][key]), dim=0) for key, value in model_input["obs"].items()
+        },
+        "info": {
+            "input_mask": torch.cat(
+                (model_input["info"]["input_mask"], rotated_input["info"]["input_mask"]), dim=0
+            ),
+            "available_actions_mask": {
+                key: torch.cat((value, rotated_input["info"]["available_actions_mask"][key]), dim=0)
+                for key, value in model_input["info"]["available_actions_mask"].items()
+            },
+        },
+    }
+    if "subtask_embeddings" in model_input["info"]:
+        batched_input["info"]["subtask_embeddings"] = torch.cat(
+            (model_input["info"]["subtask_embeddings"], rotated_input["info"]["subtask_embeddings"]), dim=0
+        )
+    batch_size = model_input["info"]["input_mask"].shape[0]
+    combined = model(batched_input, sample=False, actions_per_square=1)
+    original = {
+        "policy_logits": {key: value[:batch_size] for key, value in combined["policy_logits"].items()},
+        "baseline": combined["baseline"][:batch_size],
+    }
+    rotated = {
+        "policy_logits": {key: value[batch_size:] for key, value in combined["policy_logits"].items()},
+        "baseline": combined["baseline"][batch_size:],
+    }
     rotated_policy = rotate_policy_180(rotated["policy_logits"])
     return {
         "policy_logits": {

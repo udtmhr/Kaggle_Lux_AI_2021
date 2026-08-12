@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 
 from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
+from lux_ai.lux_gym.wrappers import VecEnv
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
 from lux_ai.strategic_rl.evaluate import summarize
@@ -16,6 +18,7 @@ from lux_ai.strategic_rl.league import (
     PFSPSampler,
     learner_player_mask,
     merge_player_actions,
+    merge_player_actions_inplace,
     opponents_from_config,
 )
 from lux_ai.strategic_rl.models import SurvivalStrategicBackbone
@@ -28,7 +31,9 @@ from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
 from lux_ai.strategic_rl.tta import (
     ROT180_ACTION_INDICES,
+    rot180_ensemble_outputs,
     rotate_compact_distillation_batch_180,
+    rotate_model_input_180,
     rotate_observations_180,
     rotate_policy_180,
 )
@@ -116,8 +121,82 @@ def test_league_config_sampling_and_player_action_merge():
     assert merged["worker"][1, 0, 1, 0, 0, 0] == 0
     assert torch.count_nonzero(learner["worker"]) == 0
 
+    merge_player_actions_inplace(merged, external, env_indices=[0], opponent_players=[1])
+    assert merged["worker"][0, 0, 1, 0, 0, 0] == 7
+
     mask = learner_player_mask(opponents, selected=[0, 1], learner_players=[0, 1], device=torch.device("cpu"))
     assert mask.tolist() == [[True, True], [False, True]]
+
+
+def test_vec_env_steps_independent_engines_concurrently():
+    barrier = threading.Barrier(2)
+
+    class FakeEnv:
+        def reset(self):
+            return np.zeros(1), (0.0, 0.0), False, {"value": np.zeros(1)}
+
+        def step(self, action):
+            barrier.wait(timeout=2)
+            value = np.asarray(action["value"])
+            return value, (0.0, 0.0), False, {"value": value}
+
+        def close(self):
+            return None
+
+    env = VecEnv([FakeEnv(), FakeEnv()])
+    try:
+        env.reset(force=True)
+        observation, _, _, _ = env.step({"value": np.asarray([[1.0], [2.0]])})
+    finally:
+        env.close()
+    assert observation.tolist() == [[1.0], [2.0]]
+
+
+def test_rot180_ensemble_batches_both_views_in_one_forward():
+    class DummyModel:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def __call__(self, model_input, sample, actions_per_square):
+            obs = model_input["obs"]["board"]
+            batch_size = obs.shape[0]
+            self.batch_sizes.append(batch_size)
+            base = obs[:, :1, :1].permute(0, 2, 3, 4, 1)
+            logits = torch.cat([base + offset for offset in range(len(ACTION_MEANINGS["worker"]))], dim=-1).unsqueeze(1)
+            return {
+                "policy_logits": {"worker": logits},
+                "baseline": obs.mean(dim=(1, 2, 3, 4)).unsqueeze(-1).expand(batch_size, 2),
+            }
+
+    model_input = {
+        "obs": {"board": torch.arange(2 * 1 * 1 * 3 * 3, dtype=torch.float32).view(2, 1, 1, 3, 3)},
+        "info": {
+            "input_mask": torch.ones(2, 1, 3, 3, dtype=torch.bool),
+            "available_actions_mask": {
+                "worker": torch.ones(2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"]), dtype=torch.bool)
+            },
+        },
+    }
+    reference_model = DummyModel()
+    original = reference_model(model_input, sample=False, actions_per_square=1)
+    rotated = reference_model(rotate_model_input_180(model_input), sample=False, actions_per_square=1)
+    expected_policy = (original["policy_logits"]["worker"] + rotate_policy_180(rotated["policy_logits"])["worker"]) / 2
+    expected_baseline = (original["baseline"] + rotated["baseline"]) / 2
+
+    fused_model = DummyModel()
+    actual = rot180_ensemble_outputs(fused_model, model_input)
+
+    assert fused_model.batch_sizes == [4]
+    assert torch.equal(actual["policy_logits"]["worker"], expected_policy)
+    assert torch.equal(actual["baseline"], expected_baseline)
+
+
+def test_player_perspective_stack_matches_original_indexing():
+    inputs = torch.arange(2 * 3 * 2 * 2 * 2).view(2, 3, 2, 2, 2)
+    original = inputs[:, :, torch.tensor([[0, 1], [1, 0]]), ...]
+    optimized = torch.stack((inputs, inputs.flip(dims=(2,))), dim=2)
+
+    assert torch.equal(optimized, original)
 
 
 def test_external_opponent_value_loss_masks_opponent_side():

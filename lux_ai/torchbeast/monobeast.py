@@ -28,7 +28,7 @@ import wandb
 import warnings
 
 import torch
-from torch.cuda import amp
+from torch import amp
 from torch import multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
@@ -51,7 +51,7 @@ from ..strategic_rl.artifacts import atomic_torch_save
 from ..strategic_rl.league import (
     LeagueSampler,
     learner_player_mask,
-    merge_player_actions,
+    merge_player_actions_inplace,
     opponents_from_config,
     rule_based_actions,
 )
@@ -177,11 +177,13 @@ def compute_policy_gradient_loss(
     return reduce(cross_entropy * advantages.detach(), reduction)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_output: Dict) -> Dict:
-    if not getattr(flags, "actor_policy_tta_rot180", False):
-        return actor_model(env_output)
-    output = rot180_ensemble_outputs(actor_model, env_output)
+    mixed_precision = getattr(flags, "actor_mixed_precision", flags.use_mixed_precision)
+    with amp.autocast("cuda", enabled=mixed_precision and flags.actor_device.type == "cuda"):
+        if not getattr(flags, "actor_policy_tta_rot180", False):
+            return actor_model(env_output)
+        output = rot180_ensemble_outputs(actor_model, env_output)
     output["actions"] = {
         entity: DictActor.logits_to_actions(
             torch.flatten(logits, start_dim=0, end_dim=-2),
@@ -203,7 +205,7 @@ def _league_actions(
     learner_players,
     opponent_models,
 ) -> Dict[str, torch.Tensor]:
-    merged = learner_actions
+    merged = {key: value.clone() for key, value in learner_actions.items()}
     for opponent_index, opponent in enumerate(opponents):
         if opponent.kind == "selfplay":
             continue
@@ -221,23 +223,25 @@ def _league_actions(
             )
         else:
             model_input = buffers_apply(env_output, lambda value, indices=env_indices: value[indices])
-            if opponent.kind == "teacher" and getattr(flags, "teacher_policy_tta_rot180", False):
-                model_output = rot180_ensemble_outputs(opponent_models[opponent_index], model_input)
-                model_actions = {
-                    entity: DictActor.logits_to_actions(
-                        logits.flatten(start_dim=0, end_dim=-2),
-                        sample=False,
-                        actions_per_square=MAX_OVERLAPPING_ACTIONS,
-                    ).view(*logits.shape[:-1], -1)
-                    for entity, logits in model_output["policy_logits"].items()
-                }
-            else:
-                model_actions = opponent_models[opponent_index](model_input, sample=False)["actions"]
+            mixed_precision = getattr(flags, "actor_mixed_precision", flags.use_mixed_precision)
+            with amp.autocast("cuda", enabled=mixed_precision and flags.actor_device.type == "cuda"):
+                if opponent.kind == "teacher" and getattr(flags, "teacher_policy_tta_rot180", False):
+                    model_output = rot180_ensemble_outputs(opponent_models[opponent_index], model_input)
+                    model_actions = {
+                        entity: DictActor.logits_to_actions(
+                            logits.flatten(start_dim=0, end_dim=-2),
+                            sample=False,
+                            actions_per_square=MAX_OVERLAPPING_ACTIONS,
+                        ).view(*logits.shape[:-1], -1)
+                        for entity, logits in model_output["policy_logits"].items()
+                    }
+                else:
+                    model_actions = opponent_models[opponent_index](model_input, sample=False)["actions"]
             opponent_actions = {key: torch.zeros_like(value) for key, value in learner_actions.items()}
             for local_index, env_index in enumerate(env_indices):
                 for entity in opponent_actions:
                     opponent_actions[entity][env_index] = model_actions[entity][local_index]
-        merged = merge_player_actions(merged, opponent_actions, env_indices, opponent_players)
+        merge_player_actions_inplace(merged, opponent_actions, env_indices, opponent_players)
     return merged
 
 
@@ -417,7 +421,7 @@ def learn(
 ) -> Tuple[Dict, int]:
     """Performs a learning (optimization) step."""
     with lock:
-        with amp.autocast(enabled=flags.use_mixed_precision):
+        with amp.autocast("cuda", enabled=flags.use_mixed_precision and flags.learner_device.type == "cuda"):
             flattened_batch = buffers_apply(batch, lambda x: torch.flatten(x, start_dim=0, end_dim=1))
             learner_outputs = learner_model(flattened_batch)
             learner_outputs = buffers_apply(
@@ -713,6 +717,7 @@ def train(flags):
     example_output["info"]["learner_player_mask"] = torch.ones((flags.n_actor_envs, 2), dtype=torch.bool)
     example_output["info"]["league_opponent_id"] = torch.zeros(flags.n_actor_envs, dtype=torch.int64)
     buffers = create_buffers(flags, example_env.unwrapped[0].obs_space, example_output["info"])
+    example_env.close()
     del example_env
 
     actor_model = create_model(flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False)
@@ -797,7 +802,7 @@ def train(flags):
         scaled_pct_complete = pct_complete * (1.0 - min_pct)
         return 1.0 - scaled_pct_complete
 
-    grad_scaler = amp.GradScaler()
+    grad_scaler = amp.GradScaler("cuda", enabled=flags.use_mixed_precision and flags.learner_device.type == "cuda")
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     if checkpoint_state is not None and not flags.weights_only:
         scheduler.load_state_dict(checkpoint_state["scheduler_state_dict"])

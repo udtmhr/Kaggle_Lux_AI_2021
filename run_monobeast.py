@@ -38,6 +38,9 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
 
     # Training params
     flags.setdefault("use_mixed_precision", True)
+    # Keep rollout policy logits in FP32 unless actor AMP is explicitly opted in.
+    # Small FP16 logit changes can alter sampled actions and therefore trajectories.
+    flags.setdefault("actor_mixed_precision", False)
     flags.setdefault("discounting", 0.999)
     flags.setdefault("reduction", "mean")
     flags.setdefault("clip_grads", 10.0)

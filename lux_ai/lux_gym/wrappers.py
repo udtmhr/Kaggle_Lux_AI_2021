@@ -1,8 +1,9 @@
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import gym
 import numpy as np
 import torch
-from typing import Dict, List, NoReturn, Optional, Tuple, Union
+from typing import Callable, Dict, List, NoReturn, Optional, Tuple, Union
 
 from .act_spaces import ACTION_MEANINGS
 from .lux_env import LuxEnv
@@ -167,9 +168,15 @@ class LoggingEnv(gym.Wrapper):
 
 
 class VecEnv(gym.Env):
-    def __init__(self, envs: List[gym.Env]):
+    def __init__(self, envs: List[gym.Env], parallel: bool = True):
         self.envs = envs
         self.last_outs = [() for _ in range(len(self.envs))]
+        self._executor = ThreadPoolExecutor(max_workers=len(envs)) if parallel and len(envs) > 1 else None
+
+    def _run(self, function: Callable[[int], Tuple], indices: List[int]) -> List[Tuple]:
+        if self._executor is None:
+            return [function(index) for index in indices]
+        return list(self._executor.map(function, indices))
 
     @staticmethod
     def _stack_dict(x: List[Union[Dict, np.ndarray]]) -> Union[Dict, np.ndarray]:
@@ -189,22 +196,20 @@ class VecEnv(gym.Env):
 
     def reset(self, force: bool = False, **kwargs):
         if force:
-            # noinspection PyArgumentList
-            self.last_outs = [env.reset(**kwargs) for env in self.envs]
+            self.last_outs = self._run(lambda index: self.envs[index].reset(**kwargs), list(range(len(self.envs))))
             return VecEnv._vectorize_env_outs(self.last_outs)
 
-        for i, env in enumerate(self.envs):
-            # Check if env finished
-            if self.last_outs[i][2]:
-                # noinspection PyArgumentList
-                self.last_outs[i] = env.reset(**kwargs)
+        reset_indices = [index for index, out in enumerate(self.last_outs) if out[2]]
+        reset_outs = self._run(lambda index: self.envs[index].reset(**kwargs), reset_indices)
+        for index, out in zip(reset_indices, reset_outs):
+            self.last_outs[index] = out
         return VecEnv._vectorize_env_outs(self.last_outs)
 
     def step(self, action: Dict[str, np.ndarray]):
         actions = [
             {key: val[i] for key, val in action.items()} for i in range(len(self.envs))
         ]
-        self.last_outs = [env.step(a) for env, a in zip(self.envs, actions)]
+        self.last_outs = self._run(lambda index: self.envs[index].step(actions[index]), list(range(len(self.envs))))
         return VecEnv._vectorize_env_outs(self.last_outs)
 
     def render(self, idx: int, mode: str = "human", **kwargs):
@@ -212,6 +217,9 @@ class VecEnv(gym.Env):
         return self.envs[idx].render(mode, **kwargs)
 
     def close(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         return [env.close() for env in self.envs]
 
     def seed(self, seed: Optional[int] = None) -> list:

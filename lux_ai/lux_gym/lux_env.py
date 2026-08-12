@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from queue import Queue, Empty
 import random
-from subprocess import Popen, PIPE
+from subprocess import PIPE, Popen, TimeoutExpired
 import sys
 from threading import Thread
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
@@ -106,8 +106,7 @@ class LuxEnv(gym.Env):
         self._restart_dimension_process()
 
     def _restart_dimension_process(self) -> NoReturn:
-        if self._dimension_process is not None:
-            self._dimension_process.kill()
+        self._stop_dimension_process()
         if self.run_game_automatically:
             # 1.1: Initialize dimensions in the background
             self._dimension_process = Popen(
@@ -121,6 +120,26 @@ class LuxEnv(gym.Env):
             self._t.daemon = True
             self._t.start()
             # atexit.register(_cleanup_dimensions_factory(self._dimension_process))
+
+    def _stop_dimension_process(self) -> None:
+        process = self._dimension_process
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except TimeoutExpired:
+                process.kill()
+                process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        self._dimension_process = None
+
+    def close(self) -> None:
+        self._stop_dimension_process()
+        super().close()
 
     def reset(self, observation_updates: Optional[List[str]] = None) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         self.game_state = Game()

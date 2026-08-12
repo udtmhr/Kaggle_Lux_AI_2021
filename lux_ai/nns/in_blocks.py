@@ -162,13 +162,9 @@ class ConvEmbeddingInputLayer(nn.Module):
             # Input should be of size (b, n, p|1, x, y) OR (b, n, p|1)
             in_tensor = x[self.obs_space_prefix + key]
             assert in_tensor.shape[2] <= 2
-            # First we duplicate each batch entry and swap player axes when relevant
-            in_tensor = in_tensor[
-                        :,
-                        :,
-                        [np.arange(in_tensor.shape[2]), np.arange(in_tensor.shape[2])[::-1]],
-                        ...
-                        ]
+            # Duplicate each batch entry from both player perspectives without
+            # constructing a CPU NumPy index tensor on every forward.
+            in_tensor = torch.stack((in_tensor, in_tensor.flip(dims=(2,))), dim=2)
             # Then we swap the new dims and channel dims so we can combine them with the batch dims
             in_tensor = torch.flatten(
                 in_tensor.transpose(1, 2),
