@@ -8,6 +8,15 @@ from pathlib import Path
 import numpy as np
 
 
+def candidate_last_response_turn(replay: dict, candidate_player: int) -> int:
+    turns = [
+        turn
+        for turn, commands in enumerate(replay.get("allCommands", ()))
+        if any(int(command.get("agentID", -1)) == candidate_player for command in commands)
+    ]
+    return max(turns, default=-1)
+
+
 def _turn_stats(updates: list[str], team: int) -> tuple[int, int, float]:
     cities = {}
     city_tiles = 0
@@ -105,6 +114,7 @@ def run_match(
     replay_path: Path,
     python: str,
     timeout: int,
+    opponent_name: str | None = None,
 ) -> dict:
     agents = [str(opponent), str(candidate)]
     agents[candidate_player] = str(candidate)
@@ -135,14 +145,67 @@ def run_match(
     ]
     subprocess.run(command, check=True, timeout=timeout)
     replay = json.loads(replay_path.read_text(encoding="utf-8"))
+    last_response_turn = candidate_last_response_turn(replay, candidate_player)
+    if len(replay.get("allCommands", ())) > 1 and last_response_turn < 1:
+        raise RuntimeError(
+            f"Candidate stopped responding after turn 0; refusing to record this as a valid loss: {replay_path}"
+        )
     return {
-        "opponent": opponent.stem,
+        "opponent": opponent_name or opponent.stem,
         "seed": seed,
         "map_size": map_size,
         "candidate_player": candidate_player,
+        "candidate_last_response_turn": last_response_turn,
         "replay": replay_path.name,
         **replay_metrics(replay, candidate_player),
     }
+
+
+def run_matched_matches(
+    candidate: Path,
+    opponent: Path,
+    output_dir: Path,
+    *,
+    seed_start: int = 2021,
+    seeds: int = 10,
+    map_sizes: tuple[int, ...] = (12, 16, 24, 32),
+    python: str = "python",
+    timeout: int = 600,
+    resume: bool = False,
+    opponent_name: str | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_path = output_dir / "games.jsonl"
+    if result_path.exists() and not resume:
+        raise FileExistsError(f"Refusing to mix evaluation runs; use a new directory or --resume: {result_path}")
+    completed = set()
+    if result_path.exists():
+        with result_path.open(encoding="utf-8") as existing_file:
+            for line in existing_file:
+                record = json.loads(line)
+                completed.add((int(record["seed"]), int(record["map_size"]), int(record["candidate_player"])))
+    with result_path.open("a" if resume else "x", encoding="utf-8") as result_file:
+        for seed in range(seed_start, seed_start + seeds):
+            for map_size in map_sizes:
+                for candidate_player in (0, 1):
+                    if (seed, map_size, candidate_player) in completed:
+                        continue
+                    name = f"seed-{seed}-size-{map_size}-p{candidate_player}.json"
+                    record = run_match(
+                        candidate,
+                        opponent,
+                        candidate_player,
+                        seed,
+                        map_size,
+                        output_dir / name,
+                        python,
+                        timeout,
+                        opponent_name,
+                    )
+                    result_file.write(json.dumps(record, sort_keys=True) + "\n")
+                    result_file.flush()
+                    print(json.dumps(record, sort_keys=True))
+    return result_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,36 +224,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = args.output_dir / "games.jsonl"
-    if result_path.exists() and not args.resume:
-        raise FileExistsError(f"Refusing to mix evaluation runs; use a new directory or --resume: {result_path}")
-    completed = set()
-    if result_path.exists():
-        with result_path.open(encoding="utf-8") as existing_file:
-            for line in existing_file:
-                record = json.loads(line)
-                completed.add((int(record["seed"]), int(record["map_size"]), int(record["candidate_player"])))
-    with result_path.open("a" if args.resume else "x", encoding="utf-8") as result_file:
-        for seed in range(args.seed_start, args.seed_start + args.seeds):
-            for map_size in args.map_sizes:
-                for candidate_player in (0, 1):
-                    if (seed, map_size, candidate_player) in completed:
-                        continue
-                    name = f"seed-{seed}-size-{map_size}-p{candidate_player}.json"
-                    record = run_match(
-                        args.candidate,
-                        args.opponent,
-                        candidate_player,
-                        seed,
-                        map_size,
-                        args.output_dir / name,
-                        args.python,
-                        args.timeout,
-                    )
-                    result_file.write(json.dumps(record, sort_keys=True) + "\n")
-                    result_file.flush()
-                    print(json.dumps(record, sort_keys=True))
+    run_matched_matches(
+        args.candidate,
+        args.opponent,
+        args.output_dir,
+        seed_start=args.seed_start,
+        seeds=args.seeds,
+        map_sizes=tuple(args.map_sizes),
+        python=args.python,
+        timeout=args.timeout,
+        resume=args.resume,
+    )
 
 
 if __name__ == "__main__":

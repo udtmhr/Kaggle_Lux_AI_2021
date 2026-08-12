@@ -12,6 +12,7 @@ from lux_ai.lux_gym.wrappers import VecEnv
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
 from lux_ai.strategic_rl.evaluate import summarize
+from lux_ai.strategic_rl.evaluate_checkpoint import evaluate_checkpoint
 from lux_ai.strategic_rl.league import (
     LeagueSampler,
     Opponent,
@@ -24,9 +25,10 @@ from lux_ai.strategic_rl.league import (
 from lux_ai.strategic_rl.models import SurvivalStrategicBackbone
 from lux_ai.strategic_rl.obs import night_turns_between
 from lux_ai.strategic_rl.prepare_data import _discover_replays
-from lux_ai.strategic_rl.reward import SurvivalPotentialReward
-from lux_ai.strategic_rl.run_matches import replay_metrics
+from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
+from lux_ai.strategic_rl.reward import SurvivalPotentialReward
+from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
 from lux_ai.strategic_rl.tta import (
@@ -76,6 +78,73 @@ def test_named_inference_model_directory(monkeypatch, tmp_path: Path):
 
     assert model_directory() == model_dir.resolve()
     assert checkpoint_path() == checkpoint
+
+
+def test_prepare_eval_agent_builds_isolated_single_checkpoint(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "001024_weights.pt"
+    torch.save({"model_state_dict": {}}, checkpoint)
+    config = run_dir / "config.yaml"
+    config.write_text("model_arch: survival_strategic\n", encoding="utf-8")
+    output_dir = tmp_path / "lux_candidate_001024"
+
+    result = prepare_eval_agent(checkpoint, output_dir, validate_model=False)
+
+    bundled = output_dir / "lux_ai" / "rl_agent" / checkpoint.name
+    assert checkpoint_label(checkpoint) == "001024"
+    assert Path(result["agent"]) == output_dir / "main.py"
+    assert bundled.is_file()
+    assert sha256_file(bundled) == sha256_file(checkpoint)
+    assert list((output_dir / "lux_ai" / "rl_agent").glob("*.pt")) == [bundled]
+    assert (output_dir / "lux_ai" / "rl_agent" / "config.yaml").read_text(encoding="utf-8") == config.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_candidate_response_turn_detects_turn_zero_agent_exit():
+    crashed = {"allCommands": [[{"agentID": 0, "command": "m u_1 e"}], [{"agentID": 1, "command": "m u_2 w"}]]}
+    healthy = {
+        "allCommands": [
+            [{"agentID": 0, "command": "m u_1 e"}],
+            [{"agentID": 0, "command": "dst alive"}],
+        ]
+    }
+    assert candidate_last_response_turn(crashed, 0) == 0
+    assert candidate_last_response_turn(healthy, 0) == 1
+
+
+def test_evaluate_checkpoint_builds_runs_and_writes_report(monkeypatch, tmp_path: Path):
+    checkpoint = tmp_path / "001024_weights.pt"
+    checkpoint.touch()
+    opponent = tmp_path / "opponent.py"
+    opponent.touch()
+    candidate = tmp_path / "agent" / "main.py"
+    candidate.parent.mkdir()
+    candidate.touch()
+    output_dir = tmp_path / "evaluation"
+
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.evaluate_checkpoint.prepare_eval_agent",
+        lambda *args, **kwargs: {"agent": str(candidate)},
+    )
+
+    def fake_run_matches(*args, **kwargs):
+        output_dir.mkdir()
+        games = output_dir / "games.jsonl"
+        records = [
+            {"opponent": "teacher", "seed": 2021, "map_size": 12, "candidate_player": 0, "winner": 0},
+            {"opponent": "teacher", "seed": 2021, "map_size": 12, "candidate_player": 1, "winner": 1},
+        ]
+        games.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        return games
+
+    monkeypatch.setattr("lux_ai.strategic_rl.evaluate_checkpoint.run_matched_matches", fake_run_matches)
+
+    result = evaluate_checkpoint(checkpoint, opponent, output_dir, opponent_name="teacher")
+
+    assert result["summary"]["opponents"]["teacher"]["score_rate"] == 1.0
+    assert (output_dir / "report.json").is_file()
 
 
 def test_backbone_masks_padding_and_is_finite():

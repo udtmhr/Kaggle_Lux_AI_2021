@@ -57,11 +57,15 @@ Promotion evaluation must use both orientations for every seed. Store one JSON o
 `seed`, `candidate_player`, and `winner`, then aggregate it with:
 
 ```bash
-uv run luxsr-run-matches --candidate /path/to/candidate/main.py --opponent /path/to/opponent/main.py \
-  --output-dir outputs/evaluation/candidate_vs_teacher --seeds 20
-uv run luxsr-evaluate --results-jsonl outputs/evaluation/candidate_vs_teacher/games.jsonl \
-  --output outputs/evaluation/candidate_vs_teacher/report.json
+uv run luxsr-evaluate-checkpoint \
+  outputs/survival_strategic/2026-08-11/15-57-59/1140224_weights.pt
 ```
+
+`luxsr-evaluate-checkpoint` automatically builds `/tmp/lux_candidate_<step>/main.py`, runs the first-place opponent
+in both orientations on one 12x12 seed, and writes `games.jsonl` plus `report.json` under
+`outputs/evaluation/step_<step>_vs_first_place`. A candidate that stops responding after turn 0 fails the evaluation.
+For a full 80-game evaluation, add `--seeds 10 --map-sizes 12 16 24 32`. Use `--opponent` and `--opponent-name` to
+select another opponent. `luxsr-prepare-eval-agent` remains available when only the isolated agent is needed.
 
 Do not promote from aggregate score alone: inspect opponent-specific paired delta, bootstrap lower bound, teacher
 non-regression, city survival, and stranded-fuel diagnostics.

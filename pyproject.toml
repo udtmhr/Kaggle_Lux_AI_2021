@@ -22,6 +22,8 @@ dependencies = [
 
 [project.scripts]
 luxsr-prepare-data = "lux_ai.strategic_rl.prepare_data:main"
+luxsr-prepare-eval-agent = "lux_ai.strategic_rl.prepare_eval_agent:main"
+luxsr-evaluate-checkpoint = "lux_ai.strategic_rl.evaluate_checkpoint:main"
 luxsr-train-distill = "lux_ai.strategic_rl.train_distill:main"
 luxsr-evaluate = "lux_ai.strategic_rl.evaluate:main"
 luxsr-run-matches = "lux_ai.strategic_rl.run_matches:main"
