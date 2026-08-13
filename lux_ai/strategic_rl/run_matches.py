@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -115,7 +116,10 @@ def run_match(
     python: str,
     timeout: int,
     opponent_name: str | None = None,
+    max_time_ms: int = 20_000,
 ) -> dict:
+    if max_time_ms <= 0:
+        raise ValueError("max_time_ms must be positive")
     agents = [str(opponent), str(candidate)]
     agents[candidate_player] = str(candidate)
     agents[1 - candidate_player] = str(opponent)
@@ -129,7 +133,7 @@ def run_match(
         "--memory",
         "8000",
         "--maxtime",
-        "20000",
+        str(max_time_ms),
         "--storeLogs",
         "false",
         "--statefulReplay",
@@ -173,7 +177,10 @@ def run_matched_matches(
     timeout: int = 600,
     resume: bool = False,
     opponent_name: str | None = None,
+    workers: int = 2,
 ) -> Path:
+    if workers <= 0:
+        raise ValueError("workers must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
     result_path = output_dir / "games.jsonl"
     if result_path.exists() and not resume:
@@ -184,27 +191,52 @@ def run_matched_matches(
             for line in existing_file:
                 record = json.loads(line)
                 completed.add((int(record["seed"]), int(record["map_size"]), int(record["candidate_player"])))
-    with result_path.open("a" if resume else "x", encoding="utf-8") as result_file:
-        for seed in range(seed_start, seed_start + seeds):
-            for map_size in map_sizes:
-                for candidate_player in (0, 1):
-                    if (seed, map_size, candidate_player) in completed:
-                        continue
-                    name = f"seed-{seed}-size-{map_size}-p{candidate_player}.json"
-                    record = run_match(
-                        candidate,
-                        opponent,
-                        candidate_player,
-                        seed,
-                        map_size,
-                        output_dir / name,
-                        python,
-                        timeout,
-                        opponent_name,
-                    )
-                    result_file.write(json.dumps(record, sort_keys=True) + "\n")
-                    result_file.flush()
-                    print(json.dumps(record, sort_keys=True))
+    jobs = []
+    for seed in range(seed_start, seed_start + seeds):
+        for map_size in map_sizes:
+            for candidate_player in (0, 1):
+                if (seed, map_size, candidate_player) in completed:
+                    continue
+                replay_path = output_dir / f"seed-{seed}-size-{map_size}-p{candidate_player}.json"
+                jobs.append((candidate_player, seed, map_size, replay_path))
+
+    failures = []
+    with (
+        result_path.open("a" if resume else "x", encoding="utf-8") as result_file,
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lux-eval") as executor,
+    ):
+        futures = {
+            executor.submit(
+                run_match,
+                candidate,
+                opponent,
+                candidate_player,
+                seed,
+                map_size,
+                replay_path,
+                python,
+                timeout,
+                opponent_name,
+            ): (seed, map_size, candidate_player)
+            for candidate_player, seed, map_size, replay_path in jobs
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            error = future.exception()
+            if error is not None:
+                failures.append((key, error))
+                continue
+            record = future.result()
+            line = json.dumps(record, sort_keys=True)
+            result_file.write(line + "\n")
+            result_file.flush()
+            print(line)
+    if failures:
+        details = "; ".join(
+            f"seed={seed}, map_size={map_size}, candidate_player={player}: {error}"
+            for (seed, map_size, player), error in failures
+        )
+        raise RuntimeError(f"{len(failures)} evaluation match(es) failed; successful matches were saved: {details}")
     return result_path
 
 
@@ -218,6 +250,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-sizes", type=int, nargs="+", default=(12, 16, 24, 32))
     parser.add_argument("--python", default="python")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--workers", type=int, default=2, help="Concurrent matches; use 1 to disable parallelism.")
     parser.add_argument("--resume", action="store_true", help="Skip completed seed/map/orientation records.")
     return parser.parse_args()
 
@@ -234,6 +267,7 @@ def main() -> None:
         python=args.python,
         timeout=args.timeout,
         resume=args.resume,
+        workers=args.workers,
     )
 
 

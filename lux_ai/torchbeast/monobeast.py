@@ -979,6 +979,12 @@ def train(flags):
 
     t = flags.unroll_length
     b = flags.batch_size
+    training_stop_step = min(
+        int(flags.total_steps),
+        int(flags.stop_after_step) if getattr(flags, "stop_after_step", None) is not None else int(flags.total_steps),
+    )
+    if training_stop_step <= 0:
+        raise ValueError("stop_after_step must be positive")
 
     league_opponents = opponents_from_config(flags.league_opponents) if flags.league_enabled else (
         opponents_from_config([{"name": "selfplay", "kind": "selfplay", "weight": 1.0}])
@@ -1196,7 +1202,7 @@ def train(flags):
         """Thread target for the learning process."""
         nonlocal step, total_games_played, stats
         timings = prof.Timings()
-        while step < flags.total_steps:
+        while step < training_stop_step:
             timings.reset()
             full_batch = get_batch(
                 flags,
@@ -1280,7 +1286,7 @@ def train(flags):
     timer = timeit.default_timer
     try:
         last_checkpoint_time = timer()
-        while step < flags.total_steps:
+        while step < training_stop_step:
             dead_actors = [index for index, actor in enumerate(actor_processes) if not actor.is_alive()]
             if dead_actors:
                 raise RuntimeError(f"Rollout actors terminated before training completed: {dead_actors}")

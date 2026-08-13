@@ -1,0 +1,55 @@
+schema_version: 1
+
+search:
+  pilot_sigmas: [0.0025, 0.005, 0.01]
+  pilot_directions: 8
+  pilot_games_per_candidate: 2
+  generations: 8
+  directions: 16
+  games_per_candidate: 4
+  active_probability: 0.75
+  active_warmup_generations: 2
+  active_rank: 8
+  tie_break_weight: 0.01
+  scale_floor: 0.001
+  seed: 2021
+
+evaluation:
+  pilot_seed_start: 20000
+  train_seed_start: 30000
+  gate_seed_start: 40000
+  map_sizes: [12, 16, 24, 32]
+  gate_pairs: 4
+  action_probe_states: 1024
+  action_disagreement_min: 0.01
+  action_disagreement_max: 0.20
+  signal_fraction_min: 0.25
+  max_city_extinction_delta: 0.05
+  formal_seeds: 10
+  formal_bootstrap_samples: 2000
+  formal_min_head_to_head_score: 0.50
+  formal_min_head_to_head_lcb95: 0.45
+  formal_min_first_place_delta: -0.05
+
+history_checkpoints:
+  - outputs/strength_winloss_001/step_1000000/0542336_weights.pt
+  - outputs/strength_winloss_001/step_1000000/0428416_weights.pt
+  - outputs/strength_winloss_001/step_1000000/0316544_weights.pt
+  - outputs/strength_winloss_001/step_1000000/0206528_weights.pt
+  - outputs/strength_winloss_001/step_1000000/0100096_weights.pt
+
+opponents:
+  - name: first_place
+    checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+    config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+    agent: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py
+  - name: initial_model
+    source: initial
+  - name: past_59822400
+    checkpoint: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+    config: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+    agent: internal_testing/hall_of_fame/11-09_21-32-04_59822400/main.py
+  - name: past_28576448
+    checkpoint: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+    config: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+    agent: internal_testing/hall_of_fame/10-10_11-18-12_28576448/main.py

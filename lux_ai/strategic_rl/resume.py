@@ -4,7 +4,13 @@ from omegaconf import DictConfig, OmegaConf
 def merge_resume_config(saved_flags: DictConfig, selected_flags: DictConfig, cli_conf: DictConfig) -> DictConfig:
     """Migrate newly introduced league fields without resetting saved run settings."""
     migrations = {}
-    for key in ("league_enabled", "league_opponents", "league_config_version", "reward_config_version"):
+    for key in (
+        "league_enabled",
+        "league_opponents",
+        "league_config_version",
+        "reward_config_version",
+        "teacher_kl_cost_floor",
+    ):
         if key not in saved_flags and key in selected_flags:
             migrations[key] = selected_flags[key]
     saved_version = int(saved_flags.get("league_config_version", 0))

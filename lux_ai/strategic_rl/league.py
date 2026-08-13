@@ -22,6 +22,7 @@ class Opponent:
     weight: float = 1.0
     strategy: str = "economy"
     slot: int = 0
+    fixed_probability: float = 0.0
 
 
 class PFSPSampler:
@@ -44,24 +45,66 @@ class PFSPSampler:
         self.exploration = float(exploration)
 
     def probabilities(self, win_rates: Mapping[str, float]) -> np.ndarray:
-        # Prefer opponents near a 50% learner win rate. Extremely weak or
-        # currently impossible opponents retain a small exploration share.
-        scores = np.asarray([], dtype=np.float64)
+        # Reserve fixed opponent probabilities first, then apply PFSP only to
+        # the remaining probability mass. This prevents a deliberately hard
+        # anchor (for example first-place) from disappearing as its win rate
+        # moves away from 50%.
+        fixed = np.asarray([opponent.fixed_probability for opponent in self.opponents], dtype=np.float64)
+        if not np.isfinite(fixed).all() or (fixed < 0).any() or fixed.sum() >= 1.0:
+            raise ValueError("fixed opponent probabilities must be finite, non-negative, and sum to less than one")
+        adaptive = fixed == 0.0
+        if not adaptive.any():
+            raise ValueError("PFSP requires at least one opponent without fixed_probability")
+
+        # Prefer adaptive opponents near a 50% learner win rate. Extremely
+        # weak or currently impossible opponents retain a small exploration share.
         priorities = []
         for opponent in self.opponents:
+            if opponent.fixed_probability > 0.0:
+                priorities.append(0.0)
+                continue
             win_rate = float(np.clip(win_rates.get(opponent.name, 0.5), 0.0, 1.0))
             learnability = max(win_rate * (1.0 - win_rate), self.exploration)
             priorities.append(max(opponent.weight, 0.0) * learnability**self.power)
         scores = np.asarray(priorities, dtype=np.float64)
         if scores.sum() <= 0.0:
-            scores = np.ones(len(self.opponents), dtype=np.float64)
-        probabilities = scores / max(scores.sum(), 1e-12)
-        teacher_indices = [i for i, opponent in enumerate(self.opponents) if opponent.kind == "teacher"]
-        if teacher_indices and probabilities[teacher_indices].sum() < self.teacher_floor:
-            probabilities *= 1.0 - self.teacher_floor
-            teacher_share = self.teacher_floor / len(teacher_indices)
-            probabilities[teacher_indices] += teacher_share
-            probabilities /= probabilities.sum()
+            scores = adaptive.astype(np.float64)
+        remaining = 1.0 - fixed.sum()
+        probabilities = fixed + remaining * scores / max(scores.sum(), 1e-12)
+
+        # The teacher floor applies to total teacher exposure, including fixed
+        # anchors. If more teacher mass is needed, take it proportionally from
+        # adaptive non-teachers and distribute it across adaptive teachers.
+        teacher_indices = np.asarray(
+            [i for i, opponent in enumerate(self.opponents) if opponent.kind == "teacher"], dtype=np.int64
+        )
+        adaptive_teachers = np.asarray(
+            [
+                i
+                for i, opponent in enumerate(self.opponents)
+                if opponent.kind == "teacher" and opponent.fixed_probability == 0.0
+            ],
+            dtype=np.int64,
+        )
+        current_teacher_share = probabilities[teacher_indices].sum() if teacher_indices.size else 0.0
+        if adaptive_teachers.size and current_teacher_share < self.teacher_floor:
+            needed = self.teacher_floor - current_teacher_share
+            donors = np.asarray(
+                [
+                    i
+                    for i, opponent in enumerate(self.opponents)
+                    if opponent.kind != "teacher" and opponent.fixed_probability == 0.0
+                ],
+                dtype=np.int64,
+            )
+            available = probabilities[donors].sum() if donors.size else 0.0
+            transfer = min(needed, available)
+            if transfer > 0.0:
+                probabilities[donors] *= (available - transfer) / available
+                teacher_weights = probabilities[adaptive_teachers]
+                if teacher_weights.sum() <= 0.0:
+                    teacher_weights = np.ones(len(adaptive_teachers), dtype=np.float64)
+                probabilities[adaptive_teachers] += transfer * teacher_weights / teacher_weights.sum()
         return probabilities
 
     def sample(self, win_rates: Mapping[str, float], rng: np.random.Generator) -> Opponent:
@@ -97,6 +140,7 @@ def opponents_from_config(entries: Sequence[Mapping]) -> tuple[Opponent, ...]:
             weight=float(entry.get("weight", 1.0)),
             strategy=str(entry.get("strategy", "economy")),
             slot=int(entry.get("slot", 0)),
+            fixed_probability=float(entry.get("fixed_probability", 0.0)),
         )
         for entry in entries
     )
@@ -112,6 +156,10 @@ def opponents_from_config(entries: Sequence[Mapping]) -> tuple[Opponent, ...]:
             raise ValueError(f"{opponent.name} requires a config")
         if opponent.kind == "learner_snapshot" and opponent.slot < 0:
             raise ValueError(f"{opponent.name} requires a non-negative slot")
+        if not 0.0 <= opponent.fixed_probability < 1.0:
+            raise ValueError(f"{opponent.name} fixed_probability must be in [0, 1)")
+    if sum(opponent.fixed_probability for opponent in opponents) >= 1.0:
+        raise ValueError("fixed opponent probabilities must sum to less than one")
     return opponents
 
 

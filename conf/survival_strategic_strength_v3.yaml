@@ -1,0 +1,59 @@
+defaults:
+- survival_strategic_strength_v2
+- _self_
+
+name: survival_strategic_strength_v3
+
+# Keep the first-place anchor outside PFSP. The remaining 75% is allocated
+# adaptively across self-play, snapshots, historical agents, and rule bots.
+league_config_version: 4
+pfsp_teacher_floor: 0.25
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.30
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.10
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.10
+- name: first_place
+  kind: teacher
+  weight: 0.20
+  fixed_probability: 0.25
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: past_59822400
+  kind: teacher
+  weight: 0.05
+  config: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+- name: past_28576448
+  kind: teacher
+  weight: 0.05
+  config: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+- name: rule_economy
+  kind: rule_based
+  strategy: economy
+  weight: 0.05
+- name: rule_survival
+  kind: rule_based
+  strategy: survival
+  weight: 0.025
+- name: rule_expansion
+  kind: rule_based
+  strategy: expansion
+  weight: 0.025
+
+# Do not let the online first-place anchor decay below this value.
+teacher_kl_cost_end: 0.005
+teacher_kl_cost_floor: 0.005
+
+# The coordinator overrides this at each evaluation milestone while retaining
+# total_steps=1M, so LR/KL schedules do not restart or decay prematurely.
+stop_after_step: null
+

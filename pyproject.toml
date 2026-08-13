@@ -28,6 +28,8 @@ luxsr-train-distill = "lux_ai.strategic_rl.train_distill:main"
 luxsr-evaluate = "lux_ai.strategic_rl.evaluate:main"
 luxsr-run-matches = "lux_ai.strategic_rl.run_matches:main"
 luxsr-validate-run = "lux_ai.strategic_rl.artifacts:main"
+luxsr-train-eval = "lux_ai.strategic_rl.train_eval:main"
+luxsr-train-es = "lux_ai.strategic_rl.train_es:main"
 
 [build-system]
 requires = ["setuptools==65.5.0", "wheel==0.38.4"]

@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,14 +9,14 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
 from lux_ai.lux_gym import create_env
-from lux_ai.nns import create_model
+from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
 from lux_ai.lux_gym.wrappers import VecEnv
+from lux_ai.nns import create_model
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
 from lux_ai.strategic_rl.evaluate import summarize
-from lux_ai.strategic_rl.evaluate_checkpoint import evaluate_checkpoint
+from lux_ai.strategic_rl.evaluate_checkpoint import _opponent_model_files, _parity_passed, evaluate_checkpoint
 from lux_ai.strategic_rl.league import (
     LeagueSampler,
     Opponent,
@@ -32,9 +33,10 @@ from lux_ai.strategic_rl.prepare_data import _discover_replays
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
 from lux_ai.strategic_rl.reward import StrategicPotentialRewardV2, SurvivalPotentialReward
-from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics
+from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics, run_matched_matches
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
+from lux_ai.strategic_rl.train_eval import full_checkpoint, promotion_decision, run_training_segment
 from lux_ai.strategic_rl.tta import (
     ROT180_ACTION_INDICES,
     rot180_ensemble_outputs,
@@ -44,9 +46,9 @@ from lux_ai.strategic_rl.tta import (
     rotate_policy_180,
 )
 from lux_ai.torchbeast.monobeast import (
-    configure_trainable_parameters,
     compute_baseline_loss,
     compute_teacher_kl_loss,
+    configure_trainable_parameters,
     trajectory_weighted_mean,
 )
 from lux_ai.utils import flags_to_namespace
@@ -154,7 +156,126 @@ def test_evaluate_checkpoint_builds_runs_and_writes_report(monkeypatch, tmp_path
     result = evaluate_checkpoint(checkpoint, opponent, output_dir, opponent_name="teacher")
 
     assert result["summary"]["opponents"]["teacher"]["score_rate"] == 1.0
+    assert result["backend"]["selected"] == "official"
     assert (output_dir / "report.json").is_file()
+
+
+def test_evaluate_checkpoint_auto_selects_batched_backend_after_parity(monkeypatch, tmp_path: Path):
+    checkpoint = tmp_path / "candidate" / "001024_weights.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.touch()
+    config = checkpoint.parent / "config.yaml"
+    config.touch()
+    opponent = tmp_path / "opponent" / "main.py"
+    opponent_model_dir = opponent.parent / "lux_ai" / "rl_agent"
+    opponent_model_dir.mkdir(parents=True)
+    opponent.touch()
+    (opponent_model_dir / "model.pt").touch()
+    (opponent_model_dir / "config.yaml").touch()
+    candidate = tmp_path / "agent" / "main.py"
+    candidate.parent.mkdir()
+    candidate.touch()
+
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.evaluate_checkpoint.prepare_eval_agent",
+        lambda *args, **kwargs: {"agent": str(candidate)},
+    )
+    records = [
+        {"opponent": "teacher", "seed": 2021, "map_size": 12, "candidate_player": player, "winner": player}
+        for player in (0, 1)
+    ]
+
+    def write_records(output):
+        output.mkdir(parents=True, exist_ok=True)
+        games = output / "games.jsonl"
+        games.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        return games
+
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.evaluate_checkpoint.run_matched_matches",
+        lambda *args, **kwargs: write_records(args[2]),
+    )
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.evaluate_checkpoint._run_batched_matches",
+        lambda *args, **kwargs: write_records(args[4]),
+    )
+    result = evaluate_checkpoint(
+        checkpoint,
+        opponent,
+        tmp_path / "evaluation",
+        config=config,
+        opponent_name="teacher",
+    )
+    assert result["backend"]["parity"] == "passed"
+    assert result["backend"]["selected"] == "internal"
+
+
+def test_run_matched_matches_runs_games_in_parallel(monkeypatch, tmp_path: Path):
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_run_match(candidate, opponent, candidate_player, seed, map_size, replay_path, python, timeout, opponent_name):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return {
+            "opponent": opponent_name,
+            "seed": seed,
+            "map_size": map_size,
+            "candidate_player": candidate_player,
+            "winner": candidate_player,
+        }
+
+    monkeypatch.setattr("lux_ai.strategic_rl.run_matches.run_match", fake_run_match)
+    result_path = run_matched_matches(
+        tmp_path / "candidate.py",
+        tmp_path / "opponent.py",
+        tmp_path / "evaluation",
+        seeds=2,
+        map_sizes=(12,),
+        opponent_name="teacher",
+        workers=2,
+    )
+
+    records = [json.loads(line) for line in result_path.read_text(encoding="utf-8").splitlines()]
+    assert max_active == 2
+    assert len(records) == 4
+    assert {(record["seed"], record["candidate_player"]) for record in records} == {
+        (2021, 0),
+        (2021, 1),
+        (2022, 0),
+        (2022, 1),
+    }
+
+
+def test_batched_evaluation_discovers_bundle_and_checks_parity(tmp_path: Path):
+    opponent = tmp_path / "opponent" / "main.py"
+    model_dir = opponent.parent / "lux_ai" / "rl_agent"
+    model_dir.mkdir(parents=True)
+    opponent.touch()
+    checkpoint = model_dir / "model.pt"
+    config = model_dir / "config.yaml"
+    checkpoint.touch()
+    config.touch()
+    assert _opponent_model_files(opponent) == (checkpoint, config)
+
+    official = tmp_path / "official.jsonl"
+    internal = tmp_path / "internal.jsonl"
+    records = [
+        {"opponent": "teacher", "seed": 7, "map_size": 12, "candidate_player": player, "winner": player}
+        for player in (0, 1)
+    ]
+    payload = "".join(json.dumps(record) + "\n" for record in records)
+    official.write_text(payload, encoding="utf-8")
+    internal.write_text(payload, encoding="utf-8")
+    assert _parity_passed(official, internal)
+    internal.write_text(payload.replace('"winner": 1', '"winner": 0'), encoding="utf-8")
+    assert not _parity_passed(official, internal)
 
 
 def test_backbone_masks_padding_and_is_finite():
@@ -181,6 +302,20 @@ def test_linear_schedule_and_teacher_floor():
     assert probabilities[0] >= 0.2
     disabled = type("Flags", (), {"use_teacher": False, "teacher_kl_cost": 1.0})()
     assert teacher_kl_coefficient(disabled, 0) == 0.0
+    anchored = type(
+        "Flags",
+        (),
+        {
+            "use_teacher": True,
+            "teacher_kl_cost": 0.01,
+            "teacher_kl_cost_start": 0.01,
+            "teacher_kl_cost_end": 0.001,
+            "teacher_kl_cost_floor": 0.005,
+            "teacher_kl_decay_steps": 100,
+            "teacher_kl_delay_steps": 0,
+        },
+    )()
+    assert teacher_kl_coefficient(anchored, 100) == 0.005
 
 
 def test_league_config_sampling_and_player_action_merge():
@@ -418,6 +553,75 @@ def test_pfsp_prefers_learnable_opponent_and_honours_prior_weight():
     assert probabilities[2] > probabilities[1]
 
 
+def test_pfsp_reserves_fixed_first_place_probability():
+    opponents = [
+        Opponent("selfplay", kind="selfplay", weight=1.0),
+        Opponent("first_place", kind="teacher", weight=1.0, fixed_probability=0.25),
+        Opponent("snapshot", kind="learner_snapshot", weight=1.0),
+    ]
+    probabilities = PFSPSampler(opponents, teacher_floor=0.25).probabilities(
+        {"selfplay": 0.5, "first_place": 0.0, "snapshot": 0.2}
+    )
+    assert np.isclose(probabilities.sum(), 1.0)
+    assert np.isclose(probabilities[1], 0.25)
+
+
+def test_quality_gate_and_full_checkpoint_selection(tmp_path: Path):
+    baseline = {
+        "opponents": {
+            "first_place": {"score_rate": 0.20, "candidate_city_extinction_rate": 0.10}
+        }
+    }
+    candidate = {
+        "opponents": {
+            "first_place": {"score_rate": 0.14, "candidate_city_extinction_rate": 0.18}
+        }
+    }
+    decision = promotion_decision(
+        baseline,
+        candidate,
+        opponent_name="first_place",
+        min_score_delta=-0.05,
+        max_city_extinction_delta=0.05,
+    )
+    assert decision["passed"] is False
+    assert len(decision["reasons"]) == 2
+
+    atomic_torch_save({"model_state_dict": {"x": torch.tensor(1)}}, tmp_path / "200_weights.pt")
+    atomic_torch_save(
+        {"model_state_dict": {}, "optimizer_state_dict": {}, "step": 100}, tmp_path / "100.pt"
+    )
+    atomic_torch_save(
+        {"model_state_dict": {}, "optimizer_state_dict": {}, "step": 200}, tmp_path / "200.pt"
+    )
+    assert full_checkpoint(tmp_path) == tmp_path / "200.pt"
+
+
+def test_training_segment_uses_hydra_append_for_resume_paths(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("lux_ai.strategic_rl.train_eval.subprocess.run", fake_run)
+    checkpoint = tmp_path / "base" / "500.pt"
+    run_training_segment(
+        config_name="survival_strategic_strength_v3",
+        run_dir=tmp_path / "stage",
+        stop_after_step=250,
+        total_steps=1000,
+        load_checkpoint=checkpoint,
+        weights_only=False,
+        python="python",
+    )
+    assert f"+load_dir={checkpoint.parent}" in captured["command"]
+    assert "+checkpoint_file=500.pt" in captured["command"]
+    assert "weights_only=false" in captured["command"]
+    assert "total_steps=1000" in captured["command"]
+    assert "stop_after_step=250" in captured["command"]
+
+
 def _cpu_strength_flags(intent_aux_enabled: bool):
     config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "survival_strategic_strength_v2.yaml")
     base = OmegaConf.load(Path(__file__).parents[1] / "conf" / "survival_strategic.yaml")
@@ -566,6 +770,24 @@ def test_evaluation_requires_and_counts_matched_map_orientations():
     teacher = report["opponents"]["teacher"]
     assert teacher["matched_pairs"] == 2
     assert teacher["score_rate"] == 0.75
+
+
+def test_evaluation_reports_extinction_rates():
+    records = [
+        {
+            "opponent": "teacher",
+            "seed": 7,
+            "map_size": 12,
+            "candidate_player": player,
+            "winner": player,
+            "candidate_final_city_tiles": 0 if player == 0 else 2,
+            "candidate_final_units": 0 if player == 0 else 1,
+        }
+        for player in (0, 1)
+    ]
+    teacher = summarize(records, bootstrap_samples=10)["opponents"]["teacher"]
+    assert teacher["candidate_city_extinction_rate"] == 0.5
+    assert teacher["candidate_unit_extinction_rate"] == 0.5
 
 
 def test_compact_shard_loads_ragged_entities_and_rebuilds_dense_mask(tmp_path: Path):

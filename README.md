@@ -65,10 +65,79 @@ uv run luxsr-evaluate-checkpoint \
 in both orientations on one 12x12 seed, and writes `games.jsonl` plus `report.json` under
 `outputs/evaluation/step_<step>_vs_first_place`. A candidate that stops responding after turn 0 fails the evaluation.
 For a full 80-game evaluation, add `--seeds 10 --map-sizes 12 16 24 32`. Use `--opponent` and `--opponent-name` to
-select another opponent. `luxsr-prepare-eval-agent` remains available when only the isolated agent is needed.
+select another opponent. `--backend auto` first compares a small official-CLI sample with the internal engine and,
+when winners agree, evaluates eight games per GPU inference batch. Use `--batch-games 4` if GPU memory is constrained,
+or `--backend official` to force isolated CLI matches. Official matches run with `--workers 2` by default.
+`luxsr-prepare-eval-agent` remains available when only the isolated agent is needed.
 
 Do not promote from aggregate score alone: inspect opponent-specific paired delta, bootstrap lower bound, teacher
 non-regression, city survival, and stranded-fuel diagnostics.
+
+### Gated strength-v3 training
+
+`survival_strategic_strength_v3` keeps first-place at an exact 25% rollout probability while PFSP distributes the
+remaining 75%, and floors online teacher KL at `0.005`. Use the coordinator to stop at fixed milestones, save a full
+checkpoint, run matched first-place evaluation while training is not using the GPU, and resume optimizer/scheduler
+state only after the quality gate passes:
+
+```bash
+uv run --locked luxsr-train-eval \
+  --base-checkpoint /absolute/path/to/old-5m/5000128_weights.pt \
+  --run-root outputs/strength_v3_gated_001 \
+  --milestones 250000 500000 750000 1000000 \
+  --seeds 5 --map-sizes 12 16 24 32
+```
+
+The baseline and every milestone use the same seeds, map sizes, and both player orientations. By default, training
+stops when score rate is more than 5 percentage points below the old 5M baseline or city-extinction rate is more
+than 5 points above it. Results and decisions are written atomically to `evaluation_progress.json`. Increase
+`--seeds` for the final selection; auto evaluation uses eight-game GPU batches after its parity check. Lower
+`--eval-batch-games` if GPU memory is constrained. `--continue-on-fail` is available only for deliberate ablation
+runs.
+
+### Pure Evolution Strategies fine-tuning
+
+`luxsr-train-es` evolves only action-affecting policy parameters from an RL checkpoint. It uses layer-scaled
+antithetic noise, common match schedules, centered ranks, ClipUp, and a recent-update/checkpoint-difference active
+subspace. Value and intent heads remain fixed. The default configuration first runs the sigma usefulness gate, then
+eight gated generations, and finally matched official-CLI promotion evaluation.
+
+Inspect all paths and the evolved parameter set without creating a run:
+
+```bash
+uv run --locked luxsr-train-es \
+  --init-checkpoint outputs/strength_winloss_001/step_1000000/0657088_weights.pt \
+  --config outputs/strength_winloss_001/step_1000000/config.yaml \
+  --run-dir outputs/es_strength_001 --dry-run
+```
+
+Run the requested CPU resume/checkpoint smoke with a deliberately forced sigma (this skips only the pilot):
+
+```bash
+uv run --locked luxsr-train-es \
+  --init-checkpoint outputs/strength_winloss_001/step_1000000/0657088_weights.pt \
+  --config outputs/strength_winloss_001/step_1000000/config.yaml \
+  --run-dir outputs/es_smoke_001 --backend internal --skip-parity \
+  --force-sigma 0.005 --generations 1 --directions 2 \
+  --games-per-candidate 1 --gate-pairs 1 --action-probe-states 0 \
+  --skip-formal-eval --device cpu --cpu-threads 4
+```
+
+For the overnight run, omit smoke overrides:
+
+```bash
+uv run --locked luxsr-train-es \
+  --init-checkpoint outputs/strength_winloss_001/step_1000000/0657088_weights.pt \
+  --config outputs/strength_winloss_001/step_1000000/config.yaml \
+  --run-dir outputs/es_strength_001 --workers 2
+```
+
+Resume the same directory with the same checkpoint and model config by appending `--resume`. The run stores
+`manifest.json`, `fitness.jsonl`, `generations.jsonl`, `latest_es.pt`, and `best_weights.pt`; it reuses completed
+candidate IDs and the backend selected by the initial parity check. A rejected proposal restores the center and halves
+both sigma and ClipUp speed. Internal-backend fitness rows also record forward/environment timing and CUDA peak memory;
+only revisit EGGROLL if `backend_profile.forward_fraction` shows neural forward as the bottleneck. Keep ES artifacts
+even if the final promotion gate reports `not_promoted`.
 
 ### Reusable official-CLI agent bundle
 

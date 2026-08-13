@@ -24,4 +24,7 @@ def teacher_kl_coefficient(flags, step: int) -> float:
     end = float(getattr(flags, "teacher_kl_cost_end", flags.teacher_kl_cost))
     duration = int(float(getattr(flags, "teacher_kl_decay_steps", 0)))
     delay = int(float(getattr(flags, "teacher_kl_delay_steps", 0)))
-    return LinearSchedule(start, end, duration, delay)(step)
+    floor = float(getattr(flags, "teacher_kl_cost_floor", 0.0))
+    if floor < 0.0:
+        raise ValueError("teacher_kl_cost_floor must be non-negative")
+    return max(LinearSchedule(start, end, duration, delay)(step), floor)

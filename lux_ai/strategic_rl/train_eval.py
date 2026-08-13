@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+
+from .evaluate_checkpoint import FIRST_PLACE_AGENT, evaluate_checkpoint
+from .prepare_eval_agent import ROOT
+
+
+def promotion_decision(
+    baseline: dict,
+    candidate: dict,
+    *,
+    opponent_name: str,
+    min_score_delta: float,
+    max_city_extinction_delta: float,
+) -> dict:
+    baseline_metrics = baseline["opponents"][opponent_name]
+    candidate_metrics = candidate["opponents"][opponent_name]
+    score_delta = float(candidate_metrics["score_rate"] - baseline_metrics["score_rate"])
+    extinction_delta = float(
+        candidate_metrics["candidate_city_extinction_rate"]
+        - baseline_metrics["candidate_city_extinction_rate"]
+    )
+    reasons = []
+    if score_delta < min_score_delta:
+        reasons.append(f"score_delta={score_delta:.6f} < {min_score_delta:.6f}")
+    if extinction_delta > max_city_extinction_delta:
+        reasons.append(
+            f"city_extinction_delta={extinction_delta:.6f} > {max_city_extinction_delta:.6f}"
+        )
+    return {
+        "passed": not reasons,
+        "score_delta": score_delta,
+        "city_extinction_delta": extinction_delta,
+        "reasons": reasons,
+    }
+
+
+def full_checkpoint(run_dir: Path) -> Path:
+    checkpoints = []
+    for path in run_dir.glob("*.pt"):
+        if path.name.endswith("_weights.pt"):
+            continue
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if isinstance(state, dict) and "optimizer_state_dict" in state and "step" in state:
+            checkpoints.append((int(state["step"]), path))
+    if not checkpoints:
+        raise FileNotFoundError(f"No full training checkpoint found in {run_dir}")
+    return max(checkpoints)[1]
+
+
+def write_progress(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def run_training_segment(
+    *,
+    config_name: str,
+    run_dir: Path,
+    stop_after_step: int,
+    total_steps: int,
+    load_checkpoint: Path,
+    weights_only: bool,
+    python: str,
+) -> None:
+    command = [
+        python,
+        str(ROOT / "run_monobeast.py"),
+        f"--config-name={config_name}",
+        f"hydra.run.dir={run_dir}",
+        f"+load_dir={load_checkpoint.parent}",
+        f"+checkpoint_file={load_checkpoint.name}",
+        f"weights_only={'true' if weights_only else 'false'}",
+        f"total_steps={total_steps}",
+        f"stop_after_step={stop_after_step}",
+    ]
+    subprocess.run(command, cwd=ROOT, check=True)
+
+
+def run_train_eval(args: argparse.Namespace) -> dict:
+    run_root = args.run_root.expanduser().resolve()
+    run_root.mkdir(parents=True, exist_ok=False)
+    progress_path = run_root / "evaluation_progress.json"
+    milestones = sorted(set(args.milestones))
+    if not milestones or milestones[-1] > args.total_steps or milestones[0] <= 0:
+        raise ValueError("milestones must be positive and no larger than total_steps")
+
+    baseline_result = evaluate_checkpoint(
+        args.base_checkpoint,
+        args.opponent,
+        run_root / "baseline_evaluation",
+        opponent_name=args.opponent_name,
+        seed_start=args.seed_start,
+        seeds=args.seeds,
+        map_sizes=tuple(args.map_sizes),
+        python=args.engine_python,
+        timeout=args.timeout,
+        bootstrap_samples=args.bootstrap_samples,
+        workers=args.workers,
+        backend=args.eval_backend,
+        device=args.eval_device,
+        batch_games=args.eval_batch_games,
+        parity_games=args.parity_games,
+    )
+    progress = {
+        "schema_version": 1,
+        "status": "running",
+        "config_name": args.config_name,
+        "base_checkpoint": str(args.base_checkpoint.expanduser().resolve()),
+        "baseline": baseline_result["summary"],
+        "milestones": [],
+    }
+    write_progress(progress_path, progress)
+
+    load_checkpoint = args.base_checkpoint.expanduser().resolve()
+    weights_only = True
+    for target in milestones:
+        stage_dir = run_root / f"step_{target:07d}"
+        run_training_segment(
+            config_name=args.config_name,
+            run_dir=stage_dir,
+            stop_after_step=target,
+            total_steps=args.total_steps,
+            load_checkpoint=load_checkpoint,
+            weights_only=weights_only,
+            python=args.python,
+        )
+        checkpoint = full_checkpoint(stage_dir)
+        evaluation = evaluate_checkpoint(
+            checkpoint,
+            args.opponent,
+            run_root / f"evaluation_step_{target:07d}",
+            config=stage_dir / "config.yaml",
+            opponent_name=args.opponent_name,
+            seed_start=args.seed_start,
+            seeds=args.seeds,
+            map_sizes=tuple(args.map_sizes),
+            python=args.engine_python,
+            timeout=args.timeout,
+            bootstrap_samples=args.bootstrap_samples,
+            workers=args.workers,
+            backend=args.eval_backend,
+            device=args.eval_device,
+            batch_games=args.eval_batch_games,
+            parity_games=args.parity_games,
+        )
+        decision = promotion_decision(
+            baseline_result["summary"],
+            evaluation["summary"],
+            opponent_name=args.opponent_name,
+            min_score_delta=args.min_score_delta,
+            max_city_extinction_delta=args.max_city_extinction_delta,
+        )
+        progress["milestones"].append(
+            {
+                "target_step": target,
+                "checkpoint": str(checkpoint),
+                "evaluation": evaluation["summary"],
+                "decision": decision,
+            }
+        )
+        write_progress(progress_path, progress)
+        if not decision["passed"] and not args.continue_on_fail:
+            progress["status"] = "stopped_by_quality_gate"
+            write_progress(progress_path, progress)
+            return progress
+        load_checkpoint = checkpoint
+        weights_only = False
+
+    progress["status"] = "completed"
+    write_progress(progress_path, progress)
+    return progress
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train in full-resume segments and run matched first-place gates between segments."
+    )
+    parser.add_argument("--base-checkpoint", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--config-name", default="survival_strategic_strength_v3")
+    parser.add_argument("--total-steps", type=int, default=1_000_000)
+    parser.add_argument("--milestones", type=int, nargs="+", default=(250_000, 500_000, 750_000, 1_000_000))
+    parser.add_argument("--opponent", type=Path, default=FIRST_PLACE_AGENT)
+    parser.add_argument("--opponent-name", default="first_place")
+    parser.add_argument("--seed-start", type=int, default=2021)
+    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--map-sizes", type=int, nargs="+", default=(12, 16, 24, 32))
+    parser.add_argument("--min-score-delta", type=float, default=-0.05)
+    parser.add_argument("--max-city-extinction-delta", type=float, default=0.05)
+    parser.add_argument("--python", default=sys.executable, help="Python used for run_monobeast.py.")
+    parser.add_argument("--engine-python", default=sys.executable, help="Python passed to lux-ai-2021 agents.")
+    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--workers", type=int, default=2, help="Concurrent evaluation matches.")
+    parser.add_argument("--eval-backend", choices=("auto", "official", "internal"), default="auto")
+    parser.add_argument("--eval-device", default="auto")
+    parser.add_argument("--eval-batch-games", type=int, default=8)
+    parser.add_argument("--parity-games", type=int, default=4)
+    parser.add_argument("--bootstrap-samples", type=int, default=2000)
+    parser.add_argument("--continue-on-fail", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        result = run_train_eval(args)
+    except (FileExistsError, FileNotFoundError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

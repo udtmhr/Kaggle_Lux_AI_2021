@@ -35,6 +35,8 @@ def summarize(records: list[dict], bootstrap_samples: int = 2000, seed: int = 20
     for opponent in sorted({record["opponent"] for record in records}):
         pairs = []
         survival = []
+        city_extinctions = []
+        unit_extinctions = []
         for (pair_opponent, _, _), pair_records in grouped.items():
             if pair_opponent != opponent:
                 continue
@@ -47,6 +49,16 @@ def summarize(records: list[dict], bootstrap_samples: int = 2000, seed: int = 20
                 for record in pair_records
                 if "candidate_city_survival" in record
             )
+            city_extinctions.extend(
+                float(int(record["candidate_final_city_tiles"]) == 0)
+                for record in pair_records
+                if "candidate_final_city_tiles" in record
+            )
+            unit_extinctions.extend(
+                float(int(record["candidate_final_units"]) == 0)
+                for record in pair_records
+                if "candidate_final_units" in record
+            )
         if not pairs:
             raise ValueError(f"No complete matched seed/orientation pairs for {opponent}")
         values = np.asarray(pairs)
@@ -57,6 +69,8 @@ def summarize(records: list[dict], bootstrap_samples: int = 2000, seed: int = 20
             "paired_delta_from_even": float(values.mean() - 0.5),
             "bootstrap_lcb95": float(np.quantile(boot, 0.025)),
             "candidate_city_survival": float(np.mean(survival)) if survival else None,
+            "candidate_city_extinction_rate": float(np.mean(city_extinctions)) if city_extinctions else None,
+            "candidate_unit_extinction_rate": float(np.mean(unit_extinctions)) if unit_extinctions else None,
         }
     return report
 

@@ -1,24 +1,21 @@
-import numpy as np
 import os
 from pathlib import Path
-import torch
-import torch.nn.functional as F
 from types import SimpleNamespace
 from typing import *
+
+import numpy as np
+import torch
 import yaml
 
-from . import data_augmentation
-from ..lux_gym import create_reward_space, LuxEnv, wrappers
-from ..lux_gym.act_spaces import ACTION_MEANINGS
-from ..utils import DEBUG_MESSAGE, RUNTIME_DEBUG_MESSAGE, LOCAL_EVAL
-from ..utility_constants import MAX_RESEARCH, DN_CYCLE_LEN, MAX_BOARD_SIZE
-from ..nns import create_model, models
-from ..utils import flags_to_namespace, Stopwatch
-
-from ..lux.game import Game
-from ..lux.game_constants import GAME_CONSTANTS
-from ..lux.game_objects import CityTile, Unit
 from ..lux import annotate
+from ..lux.game import Game
+from ..lux.game_objects import CityTile, Unit
+from ..lux_gym import LuxEnv, create_reward_space, wrappers
+from ..nns import create_model, models
+from ..utility_constants import MAX_BOARD_SIZE
+from ..utils import DEBUG_MESSAGE, LOCAL_EVAL, Stopwatch, flags_to_namespace
+from . import data_augmentation
+from .action_postprocessing import resolve_collision_rankings
 
 RL_AGENT_CONFIG_PATH = Path(__file__).parent / "rl_agent_config.yaml"
 AGENT = None
@@ -260,130 +257,13 @@ class RLAgent:
         }
 
     def resolve_collision_detection(self, obs, agent_output) -> List[str]:
-        # Get log_probs for all of my actions
-        flat_log_probs = {
-            key: torch.flatten(
-                F.log_softmax(val.squeeze(0).squeeze(0), dim=-1),
-                start_dim=-3,
-                end_dim=-2
-            )
-            for key, val in agent_output["policy_logits"].items()
-        }
-        my_flat_log_probs = {
-            key: val[obs.player] for key, val in flat_log_probs.items()
-        }
-        my_flat_actions = {
-            key: torch.flatten(
-                val.squeeze(0).squeeze(0)[obs.player],
-                start_dim=-3,
-                end_dim=-2
-            )
-            for key, val in agent_output["actions"].items()
-        }
-        # Use actions with highest prob/log_prob as highest priority
-        city_tile_priorities = torch.argsort(my_flat_log_probs["city_tile"].max(dim=-1)[0], dim=-1, descending=True)
-
-        # First handle city tile actions, ensuring the unit cap and research cap is not exceeded
-        units_to_build = max(self.me.city_tile_count - len(self.me.units), 0)
-        research_remaining = max(MAX_RESEARCH - self.me.research_points, 0)
-        for loc in city_tile_priorities:
-            loc = loc.item()
-            actions = my_flat_actions["city_tile"][loc]
-            if self.loc_to_actionable_city_tiles.get(loc, None) is not None:
-                for i, act in enumerate(actions):
-                    illegal_action = False
-                    action_meaning = ACTION_MEANINGS["city_tile"][act]
-                    # Check that it is allowed to build carts
-                    if action_meaning == "BUILD_CART" and not self.agent_flags.can_build_carts:
-                        illegal_action = True
-                    # Check that the city will not build more units than the unit cap
-                    elif action_meaning.startswith("BUILD_"):
-                        if units_to_build > 0:
-                            units_to_build -= 1
-                        else:
-                            illegal_action = True
-                    # Check that the city will not research more than the research cap
-                    elif action_meaning == "RESEARCH":
-                        if research_remaining > 0:
-                            research_remaining -= 1
-                        else:
-                            illegal_action = True
-                    # Ban no-ops after the first night until research is complete
-                    # This might prevent games like this from happening:
-                    # https://www.kaggle.com/c/lux-ai-2021/submissions?dialog=episodes-episode-26458475
-                    elif (
-                            action_meaning == "NO-OP" and
-                            self.game_state.turn >= DN_CYCLE_LEN and
-                            research_remaining > 0 and
-                            self.agent_flags.must_research
-                    ):
-                        illegal_action = True
-                    # Ban all non-unit-creating actions on the final step
-                    if self.game_state.turn >= GAME_CONSTANTS["PARAMETERS"]["MAX_DAYS"] - 1:
-                        if action_meaning == "BUILD_CART":
-                            illegal_action = False
-                        else:
-                            illegal_action = True
-                    if illegal_action:
-                        my_flat_log_probs["city_tile"][loc, act] = float("-inf")
-                    else:
-                        break
-
-        # Then handle unit actions, ensuring that no units try to move to the same square
-        occupied_squares = np.zeros(MAX_BOARD_SIZE, dtype=bool)
-        max_loc_val = MAX_BOARD_SIZE[0] * MAX_BOARD_SIZE[1]
-        combined_unit_log_probs = torch.cat(
-            [my_flat_log_probs["worker"].max(dim=-1)[0], my_flat_log_probs["cart"].max(dim=-1)[0]],
-            dim=-1
+        actions_tensors = resolve_collision_rankings(
+            self.game_state,
+            obs.player,
+            agent_output["policy_logits"],
+            must_research=self.agent_flags.must_research,
+            can_build_carts=self.agent_flags.can_build_carts,
         )
-        unit_priorities = torch.argsort(combined_unit_log_probs, dim=-1, descending=True)
-        for loc in unit_priorities:
-            loc = loc.item()
-            if loc >= max_loc_val:
-                unit_type = "cart"
-                actionable_dict = self.loc_to_actionable_carts
-            else:
-                unit_type = "worker"
-                actionable_dict = self.loc_to_actionable_workers
-            loc = loc % max_loc_val
-            actions = my_flat_actions[unit_type][loc]
-            actionable_list = actionable_dict.get(loc, None)
-            if actionable_list is not None:
-                acted_count = 0
-                for i, act in enumerate(actions):
-                    illegal_action = False
-                    action_meaning = ACTION_MEANINGS[unit_type][act]
-                    if action_meaning.startswith("MOVE_"):
-                        direction = action_meaning.split("_")[1]
-                        new_pos = actionable_list[acted_count].pos.translate(direction, 1)
-                    else:
-                        new_pos = actionable_list[acted_count].pos
-
-                    # Check that the new position is a legal square
-                    if (
-                            new_pos.x < 0 or new_pos.x >= self.game_state.map_width or
-                            new_pos.y < 0 or new_pos.y >= self.game_state.map_height
-                    ):
-                        illegal_action = True
-                    # Check that the new position does not conflict with another unit's new position
-                    elif occupied_squares[new_pos.x, new_pos.y] and not self.my_city_tile_mat[new_pos.x, new_pos.y]:
-                        illegal_action = True
-                    else:
-                        occupied_squares[new_pos.x, new_pos.y] = True
-
-                    if illegal_action:
-                        my_flat_log_probs[unit_type][loc, act] = float("-inf")
-                    else:
-                        acted_count += 1
-
-                    if acted_count >= len(actionable_list):
-                        break
-
-        # Finally, get new actions from the modified log_probs
-        actions_tensors = {
-            key: val.view(1, *val.shape[:-2], *MAX_BOARD_SIZE, -1).argsort(dim=-1, descending=True)
-            for key, val in flat_log_probs.items()
-        }
         actions, _ = self.unwrapped_env.process_actions({
             key: value.numpy() for key, value in actions_tensors.items()
         })

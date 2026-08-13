@@ -48,6 +48,7 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("num_learner_threads", 1)
     flags.setdefault("use_teacher", False)
     flags.setdefault("teacher_baseline_cost", flags.get("teacher_kl_cost", 0.0) / 2.0)
+    flags.setdefault("teacher_kl_cost_floor", 0.0)
     flags.setdefault("actor_policy_tta_rot180", False)
     flags.setdefault("teacher_policy_tta_rot180", False)
     flags.setdefault("league_enabled", False)
@@ -70,6 +71,7 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("intent_aux_enabled", False)
     flags.setdefault("intent_aux_cost", 0.01)
     flags.setdefault("intent_head_only_finetune", False)
+    flags.setdefault("stop_after_step", None)
 
     # Model params
     flags.setdefault("use_index_select", True)
