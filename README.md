@@ -100,7 +100,12 @@ runs.
 `luxsr-train-es` evolves only action-affecting policy parameters from an RL checkpoint. It uses layer-scaled
 antithetic noise, common match schedules, centered ranks, ClipUp, and a recent-update/checkpoint-difference active
 subspace. Value and intent heads remain fixed. The default configuration first runs the sigma usefulness gate, then
-eight gated generations, and finally matched official-CLI promotion evaluation.
+eight gated generations, and finally matched official-CLI promotion evaluation. Each candidate is evaluated against
+only `first_place` and `initial_model`; the internal backend batches all games for one opponent together. The pilot
+uses two games per opponent and the main search uses three games per opponent (four/six total respectively). On CUDA,
+antithetic `+/-` candidates and gate `old/new` candidates are evaluated two at a time by default; use
+`--candidate-workers 1` to disable this. Official-CLI fallback remains single-candidate because it rewrites one
+candidate bundle checkpoint between evaluations.
 
 Inspect all paths and the evolved parameter set without creating a run:
 
@@ -136,8 +141,9 @@ Resume the same directory with the same checkpoint and model config by appending
 `manifest.json`, `fitness.jsonl`, `generations.jsonl`, `latest_es.pt`, and `best_weights.pt`; it reuses completed
 candidate IDs and the backend selected by the initial parity check. A rejected proposal restores the center and halves
 both sigma and ClipUp speed. Internal-backend fitness rows also record forward/environment timing and CUDA peak memory;
-only revisit EGGROLL if `backend_profile.forward_fraction` shows neural forward as the bottleneck. Keep ES artifacts
-even if the final promotion gate reports `not_promoted`.
+parallel rows additionally record `candidate_group_size`, aggregate group throughput, and whether candidate concurrency
+was active. Only revisit EGGROLL if `backend_profile.forward_fraction` shows neural forward as the bottleneck. Keep ES
+artifacts even if the final promotion gate reports `not_promoted`.
 
 ### Reusable official-CLI agent bundle
 

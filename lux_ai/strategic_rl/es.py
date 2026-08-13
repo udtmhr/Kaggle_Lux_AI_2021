@@ -264,20 +264,27 @@ def make_match_schedule(
     if games <= 0 or not opponents or not map_sizes:
         raise ValueError("games, opponents, and map_sizes must be non-empty")
     schedule = []
-    for index in range(games):
-        opponent = opponents[(generation + index) % len(opponents)]
-        map_size = int(map_sizes[(2 * generation + index) % len(map_sizes)])
-        candidate_player = (generation + index) % 2
-        seed = int(seed_start + generation * games + index)
-        schedule.append(
-            MatchSpec(
-                match_id=f"{namespace}-g{generation:04d}-m{index:03d}",
-                opponent=opponent,
-                seed=seed,
-                map_size=map_size,
-                candidate_player=candidate_player,
+    opponent_order = tuple(opponents[generation % len(opponents) :]) + tuple(
+        opponents[: generation % len(opponents)]
+    )
+    base_games, extra_games = divmod(games, len(opponent_order))
+    index = 0
+    for opponent_index, opponent in enumerate(opponent_order):
+        opponent_games = base_games + int(opponent_index < extra_games)
+        for local_index in range(opponent_games):
+            map_size = int(map_sizes[(2 * generation + local_index) % len(map_sizes)])
+            candidate_player = (generation + local_index) % 2
+            seed = int(seed_start + generation * games + index)
+            schedule.append(
+                MatchSpec(
+                    match_id=f"{namespace}-g{generation:04d}-m{index:03d}",
+                    opponent=opponent,
+                    seed=seed,
+                    map_size=map_size,
+                    candidate_player=candidate_player,
+                )
             )
-        )
+            index += 1
     return tuple(schedule)
 
 

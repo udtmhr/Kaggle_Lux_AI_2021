@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 import torch
@@ -46,6 +47,7 @@ from .train_distill import ShardDataset, _compact_collate, _select_entity_logits
 from .tta import rot180_ensemble_outputs
 
 SCHEMA_VERSION = 1
+_MODEL_CREATION_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,13 @@ class OpponentSpec:
     config: Path
     agent: Path | None
     source: str = "checkpoint"
+
+
+@dataclass(frozen=True)
+class CandidateRequest:
+    candidate_id: str
+    vector: torch.Tensor
+    metadata: Mapping
 
 
 @dataclass(frozen=True)
@@ -217,20 +226,27 @@ def paired_schedule(
     namespace: str,
 ) -> tuple[MatchSpec, ...]:
     schedule = []
-    for pair in range(pairs):
-        opponent = opponents[(generation + pair) % len(opponents)]
-        map_size = int(map_sizes[(2 * generation + pair) % len(map_sizes)])
-        seed = int(seed_start + generation * pairs + pair)
-        for player in (0, 1):
-            schedule.append(
-                MatchSpec(
-                    match_id=f"{namespace}-g{generation:04d}-pair{pair:03d}-p{player}",
-                    opponent=opponent,
-                    seed=seed,
-                    map_size=map_size,
-                    candidate_player=player,
+    opponent_order = tuple(opponents[generation % len(opponents) :]) + tuple(
+        opponents[: generation % len(opponents)]
+    )
+    base_pairs, extra_pairs = divmod(pairs, len(opponent_order))
+    pair = 0
+    for opponent_index, opponent in enumerate(opponent_order):
+        opponent_pairs = base_pairs + int(opponent_index < extra_pairs)
+        for _local_pair in range(opponent_pairs):
+            map_size = int(map_sizes[(2 * generation + pair) % len(map_sizes)])
+            seed = int(seed_start + generation * pairs + pair)
+            for player in (0, 1):
+                schedule.append(
+                    MatchSpec(
+                        match_id=f"{namespace}-g{generation:04d}-pair{pair:03d}-p{player}",
+                        opponent=opponent,
+                        seed=seed,
+                        map_size=map_size,
+                        candidate_player=player,
+                    )
                 )
-            )
+            pair += 1
     return tuple(schedule)
 
 
@@ -327,6 +343,34 @@ class InternalMatchEvaluator:
             for opponent in opponents
         }
 
+    def fork(self) -> InternalMatchEvaluator:
+        worker = copy.copy(self)
+        worker.candidate_flags = copy.copy(self.candidate_flags)
+        worker.opponent_flags = {
+            name: copy.copy(flags) for name, flags in self.opponent_flags.items()
+        }
+        return worker
+
+    def evaluate_many(
+        self,
+        candidate_states: Sequence[Mapping[str, torch.Tensor]],
+        schedule: Sequence[MatchSpec],
+        max_workers: int,
+    ) -> list[tuple[list[dict], dict[str, float]]]:
+        def evaluate_one(candidate_state):
+            worker = self.fork()
+            records = worker.evaluate(candidate_state, schedule)
+            return records, worker.last_profile
+
+        workers = min(max_workers, len(candidate_states))
+        if workers <= 1:
+            return [evaluate_one(state) for state in candidate_states]
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="lux-es-candidate",
+        ) as executor:
+            return list(executor.map(evaluate_one, candidate_states))
+
     @torch.inference_mode()
     def evaluate(self, candidate_state: Mapping[str, torch.Tensor], schedule: Sequence[MatchSpec]) -> list[dict]:
         evaluation_started = time.monotonic()
@@ -360,20 +404,28 @@ class InternalMatchEvaluator:
                 game.configuration["seed"] = spec.seed - 1
                 game.configuration["width"] = spec.map_size
                 game.configuration["height"] = spec.map_size
-            candidate = create_model(
-                self.candidate_flags,
-                self.device,
-                teacher_model_flags=opponent_flags,
-                is_teacher_model=False,
-            )
+            # Model constructors consume the global torch RNG before the full
+            # state dict is loaded. Serialize that short section and restore
+            # RNG state so thread scheduling cannot affect ES resume state.
+            with _MODEL_CREATION_LOCK:
+                rng_state = torch.get_rng_state()
+                try:
+                    candidate = create_model(
+                        self.candidate_flags,
+                        self.device,
+                        teacher_model_flags=opponent_flags,
+                        is_teacher_model=False,
+                    )
+                    opponent = create_model(
+                        self.candidate_flags,
+                        self.device,
+                        teacher_model_flags=opponent_flags,
+                        is_teacher_model=True,
+                    )
+                finally:
+                    torch.set_rng_state(rng_state)
             candidate.load_state_dict(candidate_state, strict=True)
             candidate.eval()
-            opponent = create_model(
-                self.candidate_flags,
-                self.device,
-                teacher_model_flags=opponent_flags,
-                is_teacher_model=True,
-            )
             opponent.load_state_dict(self.opponent_states[opponent_name], strict=True)
             opponent.eval()
             output = env.reset(force=True)
@@ -393,6 +445,7 @@ class InternalMatchEvaluator:
                     opponent, output, self.opponent_action_configs[opponent_name].use_rot180
                 )
                 self.last_profile["opponent_forward_seconds"] += time.monotonic() - forward_started
+                action_postprocess_started = time.monotonic()
                 merged = _ranked_actions(candidate_output)
                 for index, spec in enumerate(specs):
                     players = (
@@ -409,7 +462,7 @@ class InternalMatchEvaluator:
                                 env.unwrapped[index].game_state,
                                 player,
                                 {
-                                    entity: logits[index : index + 1]
+                                    entity: logits[index : index + 1].detach().cpu()
                                     for entity, logits in policy_output["policy_logits"].items()
                                 },
                                 must_research=action_config.must_research,
@@ -425,9 +478,13 @@ class InternalMatchEvaluator:
                                 for entity, actions in _ranked_actions(policy_output).items()
                             }
                         for entity, actions in merged.items():
-                            actions[index, :, player] = rankings[entity][
-                                0, :, player, ..., :MAX_OVERLAPPING_ACTIONS
-                            ]
+                            actions[index, :, player] = (
+                                rankings[entity][0, :, player, ..., :MAX_OVERLAPPING_ACTIONS]
+                                .to(actions.device)
+                            )
+                self.last_profile["action_postprocess_seconds"] += (
+                    time.monotonic() - action_postprocess_started
+                )
                 environment_started = time.monotonic()
                 output = env.step(merged)
                 self.last_profile["environment_step_seconds"] += time.monotonic() - environment_started
@@ -688,6 +745,84 @@ def _result(
     return result
 
 
+def _candidate_results(
+    *,
+    requests: Sequence[CandidateRequest],
+    evaluator,
+    model,
+    parameter_space: ParameterSpace,
+    schedule: Sequence[MatchSpec],
+    tie_break_weight: float,
+    cache: dict[str, dict],
+    output: Path,
+    candidate_workers: int,
+) -> list[dict]:
+    if not requests:
+        return []
+    results: list[dict | None] = [None] * len(requests)
+    missing_indices = []
+    candidate_states = []
+    for index, request in enumerate(requests):
+        if request.candidate_id in cache:
+            results[index] = cache[request.candidate_id]
+            continue
+        missing_indices.append(index)
+        candidate_states.append(materialize_state(model, parameter_space, request.vector))
+    if not missing_indices:
+        return [result for result in results if result is not None]
+
+    model_device = next(model.parameters()).device
+    if model_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(model_device)
+    started = time.monotonic()
+    cpu_started = time.process_time()
+    parallel = (
+        candidate_workers > 1
+        and len(candidate_states) > 1
+        and hasattr(evaluator, "evaluate_many")
+    )
+    if parallel:
+        evaluated = evaluator.evaluate_many(candidate_states, schedule, candidate_workers)
+        evaluations = [
+            {
+                "metrics": policy_fitness(records, tie_break_weight),
+                "matches": records,
+                "backend_profile": profile,
+            }
+            for records, profile in evaluated
+        ]
+    else:
+        evaluations = [
+            _result(evaluator, state, schedule, tie_break_weight) for state in candidate_states
+        ]
+    elapsed = time.monotonic() - started
+    cpu_seconds = time.process_time() - cpu_started
+    peak_memory = (
+        torch.cuda.max_memory_allocated(model_device) if model_device.type == "cuda" else None
+    )
+    total_games = sum(len(evaluation["matches"]) for evaluation in evaluations)
+    for missing_index, evaluation in zip(missing_indices, evaluations):
+        request = requests[missing_index]
+        result = {
+            "candidate_id": request.candidate_id,
+            **request.metadata,
+            **evaluation,
+            "elapsed_seconds": elapsed,
+            "games_per_second": len(evaluation["matches"]) / max(elapsed, 1e-12),
+            "process_cpu_seconds": cpu_seconds,
+            "process_cpu_to_wall_ratio": cpu_seconds / max(elapsed, 1e-12),
+            "candidate_group_size": len(evaluations),
+            "candidate_group_games_per_second": total_games / max(elapsed, 1e-12),
+            "candidate_parallel": parallel,
+        }
+        if peak_memory is not None:
+            result["cuda_peak_memory_bytes"] = peak_memory
+        _append_jsonl(output, result)
+        cache[request.candidate_id] = result
+        results[missing_index] = result
+    return [result for result in results if result is not None]
+
+
 def _candidate_result(
     *,
     candidate_id: str,
@@ -701,35 +836,17 @@ def _candidate_result(
     output: Path,
     metadata: Mapping,
 ) -> dict:
-    if candidate_id in cache:
-        return cache[candidate_id]
-    started = time.monotonic()
-    cpu_started = time.process_time()
-    model_device = next(model.parameters()).device
-    if model_device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(model_device)
-    evaluation = _result(
-        evaluator,
-        materialize_state(model, parameter_space, vector),
-        schedule,
-        tie_break_weight,
-    )
-    elapsed = time.monotonic() - started
-    cpu_seconds = time.process_time() - cpu_started
-    result = {
-        "candidate_id": candidate_id,
-        **metadata,
-        **evaluation,
-        "elapsed_seconds": elapsed,
-        "games_per_second": len(evaluation["matches"]) / max(elapsed, 1e-12),
-        "process_cpu_seconds": cpu_seconds,
-        "process_cpu_to_wall_ratio": cpu_seconds / max(elapsed, 1e-12),
-    }
-    if model_device.type == "cuda":
-        result["cuda_peak_memory_bytes"] = torch.cuda.max_memory_allocated(model_device)
-    _append_jsonl(output, result)
-    cache[candidate_id] = result
-    return result
+    return _candidate_results(
+        requests=[CandidateRequest(candidate_id, vector, metadata)],
+        evaluator=evaluator,
+        model=model,
+        parameter_space=parameter_space,
+        schedule=schedule,
+        tie_break_weight=tie_break_weight,
+        cache=cache,
+        output=output,
+        candidate_workers=1,
+    )[0]
 
 
 def _history_basis(
@@ -856,7 +973,11 @@ def _apply_overrides(config: ESConfig, args) -> ESConfig:
 
 
 def run(args: argparse.Namespace) -> dict:
-    if torch.device(args.device).type == "cpu":
+    device = torch.device(args.device)
+    candidate_workers = args.candidate_workers
+    if candidate_workers is None:
+        candidate_workers = 2 if device.type == "cuda" else 1
+    if device.type == "cpu":
         torch.set_num_threads(args.cpu_threads)
         os.environ.setdefault("OMP_NUM_THREADS", str(args.cpu_threads))
         os.environ.setdefault("MKL_NUM_THREADS", str(args.cpu_threads))
@@ -871,7 +992,6 @@ def run(args: argparse.Namespace) -> dict:
     config, opponent_entries, configured_history = load_es_config(es_config_path)
     config = _apply_overrides(config, args)
     opponents = resolve_opponents(opponent_entries, init_checkpoint, model_config, run_dir)
-    device = torch.device(args.device)
     flags, _ = load_flags(model_config, device)
     model = create_model(flags, device)
     initial_state = load_policy_state(init_checkpoint)
@@ -900,6 +1020,7 @@ def run(args: argparse.Namespace) -> dict:
         "runtime": {
             "device": str(device),
             "cpu_threads": args.cpu_threads if device.type == "cpu" else None,
+            "candidate_workers": candidate_workers,
         },
     }
     if args.dry_run:
@@ -966,6 +1087,10 @@ def run(args: argparse.Namespace) -> dict:
     if args.resume:
         backend_report = previous_backend_report or backend_report
         backend_report["resume_reused_backend"] = True
+    effective_candidate_workers = (
+        candidate_workers if isinstance(evaluator, InternalMatchEvaluator) else 1
+    )
+    backend_report["candidate_workers"] = effective_candidate_workers
     manifest["backend"] = backend_report
     _write_json(manifest_path, manifest)
 
@@ -1013,31 +1138,37 @@ def run(args: argparse.Namespace) -> dict:
                 for direction_index in range(config.pilot_directions):
                     seed = config.seed + sigma_index * 100_000 + direction_index
                     direction, kind = sample_direction(parameter_space.dimension, seed)
-                    pair_fitness = []
-                    pair_scores = []
+                    requests = []
                     for sign, label in ((1, "plus"), (-1, "minus")):
                         vector = parameter_space.perturb(center, direction, sigma_value, sign)
                         candidate_id = f"pilot-s{sigma_index}-d{direction_index:03d}-{label}"
-                        record = _candidate_result(
-                            candidate_id=candidate_id,
-                            evaluator=evaluator,
-                            model=model,
-                            parameter_space=parameter_space,
-                            vector=vector,
-                            schedule=schedule,
-                            tie_break_weight=config.tie_break_weight,
-                            cache=result_cache,
-                            output=run_dir / "fitness.jsonl",
-                            metadata={
-                                "phase": "pilot",
-                                "sigma": sigma_value,
-                                "noise_seed": seed,
-                                "kind": kind,
-                            },
+                        requests.append(
+                            CandidateRequest(
+                                candidate_id,
+                                vector,
+                                {
+                                    "phase": "pilot",
+                                    "sigma": sigma_value,
+                                    "noise_seed": seed,
+                                    "kind": kind,
+                                    "sign": sign,
+                                },
+                            )
                         )
-                        pair_fitness.append(record["metrics"]["fitness"])
-                        pair_scores.append(record["metrics"]["score_rate"])
                         probe_vectors.append(vector)
+                    pair_records = _candidate_results(
+                        requests=requests,
+                        evaluator=evaluator,
+                        model=model,
+                        parameter_space=parameter_space,
+                        schedule=schedule,
+                        tie_break_weight=config.tie_break_weight,
+                        cache=result_cache,
+                        output=run_dir / "fitness.jsonl",
+                        candidate_workers=effective_candidate_workers,
+                    )
+                    pair_fitness = [record["metrics"]["fitness"] for record in pair_records]
+                    pair_scores = [record["metrics"]["score_rate"] for record in pair_records]
                     plus_fitness.append(pair_fitness[0])
                     minus_fitness.append(pair_fitness[1])
                     plus_scores.append(pair_scores[0])
@@ -1138,30 +1269,36 @@ def run(args: argparse.Namespace) -> dict:
             )
             directions.append(direction)
             direction_kinds.append(kind)
-            pair = []
+            requests = []
             for sign, label in ((1, "plus"), (-1, "minus")):
                 vector = parameter_space.perturb(center, direction, sigma, sign)
-                record = _candidate_result(
-                    candidate_id=f"g{generation:04d}-d{direction_index:03d}-{label}",
-                    evaluator=evaluator,
-                    model=model,
-                    parameter_space=parameter_space,
-                    vector=vector,
-                    schedule=schedule,
-                    tie_break_weight=config.tie_break_weight,
-                    cache=result_cache,
-                    output=run_dir / "fitness.jsonl",
-                    metadata={
-                        "phase": "search",
-                        "generation": generation,
-                        "direction": direction_index,
-                        "sign": sign,
-                        "sigma": sigma,
-                        "noise_seed": seed,
-                        "kind": kind,
-                    },
+                requests.append(
+                    CandidateRequest(
+                        f"g{generation:04d}-d{direction_index:03d}-{label}",
+                        vector,
+                        {
+                            "phase": "search",
+                            "generation": generation,
+                            "direction": direction_index,
+                            "sign": sign,
+                            "sigma": sigma,
+                            "noise_seed": seed,
+                            "kind": kind,
+                        },
+                    )
                 )
-                pair.append(record["metrics"]["fitness"])
+            pair_records = _candidate_results(
+                requests=requests,
+                evaluator=evaluator,
+                model=model,
+                parameter_space=parameter_space,
+                schedule=schedule,
+                tie_break_weight=config.tie_break_weight,
+                cache=result_cache,
+                output=run_dir / "fitness.jsonl",
+                candidate_workers=effective_candidate_workers,
+            )
+            pair = [record["metrics"]["fitness"] for record in pair_records]
             plus_fitness.append(pair[0])
             minus_fitness.append(pair[1])
 
@@ -1177,29 +1314,27 @@ def run(args: argparse.Namespace) -> dict:
             map_sizes=config.map_sizes,
             namespace="gate",
         )
-        old_gate = _candidate_result(
-            candidate_id=f"g{generation:04d}-gate-old",
+        old_gate, new_gate = _candidate_results(
+            requests=[
+                CandidateRequest(
+                    f"g{generation:04d}-gate-old",
+                    center,
+                    {"phase": "gate", "generation": generation, "role": "old"},
+                ),
+                CandidateRequest(
+                    f"g{generation:04d}-gate-new",
+                    proposal,
+                    {"phase": "gate", "generation": generation, "role": "new"},
+                ),
+            ],
             evaluator=evaluator,
             model=model,
             parameter_space=parameter_space,
-            vector=center,
             schedule=gate_schedule,
             tie_break_weight=config.tie_break_weight,
             cache=result_cache,
             output=run_dir / "fitness.jsonl",
-            metadata={"phase": "gate", "generation": generation, "role": "old"},
-        )
-        new_gate = _candidate_result(
-            candidate_id=f"g{generation:04d}-gate-new",
-            evaluator=evaluator,
-            model=model,
-            parameter_space=parameter_space,
-            vector=proposal,
-            schedule=gate_schedule,
-            tie_break_weight=config.tie_break_weight,
-            cache=result_cache,
-            output=run_dir / "fitness.jsonl",
-            metadata={"phase": "gate", "generation": generation, "role": "new"},
+            candidate_workers=effective_candidate_workers,
         )
         score_delta = new_gate["metrics"]["score_rate"] - old_gate["metrics"]["score_rate"]
         extinction_delta = (
@@ -1397,6 +1532,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="PyTorch intra-op threads for the CPU backend; keep this modest for small forwards.",
+    )
+    parser.add_argument(
+        "--candidate-workers",
+        type=int,
+        choices=(1, 2),
+        help="Concurrent candidate evaluations; defaults to 2 on CUDA and 1 on CPU.",
     )
     parser.add_argument("--engine-python", default=sys.executable)
     parser.add_argument("--workers", type=int, default=2)

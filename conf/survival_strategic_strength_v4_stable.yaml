@@ -1,0 +1,98 @@
+defaults:
+- survival_strategic_strength_v3
+- _self_
+
+name: survival_strategic_strength_v4_stable
+
+# Start a new policy-only stage from the evaluated 100k checkpoint.  The
+# coordinator overrides stop_after_step at each evaluation milestone.
+weights_only: true
+total_steps: 300000
+stop_after_step: null
+
+# The previous 100k -> 1M continuation drifted away from the teacher while its
+# learning rate was still close to 1e-5.  Use a smaller fresh-optimizer stage.
+optimizer_kwargs:
+  lr: 2.0e-6
+  eps: 3.0e-4
+min_lr_mod: 0.10
+
+# Keep the teacher anchor constant throughout this short stabilization stage.
+teacher_kl_cost: 0.01
+teacher_kl_cost_start: 0.01
+teacher_kl_cost_end: 0.01
+teacher_kl_cost_floor: 0.01
+teacher_kl_decay_steps: 300000
+teacher_kl_delay_steps: 0
+
+# Conservative phase-aware shaping.  Terminal win/loss remains +/-1; shaping
+# only supplies bounded survival/logistics credit between terminal outcomes.
+reward_config_version: 4
+reward_space: StrategicPotentialRewardV2
+reward_space_kwargs:
+  shaping_weight: 0.02
+  shaping_floor: 0.005
+  decay_games: 4000
+  discounting: 0.999
+  max_step_shaping: 0.02
+
+# Keep auxiliary objectives disabled so this run isolates reward, league, LR,
+# and teacher-anchor changes.
+objective_config_version: 1
+rule_aux_enabled: false
+intent_aux_enabled: false
+
+# Reserve 25% for the evaluated starting policy and 20% for first-place.  PFSP
+# distributes the remaining mass across current/recent/historical opponents.
+league_config_version: 5
+league_sampling: pfsp
+pfsp_power: 1.0
+pfsp_teacher_floor: 0.25
+pfsp_exploration: 0.05
+pfsp_prior_games: 20
+learner_snapshot_interval_steps: 100000
+league_opponents:
+- name: base_0100096
+  kind: snapshot
+  weight: 0.20
+  fixed_probability: 0.25
+  checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/strength_winloss_001/step_0100000/0100096_weights.pt
+- name: first_place
+  kind: teacher
+  weight: 0.20
+  fixed_probability: 0.20
+  config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: selfplay
+  kind: selfplay
+  weight: 0.15
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.10
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.10
+- name: past_59822400
+  kind: teacher
+  weight: 0.10
+  config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+  checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+- name: past_28576448
+  kind: teacher
+  weight: 0.10
+  config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+  checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+- name: rule_economy
+  kind: rule_based
+  strategy: economy
+  weight: 0.03
+- name: rule_survival
+  kind: rule_based
+  strategy: survival
+  weight: 0.01
+- name: rule_expansion
+  kind: rule_based
+  strategy: expansion
+  weight: 0.01

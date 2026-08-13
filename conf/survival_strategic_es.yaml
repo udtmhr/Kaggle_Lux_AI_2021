@@ -3,10 +3,10 @@ schema_version: 1
 search:
   pilot_sigmas: [0.0025, 0.005, 0.01]
   pilot_directions: 8
-  pilot_games_per_candidate: 2
+  pilot_games_per_candidate: 4
   generations: 8
   directions: 16
-  games_per_candidate: 4
+  games_per_candidate: 6
   active_probability: 0.75
   active_warmup_generations: 2
   active_rank: 8
@@ -45,11 +45,3 @@ opponents:
     agent: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py
   - name: initial_model
     source: initial
-  - name: past_59822400
-    checkpoint: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
-    config: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
-    agent: internal_testing/hall_of_fame/11-09_21-32-04_59822400/main.py
-  - name: past_28576448
-    checkpoint: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
-    config: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
-    agent: internal_testing/hall_of_fame/10-10_11-18-12_28576448/main.py

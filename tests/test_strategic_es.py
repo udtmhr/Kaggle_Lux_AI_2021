@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from torch import nn
 
 from lux_ai.lux.constants import Constants
@@ -19,7 +20,9 @@ from lux_ai.strategic_rl.es import (
     sample_direction,
 )
 from lux_ai.strategic_rl.train_es import (
+    CandidateRequest,
     OfficialMatchEvaluator,
+    _candidate_results,
     _save_es_state,
     load_deployment_action_config,
     paired_schedule,
@@ -145,6 +148,16 @@ def test_training_and_gate_schedules_are_deterministic_and_paired():
     )
     assert training[0].seed != next_generation[0].seed
     assert training[0].candidate_player != next_generation[0].candidate_player
+    grouped = make_match_schedule(
+        generation=0,
+        games=6,
+        opponents=("a", "b"),
+        seed_start=100,
+        map_sizes=(12, 16, 24, 32),
+    )
+    assert [spec.opponent for spec in grouped] == ["a"] * 3 + ["b"] * 3
+    assert [spec.candidate_player for spec in grouped] == [0, 1, 0] * 2
+    assert [spec.map_size for spec in grouped] == [12, 16, 24] * 2
     gate = paired_schedule(
         generation=0,
         pairs=2,
@@ -210,7 +223,15 @@ def test_deployment_settings_follow_each_agent_bundle():
 
 def test_es_config_paths_exist():
     root = Path(__file__).parents[1]
-    assert (root / "conf" / "survival_strategic_es.yaml").is_file()
+    config_path = root / "conf" / "survival_strategic_es.yaml"
+    assert config_path.is_file()
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["search"]["pilot_games_per_candidate"] == 4
+    assert config["search"]["games_per_candidate"] == 6
+    assert [opponent["name"] for opponent in config["opponents"]] == [
+        "first_place",
+        "initial_model",
+    ]
 
 
 def test_resume_state_preserves_next_clipup_update(tmp_path):
@@ -272,3 +293,59 @@ def test_official_backend_retries_only_one_turn_zero_cold_start(monkeypatch, tmp
     assert len(calls) == 2
     assert calls[0][1].name == "replay-attempt0.json"
     assert calls[1][1].name == "replay-attempt1.json"
+
+
+def test_candidate_results_uses_parallel_evaluator_and_preserves_order(tmp_path):
+    class FakeParallelEvaluator:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate_many(self, candidate_states, schedule, max_workers):
+            self.calls.append((len(candidate_states), len(schedule), max_workers))
+            return [
+                (
+                    [
+                        {
+                            "winner": 0,
+                            "candidate_player": 0,
+                            "candidate_final_city_tiles": index + 1,
+                        }
+                    ],
+                    {"evaluation_seconds": float(index + 1)},
+                )
+                for index, _state in enumerate(candidate_states)
+            ]
+
+    model = TinyPolicy()
+    parameter_space = ParameterSpace(model)
+    center = parameter_space.flatten_model(model)
+    evaluator = FakeParallelEvaluator()
+    schedule = make_match_schedule(
+        generation=0,
+        games=1,
+        opponents=("opponent",),
+        seed_start=123,
+        map_sizes=(12,),
+    )
+    cache = {}
+    results = _candidate_results(
+        requests=[
+            CandidateRequest("plus", center + 0.1, {"sign": 1}),
+            CandidateRequest("minus", center - 0.1, {"sign": -1}),
+        ],
+        evaluator=evaluator,
+        model=model,
+        parameter_space=parameter_space,
+        schedule=schedule,
+        tie_break_weight=0.01,
+        cache=cache,
+        output=tmp_path / "fitness.jsonl",
+        candidate_workers=2,
+    )
+    assert evaluator.calls == [(2, 1, 2)]
+    assert [result["candidate_id"] for result in results] == ["plus", "minus"]
+    assert all(result["candidate_parallel"] for result in results)
+    assert all(result["candidate_group_size"] == 2 for result in results)
+    assert [result["backend_profile"]["evaluation_seconds"] for result in results] == [1.0, 2.0]
+    assert list(cache) == ["plus", "minus"]
+    assert len((tmp_path / "fitness.jsonl").read_text(encoding="utf-8").splitlines()) == 2
