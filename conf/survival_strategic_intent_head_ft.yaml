@@ -1,0 +1,50 @@
+defaults:
+- survival_strategic_strength_v2
+- _self_
+
+name: survival_strategic_intent_head_ft
+objective_config_version: 2
+
+# Fit only the newly initialised mine/deliver/build/return head. Every other
+# parameter and non-parameter training state (including spectral norm buffers)
+# remains fixed.
+intent_aux_enabled: true
+intent_head_only_finetune: true
+intent_aux_cost: 1.0
+rule_aux_enabled: false
+
+# Online KL and RL losses are still logged but are excluded from total_loss.
+use_teacher: false
+teacher_kl_cost: 0.0
+teacher_kl_cost_start: 0.0
+teacher_kl_cost_end: 0.0
+teacher_policy_tta_rot180: false
+
+# The learner policy is frozen, so loading teacher and learner-snapshot models
+# in every actor adds startup/GPU memory cost without improving the intent
+# labels. Collect states from frozen-policy self-play plus rule specialists.
+league_config_version: 4
+league_sampling: fixed
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.70
+- name: rule_economy
+  kind: rule_based
+  strategy: economy
+  weight: 0.10
+- name: rule_survival
+  kind: rule_based
+  strategy: survival
+  weight: 0.10
+- name: rule_expansion
+  kind: rule_based
+  strategy: expansion
+  weight: 0.10
+
+optimizer_kwargs:
+  lr: 0.0003
+  eps: 0.0003
+min_lr_mod: 0.1
+total_steps: 100000
+weights_only: true

@@ -164,6 +164,7 @@ def _create_model(
         action_space=act_space.get_action_space(),
         reward_space=flags.reward_space.get_reward_spec(),
         n_value_heads=1,
-        rescale_value_input=flags.rescale_value_input
+        rescale_value_input=flags.rescale_value_input,
+        intent_classes=(4 if getattr(flags, "intent_aux_enabled", False) else 0),
     )
     return model.to(device=device)

@@ -23,7 +23,7 @@ import time
 import timeit
 import traceback
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Mapping, Optional, Tuple, Union
 import wandb
 import warnings
 
@@ -50,10 +50,11 @@ from ..utils import flags_to_namespace
 from ..strategic_rl.artifacts import atomic_torch_save
 from ..strategic_rl.league import (
     LeagueSampler,
+    PFSPSampler,
     learner_player_mask,
     merge_player_actions_inplace,
     opponents_from_config,
-    rule_based_actions,
+    rule_based_guidance,
 )
 from ..strategic_rl.schedules import teacher_kl_coefficient
 from ..strategic_rl.tta import rot180_ensemble_outputs
@@ -158,23 +159,79 @@ def reduce(losses: torch.Tensor, reduction: str) -> torch.Tensor:
         raise ValueError(f"Reduction must be one of 'sum' or 'mean', was: {reduction}")
 
 
+def trajectory_weighted_mean(losses: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Average each batch/player trajectory before averaging trajectories.
+
+    ``losses`` may already contain the sum of several entity losses at a time
+    step. ``weights`` is the corresponding active entity (or state) count.
+    """
+    if losses.shape != weights.shape or losses.ndim != 3:
+        raise ValueError(f"Expected matching [time,batch,player] tensors, got {losses.shape} and {weights.shape}")
+    weights = weights.to(losses.dtype)
+    denominators = weights.sum(dim=0)
+    active = denominators > 0
+    if not bool(active.any()):
+        return losses.sum() * 0.0
+    per_trajectory = losses.sum(dim=0) / denominators.clamp_min(1.0)
+    return per_trajectory[active].mean()
+
+
 def compute_baseline_loss(
     values: torch.Tensor,
     value_targets: torch.Tensor,
     reduction: str,
     player_mask: Optional[torch.Tensor] = None,
+    trajectory_normalize: bool = False,
 ) -> torch.Tensor:
     baseline_loss = F.smooth_l1_loss(values, value_targets.detach(), reduction="none")
     if player_mask is not None:
         baseline_loss = baseline_loss * player_mask
+    if trajectory_normalize:
+        weights = torch.ones_like(baseline_loss) if player_mask is None else player_mask
+        return trajectory_weighted_mean(baseline_loss, weights)
     return reduce(baseline_loss, reduction=reduction)
 
 
 def compute_policy_gradient_loss(
-    action_log_probs: torch.Tensor, advantages: torch.Tensor, reduction: str
+    action_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    reduction: str,
+    trajectory_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     cross_entropy = -action_log_probs.view_as(advantages)
-    return reduce(cross_entropy * advantages.detach(), reduction)
+    losses = cross_entropy * advantages.detach()
+    if trajectory_weights is not None:
+        return trajectory_weighted_mean(losses, trajectory_weights)
+    return reduce(losses, reduction)
+
+
+def _load_model_state(model: nn.Module, state_dict: Mapping, allow_new_intent_head: bool) -> None:
+    if not allow_new_intent_head:
+        model.load_state_dict(state_dict)
+        return
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [key for key in incompatible.missing_keys if not key.startswith("intent_head.")]
+    if unexpected or missing:
+        raise RuntimeError(f"Incompatible checkpoint: missing={missing}, unexpected={unexpected}")
+    if incompatible.missing_keys:
+        logging.info("Initialized new intent head while loading legacy policy weights")
+
+
+def configure_trainable_parameters(model: nn.Module, intent_head_only: bool) -> tuple[list[nn.Parameter], list[str]]:
+    """Freeze all non-intent parameters for the dedicated head fitting stage."""
+    if intent_head_only and getattr(model, "intent_head", None) is None:
+        raise ValueError("intent_head_only_finetune requires intent_aux_enabled=true")
+    trainable_parameters = []
+    trainable_names = []
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(not intent_head_only or name.startswith("intent_head."))
+        if parameter.requires_grad:
+            trainable_parameters.append(parameter)
+            trainable_names.append(name)
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters were selected")
+    return trainable_parameters, trainable_names
 
 
 @torch.inference_mode()
@@ -193,6 +250,45 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
         for entity, logits in output["policy_logits"].items()
     }
     return output
+
+
+def _attach_rule_guidance(
+    flags,
+    env,
+    env_output,
+    agent_output,
+    opponents,
+    selected_opponents,
+    learner_players,
+) -> None:
+    # Intent logits are learner-only outputs and do not need to occupy rollout
+    # shared memory. Supervision labels are generated from the live game state.
+    agent_output.pop("intent_logits", None)
+    if not (getattr(flags, "rule_aux_enabled", False) or getattr(flags, "intent_aux_enabled", False)):
+        return
+    env_indices = []
+    players = []
+    for env_index, opponent_index in enumerate(selected_opponents):
+        if opponents[opponent_index].kind == "selfplay":
+            env_indices.extend((env_index, env_index))
+            players.extend((0, 1))
+        else:
+            env_indices.append(env_index)
+            players.append(learner_players[env_index])
+    rule_actions, confidence, worker_intents, intent_mask = rule_based_guidance(
+        env.unwrapped,
+        env_output["info"]["available_actions_mask"],
+        agent_output["actions"],
+        env_indices,
+        players,
+        strategy=getattr(flags, "rule_aux_strategy", "economy"),
+    )
+    if getattr(flags, "rule_aux_enabled", False):
+        agent_output["rule_actions"] = {key: value[..., 0] for key, value in rule_actions.items()}
+        agent_output["rule_confidence"] = confidence
+    if getattr(flags, "intent_aux_enabled", False):
+        agent_output["worker_intent"] = worker_intents
+        agent_output["worker_intent_mask"] = intent_mask
 
 
 def _league_actions(
@@ -214,12 +310,13 @@ def _league_actions(
             continue
         opponent_players = [1 - learner_players[i] for i in env_indices]
         if opponent.kind == "rule_based":
-            opponent_actions = rule_based_actions(
+            opponent_actions, _, _, _ = rule_based_guidance(
                 env.unwrapped,
                 env_output["info"]["available_actions_mask"],
                 learner_actions,
                 env_indices,
                 opponent_players,
+                strategy=opponent.strategy,
             )
         else:
             model_input = buffers_apply(env_output, lambda value, indices=env_indices: value[indices])
@@ -256,10 +353,25 @@ def _set_learner_player_info(env_output, opponents, selected_opponents, learner_
         env_output["info"]["actions_taken"][entity] &= action_mask
 
 
-def _load_league_opponent_models(flags, league_obs_flags, league_opponents):
+def _load_league_opponent_models(flags, league_obs_flags, league_opponents, snapshot_paths=None):
     models = {}
     for opponent_index, opponent in enumerate(league_opponents):
         if opponent.kind in {"selfplay", "rule_based"}:
+            continue
+        if opponent.kind == "learner_snapshot":
+            if snapshot_paths is None or opponent.slot not in snapshot_paths:
+                raise ValueError(f"Missing learner snapshot slot {opponent.slot} for {opponent.name}")
+            model = create_model(
+                flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False
+            )
+            state = torch.load(snapshot_paths[opponent.slot], map_location=torch.device("cpu"), weights_only=False)
+            _load_model_state(
+                model,
+                state["model_state_dict"],
+                allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
+            )
+            model.eval()
+            models[opponent_index] = model
             continue
         if opponent.kind == "teacher":
             model_flags = flags_to_namespace(OmegaConf.to_container(OmegaConf.load(opponent.config)))
@@ -269,11 +381,67 @@ def _load_league_opponent_models(flags, league_obs_flags, league_opponents):
                 flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False
             )
         state = torch.load(Path(opponent.checkpoint), map_location=torch.device("cpu"), weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
+        _load_model_state(
+            model,
+            state["model_state_dict"],
+            allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
+        )
         model.eval()
         models[opponent_index] = model
         logging.info("Actor league loaded %s from %s", opponent.name, opponent.checkpoint)
     return models
+
+
+def _refresh_learner_snapshot_models(
+    flags,
+    opponents,
+    opponent_models,
+    snapshot_paths,
+    snapshot_versions,
+    local_versions,
+    snapshot_lock,
+) -> None:
+    for opponent_index, opponent in enumerate(opponents):
+        if opponent.kind != "learner_snapshot":
+            continue
+        version = int(snapshot_versions[opponent.slot])
+        if local_versions.get(opponent.slot) == version:
+            continue
+        with snapshot_lock:
+            state = torch.load(
+                snapshot_paths[opponent.slot], map_location=torch.device("cpu"), weights_only=False
+            )
+        _load_model_state(
+            opponent_models[opponent_index],
+            state["model_state_dict"],
+            allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
+        )
+        opponent_models[opponent_index].eval()
+        local_versions[opponent.slot] = version
+        logging.info("Actor refreshed learner snapshot slot %d version %d", opponent.slot, version)
+
+
+def _league_win_rates(opponents, league_outcomes, prior_games: float) -> dict[str, float]:
+    wins, games, lock = league_outcomes
+    with lock:
+        return {
+            opponent.name: (float(wins[index]) + 0.5 * prior_games) / (float(games[index]) + prior_games)
+            for index, opponent in enumerate(opponents)
+        }
+
+
+def _sample_league_index(flags, opponents, fixed_sampler, pfsp_sampler, league_outcomes, rng) -> int:
+    if getattr(flags, "league_sampling", "fixed") != "pfsp":
+        return fixed_sampler.sample_index(rng)
+    win_rates = _league_win_rates(opponents, league_outcomes, float(getattr(flags, "pfsp_prior_games", 20)))
+    return pfsp_sampler.sample_index(win_rates, rng)
+
+
+def _record_league_outcome(league_outcomes, opponent_index: int, score: float) -> None:
+    wins, games, lock = league_outcomes
+    with lock:
+        wins[opponent_index] += float(score)
+        games[opponent_index] += 1
 
 
 @torch.no_grad()
@@ -285,6 +453,10 @@ def act(
     full_queue: mp.SimpleQueue,
     actor_model: torch.nn.Module,
     league_opponents,
+    league_outcomes,
+    snapshot_paths,
+    snapshot_versions,
+    snapshot_lock,
     reward_game_counter,
     buffers: Buffers,
 ):
@@ -302,20 +474,41 @@ def act(
             teacher_flags=teacher_flags,
             reward_game_counter=reward_game_counter,
         )
-        opponent_models = _load_league_opponent_models(flags, teacher_flags, league_opponents)
+        opponent_models = _load_league_opponent_models(
+            flags, teacher_flags, league_opponents, snapshot_paths
+        )
+        local_snapshot_versions = {
+            opponent.slot: int(snapshot_versions[opponent.slot])
+            for opponent in league_opponents
+            if opponent.kind == "learner_snapshot"
+        }
         if flags.seed is not None:
             env.seed(flags.seed + actor_index * flags.n_actor_envs)
         else:
             env.seed()
         env_output = env.reset(force=True)
         league_sampler = LeagueSampler(league_opponents)
+        pfsp_sampler = PFSPSampler(
+            league_opponents,
+            power=float(getattr(flags, "pfsp_power", 2.0)),
+            teacher_floor=float(getattr(flags, "pfsp_teacher_floor", 0.15)),
+            exploration=float(getattr(flags, "pfsp_exploration", 0.02)),
+        )
         league_rng = np.random.default_rng(None if flags.seed is None else flags.seed + 100000 + actor_index)
-        selected_opponents = [league_sampler.sample_index(league_rng) for _ in range(flags.n_actor_envs)]
+        selected_opponents = [
+            _sample_league_index(
+                flags, league_opponents, league_sampler, pfsp_sampler, league_outcomes, league_rng
+            )
+            for _ in range(flags.n_actor_envs)
+        ]
         learner_players = league_rng.integers(0, 2, size=flags.n_actor_envs).tolist()
         _set_learner_player_info(
             env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
         )
         agent_output = actor_model_output(flags, actor_model, env_output)
+        _attach_rule_guidance(
+            flags, env, env_output, agent_output, league_opponents, selected_opponents, learner_players
+        )
         while True:
             index = free_queue.get()
             if index is None:
@@ -329,7 +522,20 @@ def act(
                 timings.reset()
 
                 agent_output = actor_model_output(flags, actor_model, env_output)
+                _attach_rule_guidance(
+                    flags, env, env_output, agent_output, league_opponents, selected_opponents, learner_players
+                )
                 timings.time("model")
+
+                _refresh_learner_snapshot_models(
+                    flags,
+                    league_opponents,
+                    opponent_models,
+                    snapshot_paths,
+                    snapshot_versions,
+                    local_snapshot_versions,
+                    snapshot_lock,
+                )
 
                 actions = _league_actions(
                     flags,
@@ -363,7 +569,19 @@ def act(
                     env_output["info"]["actions_taken"] = cached_info_actions_taken
                     env_output["info"].update(cached_info_logging)
                     for env_index in env_output["done"].nonzero(as_tuple=False).flatten().tolist():
-                        selected_opponents[env_index] = league_sampler.sample_index(league_rng)
+                        learner_player = learner_players[env_index]
+                        learner_reward = float(cached_reward[env_index, learner_player])
+                        opponent_reward = float(cached_reward[env_index, 1 - learner_player])
+                        score = 1.0 if learner_reward > opponent_reward else 0.0 if learner_reward < opponent_reward else 0.5
+                        _record_league_outcome(league_outcomes, selected_opponents[env_index], score)
+                        selected_opponents[env_index] = _sample_league_index(
+                            flags,
+                            league_opponents,
+                            league_sampler,
+                            pfsp_sampler,
+                            league_outcomes,
+                            league_rng,
+                        )
                         learner_players[env_index] = int(league_rng.integers(0, 2))
                 timings.time("step")
 
@@ -455,6 +673,7 @@ def learn(
             combined_teacher_kl_loss = torch.zeros_like(combined_behavior_action_log_probs)
             teacher_kl_losses = {}
             combined_learner_entropy = torch.zeros_like(combined_behavior_action_log_probs)
+            action_counts = torch.zeros_like(combined_behavior_action_log_probs)
             entropies = {}
             for act_space in batch["actions"].keys():
                 actions = batch["actions"][act_space]
@@ -474,6 +693,7 @@ def learn(
 
                 # Only take entropy and KL loss for tiles where at least one action was taken
                 any_actions_taken = actions_taken_mask.any(dim=-1)
+                action_counts = action_counts + any_actions_taken.sum(dim=(2, 4, 5))
                 if flags.use_teacher:
                     teacher_kl_loss = compute_teacher_kl_loss(
                         learner_policy_logits, teacher_outputs["policy_logits"][act_space], any_actions_taken
@@ -527,39 +747,110 @@ def learn(
                 lmb=flags.lmb,
             )
 
+            learner_player_mask_batch = batch["info"]["learner_player_mask"].to(values.dtype)
+            trajectory_normalize = getattr(flags, "loss_normalization", "legacy") == "trajectory"
+            vtrace_advantages = vtrace_returns.pg_advantages
+            upgo_advantages = upgo_returns.advantages
+            if getattr(flags, "normalize_advantages", False):
+                active = (learner_player_mask_batch > 0) & (action_counts > 0)
+
+                def normalize_advantage(advantage):
+                    selected = advantage[active]
+                    if selected.numel() < 2:
+                        return advantage
+                    normalized = (advantage - selected.mean()) / selected.std(unbiased=False).clamp_min(1e-6)
+                    clip = float(getattr(flags, "advantage_clip", 5.0))
+                    return normalized.clamp(-clip, clip)
+
+                vtrace_advantages = normalize_advantage(vtrace_advantages)
+                upgo_advantages = normalize_advantage(upgo_advantages)
+
             vtrace_pg_loss = compute_policy_gradient_loss(
-                combined_learner_action_log_probs, vtrace_returns.pg_advantages, reduction=flags.reduction
+                combined_learner_action_log_probs,
+                vtrace_advantages,
+                reduction=flags.reduction,
+                trajectory_weights=action_counts if trajectory_normalize else None,
             )
             upgo_clipped_importance = torch.minimum(
                 vtrace_returns.log_rhos.exp(), torch.ones_like(vtrace_returns.log_rhos)
             ).detach()
             upgo_pg_loss = compute_policy_gradient_loss(
                 combined_learner_action_log_probs,
-                upgo_clipped_importance * upgo_returns.advantages,
+                upgo_clipped_importance * upgo_advantages,
                 reduction=flags.reduction,
+                trajectory_weights=action_counts if trajectory_normalize else None,
             )
-            learner_player_mask_batch = batch["info"]["learner_player_mask"].to(values.dtype)
             baseline_loss = compute_baseline_loss(
                 values,
                 td_lambda_returns.vs,
                 reduction=flags.reduction,
                 player_mask=learner_player_mask_batch,
+                trajectory_normalize=trajectory_normalize,
             )
             teacher_kl_cost = teacher_kl_coefficient(flags, learner_step)
-            teacher_kl_loss = teacher_kl_cost * reduce(combined_teacher_kl_loss, reduction=flags.reduction)
+            reduced_teacher_kl = (
+                trajectory_weighted_mean(combined_teacher_kl_loss, action_counts)
+                if trajectory_normalize
+                else reduce(combined_teacher_kl_loss, reduction=flags.reduction)
+            )
+            teacher_kl_loss = teacher_kl_cost * reduced_teacher_kl
             if flags.use_teacher:
                 teacher_baseline_loss = flags.teacher_baseline_cost * compute_baseline_loss(
                     values,
                     teacher_outputs["baseline"],
                     reduction=flags.reduction,
                     player_mask=learner_player_mask_batch,
+                    trajectory_normalize=trajectory_normalize,
                 )
             else:
                 teacher_baseline_loss = torch.zeros_like(baseline_loss)
-            entropy_loss = flags.entropy_cost * reduce(combined_learner_entropy, reduction=flags.reduction)
+            reduced_entropy = (
+                trajectory_weighted_mean(combined_learner_entropy, action_counts)
+                if trajectory_normalize
+                else reduce(combined_learner_entropy, reduction=flags.reduction)
+            )
+            entropy_loss = flags.entropy_cost * reduced_entropy
+
+            rule_aux_loss = torch.zeros_like(baseline_loss)
+            if getattr(flags, "rule_aux_enabled", False):
+                rule_losses = torch.zeros_like(combined_learner_action_log_probs)
+                rule_counts = torch.zeros_like(action_counts)
+                for act_space, logits in learner_outputs["policy_logits"].items():
+                    targets = batch["rule_actions"][act_space]
+                    mask = batch["rule_confidence"][act_space]
+                    ce = F.cross_entropy(
+                        logits.flatten(0, -2), targets.flatten(), reduction="none"
+                    ).view_as(targets)
+                    masked_ce = torch.where(mask, ce, torch.zeros_like(ce))
+                    rule_losses += masked_ce.sum(dim=(2, 4, 5))
+                    rule_counts += mask.sum(dim=(2, 4, 5))
+                rule_aux_loss = float(flags.rule_aux_cost) * trajectory_weighted_mean(rule_losses, rule_counts)
+
+            intent_aux_loss = torch.zeros_like(baseline_loss)
+            intent_accuracy = float("nan")
+            intent_target_counts = torch.zeros(4, dtype=torch.long, device=values.device)
+            if getattr(flags, "intent_aux_enabled", False):
+                targets = batch["worker_intent"]
+                mask = batch["worker_intent_mask"]
+                logits = learner_outputs["intent_logits"]
+                ce = F.cross_entropy(logits.flatten(0, -2), targets.flatten(), reduction="none").view_as(targets)
+                intent_losses = torch.where(mask, ce, torch.zeros_like(ce)).sum(dim=(2, 4, 5))
+                intent_counts = mask.sum(dim=(2, 4, 5))
+                intent_aux_loss = float(flags.intent_aux_cost) * trajectory_weighted_mean(
+                    intent_losses, intent_counts
+                )
+                if bool(mask.any()):
+                    predictions = logits.argmax(dim=-1)
+                    targets_for_logits = targets.view_as(predictions)
+                    mask_for_logits = mask.view_as(predictions)
+                    intent_accuracy = (
+                        (predictions[mask_for_logits] == targets_for_logits[mask_for_logits]).float().mean().item()
+                    )
+                    intent_target_counts = torch.bincount(targets_for_logits[mask_for_logits], minlength=4)
             if baseline_only:
                 total_loss = baseline_loss + teacher_baseline_loss
                 vtrace_pg_loss, upgo_pg_loss, teacher_kl_loss, entropy_loss = torch.zeros(4) + float("nan")
+                rule_aux_loss = intent_aux_loss = torch.zeros_like(baseline_loss)
             else:
                 total_loss = (
                     vtrace_pg_loss
@@ -568,7 +859,11 @@ def learn(
                     + teacher_kl_loss
                     + teacher_baseline_loss
                     + entropy_loss
+                    + rule_aux_loss
+                    + intent_aux_loss
                 )
+            if getattr(flags, "intent_head_only_finetune", False):
+                total_loss = intent_aux_loss
 
             last_lr = lr_scheduler.get_last_lr()
             assert len(last_lr) == 1, "Logging per-parameter LR still needs support"
@@ -618,12 +913,21 @@ def learn(
                     "teacher_kl_loss": teacher_kl_loss.detach().item(),
                     "teacher_baseline_loss": teacher_baseline_loss.detach().item(),
                     "entropy_loss": entropy_loss.detach().item(),
+                    "rule_aux_loss": rule_aux_loss.detach().item(),
+                    "intent_aux_loss": intent_aux_loss.detach().item(),
                     "total_loss": total_loss.detach().item(),
                 },
                 "Entropy": {"overall": sum(e for e in entropies.values() if not math.isnan(e)), **entropies},
                 "Teacher_KL_Divergence": {
                     "overall": sum(tkld for tkld in teacher_kl_losses.values() if not math.isnan(tkld)),
                     **teacher_kl_losses,
+                },
+                "Intent": {
+                    "accuracy": intent_accuracy,
+                    "target_mine": int(intent_target_counts[0]),
+                    "target_deliver": int(intent_target_counts[1]),
+                    "target_build": int(intent_target_counts[2]),
+                    "target_return": int(intent_target_counts[3]),
                 },
                 "Misc": {
                     "learning_rate": last_lr,
@@ -705,6 +1009,16 @@ def train(flags):
         checkpoint_state = torch.load(Path(flags.load_dir) / flags.checkpoint_file, map_location=torch.device("cpu"))
     else:
         checkpoint_state = None
+    restored_outcomes = checkpoint_state.get("league_outcomes", {}) if checkpoint_state is not None else {}
+    restored_wins = [float(restored_outcomes.get(opponent.name, {}).get("wins", 0.0)) for opponent in league_opponents]
+    restored_games_by_opponent = [
+        int(restored_outcomes.get(opponent.name, {}).get("games", 0)) for opponent in league_opponents
+    ]
+    league_outcomes = (
+        mp.Array("d", restored_wins, lock=False),
+        mp.Array("q", restored_games_by_opponent, lock=False),
+        mp.Lock(),
+    )
     restored_games = (
         int(checkpoint_state.get("reward_games_completed", checkpoint_state.get("total_games_played", 0)))
         if checkpoint_state is not None
@@ -722,9 +1036,27 @@ def train(flags):
 
     actor_model = create_model(flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False)
     if checkpoint_state is not None:
-        actor_model.load_state_dict(checkpoint_state["model_state_dict"])
+        _load_model_state(
+            actor_model,
+            checkpoint_state["model_state_dict"],
+            allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
+        )
+    configure_trainable_parameters(
+        actor_model, intent_head_only=getattr(flags, "intent_head_only_finetune", False)
+    )
     actor_model.eval()
     actor_model.share_memory()
+    snapshot_lock = mp.Lock()
+    snapshot_state_dicts = checkpoint_state.get("learner_snapshot_state_dicts", {}) if checkpoint_state else {}
+    snapshot_slots = sorted({opponent.slot for opponent in league_opponents if opponent.kind == "learner_snapshot"})
+    snapshot_dir = Path.cwd() / ".learner_snapshots"
+    snapshot_paths = {slot: snapshot_dir / f"slot_{slot}.pt" for slot in snapshot_slots}
+    snapshot_versions = mp.Array("q", [1 for _ in range(max(snapshot_slots, default=-1) + 1)], lock=False)
+    if snapshot_slots:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+    for slot in snapshot_slots:
+        state_dict = snapshot_state_dicts.get(str(slot), actor_model.state_dict())
+        atomic_torch_save({"model_state_dict": state_dict}, snapshot_paths[slot])
     n_trainable_params = sum(p.numel() for p in actor_model.parameters() if p.requires_grad)
     logging.info(f"Training model with {n_trainable_params:,d} parameters.")
 
@@ -744,6 +1076,10 @@ def train(flags):
                 full_queue,
                 actor_model,
                 league_opponents,
+                league_outcomes,
+                snapshot_paths,
+                snapshot_versions,
+                snapshot_lock,
                 reward_game_counter,
                 buffers,
             ),
@@ -756,14 +1092,33 @@ def train(flags):
         flags, flags.learner_device, teacher_model_flags=league_obs_flags, is_teacher_model=False
     )
     if checkpoint_state is not None:
-        learner_model.load_state_dict(checkpoint_state["model_state_dict"])
+        _load_model_state(
+            learner_model,
+            checkpoint_state["model_state_dict"],
+            allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
+        )
     learner_model.train()
+    intent_head_only = getattr(flags, "intent_head_only_finetune", False)
+    trainable_parameters, trainable_parameter_names = configure_trainable_parameters(
+        learner_model, intent_head_only=intent_head_only
+    )
+    if intent_head_only:
+        # Keep spectral-normalisation buffers and every frozen module fixed.
+        learner_model.eval()
+        learner_model.intent_head.train()
     learner_model = learner_model.share_memory()
     if not flags.disable_wandb:
         wandb.watch(learner_model, flags.model_log_freq, log="all", log_graph=True)
 
-    optimizer = flags.optimizer_class(learner_model.parameters(), **flags.optimizer_kwargs)
+    optimizer = flags.optimizer_class(trainable_parameters, **flags.optimizer_kwargs)
     if checkpoint_state is not None and not flags.weights_only:
+        saved_trainable_names = checkpoint_state.get("trainable_parameter_names")
+        if saved_trainable_names is None and intent_head_only:
+            raise ValueError(
+                "A legacy/full-model optimizer cannot resume into intent-head-only fine-tuning; use weights_only=true"
+            )
+        if saved_trainable_names is not None and list(saved_trainable_names) != trainable_parameter_names:
+            raise ValueError("Checkpoint optimizer trainable parameters do not match the selected fine-tuning mode")
         optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
 
     # Load teacher model for KL loss
@@ -819,6 +1174,23 @@ def train(flags):
         # Backwards compatibility
         else:
             logging.warning("Loading old checkpoint_state without 'total_games_played' saved. Starting at step 0.")
+    snapshot_last_step = int(checkpoint_state.get("learner_snapshot_last_step", step)) if checkpoint_state else step
+    snapshot_next_slot = int(checkpoint_state.get("learner_snapshot_next_slot", 0)) if checkpoint_state else 0
+
+    def maybe_update_learner_snapshot(current_step: int) -> None:
+        nonlocal snapshot_last_step, snapshot_next_slot
+        if not snapshot_slots:
+            return
+        interval = max(int(getattr(flags, "learner_snapshot_interval_steps", 250000)), 1)
+        if current_step - snapshot_last_step < interval:
+            return
+        slot = snapshot_slots[snapshot_next_slot % len(snapshot_slots)]
+        with snapshot_lock:
+            atomic_torch_save({"model_state_dict": actor_model.state_dict()}, snapshot_paths[slot])
+            snapshot_versions[slot] += 1
+        snapshot_next_slot = (snapshot_next_slot + 1) % len(snapshot_slots)
+        snapshot_last_step = current_step
+        logging.info("Updated learner snapshot slot %d at step %d", slot, current_step)
 
     def batch_and_learn(learner_idx, lock=threading.Lock()):
         """Thread target for the learning process."""
@@ -853,6 +1225,7 @@ def train(flags):
                 )
                 with lock:
                     step += t * b
+                    maybe_update_learner_snapshot(step)
                     if not flags.disable_wandb:
                         wandb.log(stats, step=step)
             timings.time("learn")
@@ -878,6 +1251,22 @@ def train(flags):
                 "step": step,
                 "total_games_played": total_games_played,
                 "reward_games_completed": reward_game_counter.value,
+                "trainable_parameter_names": trainable_parameter_names,
+                "league_outcomes": {
+                    opponent.name: {
+                        "wins": float(league_outcomes[0][index]),
+                        "games": int(league_outcomes[1][index]),
+                    }
+                    for index, opponent in enumerate(league_opponents)
+                },
+                "learner_snapshot_state_dicts": {
+                    str(slot): torch.load(
+                        snapshot_paths[slot], map_location=torch.device("cpu"), weights_only=False
+                    )["model_state_dict"]
+                    for slot in snapshot_slots
+                },
+                "learner_snapshot_last_step": snapshot_last_step,
+                "learner_snapshot_next_slot": snapshot_next_slot,
             },
             checkpoint_path + ".pt",
         )
@@ -892,6 +1281,12 @@ def train(flags):
     try:
         last_checkpoint_time = timer()
         while step < flags.total_steps:
+            dead_actors = [index for index, actor in enumerate(actor_processes) if not actor.is_alive()]
+            if dead_actors:
+                raise RuntimeError(f"Rollout actors terminated before training completed: {dead_actors}")
+            dead_learners = [index for index, thread in enumerate(learner_threads) if not thread.is_alive()]
+            if dead_learners:
+                raise RuntimeError(f"Learner threads terminated before training completed: {dead_learners}")
             start_step = step
             start_time = timer()
             time.sleep(5)

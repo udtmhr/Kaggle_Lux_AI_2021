@@ -81,14 +81,21 @@ def rot180_ensemble_outputs(model, model_input: Mapping) -> dict[str, object]:
         "policy_logits": {key: value[batch_size:] for key, value in combined["policy_logits"].items()},
         "baseline": combined["baseline"][batch_size:],
     }
+    if "intent_logits" in combined:
+        original["intent_logits"] = combined["intent_logits"][:batch_size]
+        rotated["intent_logits"] = combined["intent_logits"][batch_size:]
     rotated_policy = rotate_policy_180(rotated["policy_logits"])
-    return {
+    output = {
         "policy_logits": {
             entity: (original["policy_logits"][entity] + rotated_policy[entity]) / 2
             for entity in original["policy_logits"]
         },
         "baseline": (original["baseline"] + rotated["baseline"]) / 2,
     }
+    if "intent_logits" in original:
+        rotated_intent = torch.rot90(rotated["intent_logits"], 2, dims=(-3, -2))
+        output["intent_logits"] = (original["intent_logits"] + rotated_intent) / 2
+    return output
 
 
 def rotate_compact_distillation_batch_180(batch: Mapping) -> dict:

@@ -54,6 +54,22 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("league_opponents", [])
     flags.setdefault("league_config_version", 0)
     flags.setdefault("reward_config_version", 0)
+    flags.setdefault("objective_config_version", 0)
+    flags.setdefault("league_sampling", "fixed")
+    flags.setdefault("pfsp_power", 2.0)
+    flags.setdefault("pfsp_teacher_floor", 0.15)
+    flags.setdefault("pfsp_exploration", 0.02)
+    flags.setdefault("pfsp_prior_games", 20)
+    flags.setdefault("learner_snapshot_interval_steps", 250000)
+    flags.setdefault("loss_normalization", "legacy")
+    flags.setdefault("normalize_advantages", False)
+    flags.setdefault("advantage_clip", 5.0)
+    flags.setdefault("rule_aux_enabled", False)
+    flags.setdefault("rule_aux_cost", 0.02)
+    flags.setdefault("rule_aux_strategy", "economy")
+    flags.setdefault("intent_aux_enabled", False)
+    flags.setdefault("intent_aux_cost", 0.01)
+    flags.setdefault("intent_head_only_finetune", False)
 
     # Model params
     flags.setdefault("use_index_select", True)
@@ -98,6 +114,10 @@ def main(flags: DictConfig):
 
     flags = get_default_flags(flags)
     original_cwd = Path(get_original_cwd())
+    if flags.get("teacher_load_dir"):
+        teacher_path = Path(flags.teacher_load_dir)
+        if not teacher_path.is_absolute():
+            flags.teacher_load_dir = str(original_cwd / teacher_path)
     for opponent in flags.league_opponents:
         for key in ("config", "checkpoint"):
             if opponent.get(key):

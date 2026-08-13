@@ -4,10 +4,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
 from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
+from lux_ai.lux_gym import create_env
+from lux_ai.nns import create_model
 from lux_ai.lux_gym.wrappers import VecEnv
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
@@ -21,13 +24,14 @@ from lux_ai.strategic_rl.league import (
     merge_player_actions,
     merge_player_actions_inplace,
     opponents_from_config,
+    rule_based_guidance,
 )
 from lux_ai.strategic_rl.models import SurvivalStrategicBackbone
 from lux_ai.strategic_rl.obs import night_turns_between
 from lux_ai.strategic_rl.prepare_data import _discover_replays
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
-from lux_ai.strategic_rl.reward import SurvivalPotentialReward
+from lux_ai.strategic_rl.reward import StrategicPotentialRewardV2, SurvivalPotentialReward
 from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
@@ -39,7 +43,13 @@ from lux_ai.strategic_rl.tta import (
     rotate_observations_180,
     rotate_policy_180,
 )
-from lux_ai.torchbeast.monobeast import compute_baseline_loss, compute_teacher_kl_loss
+from lux_ai.torchbeast.monobeast import (
+    configure_trainable_parameters,
+    compute_baseline_loss,
+    compute_teacher_kl_loss,
+    trajectory_weighted_mean,
+)
+from lux_ai.utils import flags_to_namespace
 
 
 def test_night_turn_count_boundaries():
@@ -379,6 +389,127 @@ def test_atomic_checkpoint_replaces_complete_file(tmp_path: Path):
     atomic_torch_save({"model_state_dict": {"x": torch.tensor([2])}}, path)
     assert torch.load(path, weights_only=False)["model_state_dict"]["x"].item() == 2
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_strategic_reward_v2_keeps_nonzero_floor_after_decay():
+    reward = StrategicPotentialRewardV2(shaping_weight=0.05, shaping_floor=0.01, decay_games=100)
+    counter = torch.multiprocessing.Value("q", 250)
+    reward.set_global_game_counter(counter)
+    assert np.isclose(reward.shaping_alpha(), 0.01)
+
+
+def test_trajectory_weighted_mean_balances_trajectory_sizes():
+    losses = torch.tensor([[[10.0, 1.0]], [[0.0, 1.0]]])
+    weights = torch.tensor([[[10.0, 1.0]], [[0.0, 1.0]]])
+    # Player 0: 10 / 10, player 1: 2 / 2.
+    assert torch.isclose(trajectory_weighted_mean(losses, weights), torch.tensor(1.0))
+
+
+def test_pfsp_prefers_learnable_opponent_and_honours_prior_weight():
+    opponents = [
+        Opponent("too_hard", weight=1.0),
+        Opponent("learnable", weight=1.0),
+        Opponent("weighted", weight=2.0),
+    ]
+    probabilities = PFSPSampler(opponents, power=1.0).probabilities(
+        {"too_hard": 0.02, "learnable": 0.5, "weighted": 0.5}
+    )
+    assert probabilities[1] > probabilities[0]
+    assert probabilities[2] > probabilities[1]
+
+
+def _cpu_strength_flags(intent_aux_enabled: bool):
+    config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "survival_strategic_strength_v2.yaml")
+    base = OmegaConf.load(Path(__file__).parents[1] / "conf" / "survival_strategic.yaml")
+    shaping = OmegaConf.load(Path(__file__).parents[1] / "conf" / "survival_strategic_shaping.yaml")
+    flags = OmegaConf.merge(base, shaping, config)
+    flags.intent_aux_enabled = intent_aux_enabled
+    flags.actor_device = "cpu"
+    flags.learner_device = "cpu"
+    flags.n_actor_envs = 1
+    flags.num_buffers = 1
+    flags.unroll_length = 1
+    return flags_to_namespace(OmegaConf.to_container(flags, resolve=False))
+
+
+def test_intent_head_can_be_enabled_or_disabled():
+    enabled_flags = _cpu_strength_flags(True)
+    env = create_env(enabled_flags, torch.device("cpu"))
+    try:
+        model_input = env.reset(force=True)
+        enabled = create_model(enabled_flags, torch.device("cpu"))
+        enabled_output = enabled(model_input, sample=False)
+        assert enabled_output["intent_logits"].shape == (1, 2, 32, 32, 4)
+
+        disabled_flags = _cpu_strength_flags(False)
+        disabled = create_model(disabled_flags, torch.device("cpu"))
+        assert "intent_logits" not in disabled(model_input, sample=False)
+    finally:
+        env.close()
+
+
+def test_intent_head_only_mode_freezes_every_other_parameter():
+    flags = _cpu_strength_flags(True)
+    model = create_model(flags, torch.device("cpu"))
+    parameters, names = configure_trainable_parameters(model, intent_head_only=True)
+
+    assert names == ["intent_head.weight", "intent_head.bias"]
+    assert parameters == [model.intent_head.weight, model.intent_head.bias]
+    assert all(
+        parameter.requires_grad == name.startswith("intent_head.")
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_intent_head_only_requires_enabled_head():
+    flags = _cpu_strength_flags(False)
+    model = create_model(flags, torch.device("cpu"))
+    with pytest.raises(ValueError, match="intent_aux_enabled=true"):
+        configure_trainable_parameters(model, intent_head_only=True)
+
+
+def test_rule_guidance_emits_masked_intent_targets():
+    flags = _cpu_strength_flags(True)
+    env = create_env(flags, torch.device("cpu"))
+    try:
+        env_output = env.reset(force=True)
+        action_template = {
+            entity: torch.zeros((*mask.shape[:-1], 4), dtype=torch.long)
+            for entity, mask in env_output["info"]["available_actions_mask"].items()
+        }
+        actions, confidence, intents, intent_mask = rule_based_guidance(
+            env.unwrapped,
+            env_output["info"]["available_actions_mask"],
+            action_template,
+            [0, 0],
+            [0, 1],
+            strategy="economy",
+        )
+        assert actions.keys() == action_template.keys()
+        assert confidence["worker"].shape == intents.shape
+        assert intent_mask.sum().item() == 2
+        assert set(intents[intent_mask].tolist()).issubset({0, 1, 2, 3})
+    finally:
+        env.close()
+
+
+def test_resume_migrates_strength_objective_but_cli_can_disable_intent():
+    selected = OmegaConf.create(
+        {
+            "objective_config_version": 1,
+            "loss_normalization": "trajectory",
+            "normalize_advantages": True,
+            "intent_aux_enabled": True,
+            "intent_aux_cost": 0.01,
+        }
+    )
+    merged = merge_resume_config(
+        OmegaConf.create({"objective_config_version": 0}),
+        selected,
+        OmegaConf.create({"intent_aux_enabled": False}),
+    )
+    assert merged.loss_normalization == "trajectory"
+    assert merged.intent_aux_enabled is False
 
 
 def test_replay_metrics_tracks_night_survival_and_orientation():

@@ -113,6 +113,17 @@ def create_buffers(
         specs["policy_logits"][key] = dict(size=(t + 1, n, *expanded_shape), dtype=torch.float32)
         final_actions_dim = min(expanded_shape[-1], MAX_OVERLAPPING_ACTIONS)
         specs["actions"][key] = dict(size=(t + 1, n, *expanded_shape[:-1], final_actions_dim), dtype=torch.int64)
+    if getattr(flags, "rule_aux_enabled", False):
+        specs["rule_actions"] = {}
+        specs["rule_confidence"] = {}
+        for key, expanded_shape in act_space.get_action_space_expanded_shape().items():
+            target_shape = expanded_shape[:-1]
+            specs["rule_actions"][key] = dict(size=(t + 1, n, *target_shape), dtype=torch.int64)
+            specs["rule_confidence"][key] = dict(size=(t + 1, n, *target_shape), dtype=torch.bool)
+    if getattr(flags, "intent_aux_enabled", False):
+        worker_shape = act_space.get_action_space_expanded_shape()["worker"][:-1]
+        specs["worker_intent"] = dict(size=(t + 1, n, *worker_shape), dtype=torch.int64)
+        specs["worker_intent_mask"] = dict(size=(t + 1, n, *worker_shape), dtype=torch.bool)
     buffers: Buffers = []
     for _ in range(flags.num_buffers):
         new_buffer = _create_buffers_from_specs(specs)

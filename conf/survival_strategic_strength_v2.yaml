@@ -1,0 +1,89 @@
+defaults:
+- survival_strategic_shaping
+- _self_
+
+name: survival_strategic_strength_v2
+
+# New reward contract: raw cargo is not rewarded unless it can be delivered.
+reward_config_version: 3
+reward_space: StrategicPotentialRewardV2
+reward_space_kwargs:
+  shaping_weight: 0.05
+  shaping_floor: 0.01
+  decay_games: 14000
+  discounting: 0.999
+  max_step_shaping: 0.05
+
+# Per-trajectory/player normalisation avoids map/entity-count-dependent scale.
+objective_config_version: 1
+loss_normalization: trajectory
+normalize_advantages: true
+advantage_clip: 5.0
+
+# Certified logistics decisions from rule_based_v2 are auxiliary targets only.
+rule_aux_enabled: true
+rule_aux_cost: 0.02
+rule_aux_strategy: economy
+
+# Optional worker macro-intent head: mine/deliver/build/return.
+# Override with intent_aux_enabled=false to train without this head.
+intent_aux_enabled: true
+intent_aux_cost: 0.01
+
+# PFSP uses shared learner-side outcomes and periodically frozen policy slots.
+league_config_version: 3
+league_sampling: pfsp
+pfsp_power: 2.0
+pfsp_teacher_floor: 0.15
+pfsp_exploration: 0.02
+pfsp_prior_games: 20
+learner_snapshot_interval_steps: 250000
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.30
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.10
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.10
+- name: first_place
+  kind: teacher
+  weight: 0.20
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: past_59822400
+  kind: teacher
+  weight: 0.05
+  config: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+- name: past_28576448
+  kind: teacher
+  weight: 0.05
+  config: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+- name: rule_economy
+  kind: rule_based
+  strategy: economy
+  weight: 0.05
+- name: rule_survival
+  kind: rule_based
+  strategy: survival
+  weight: 0.025
+- name: rule_expansion
+  kind: rule_based
+  strategy: expansion
+  weight: 0.025
+
+# This config is intended for a new policy-only warm start from the 5M model.
+weights_only: true
+total_steps: 1000000
+teacher_kl_decay_steps: 1000000
+
+# Preserve the first-place policy anchor used by the 5M source model.
+use_teacher: true
+teacher_load_dir: artifacts/teachers/first_place
+teacher_checkpoint_file: 062179520_weights.pt

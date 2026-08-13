@@ -190,7 +190,8 @@ class BasicActorCriticNetwork(nn.Module):
             actor_critic_activation: Callable = nn.ReLU,
             n_action_value_layers: int = 2,
             n_value_heads: int = 1,
-            rescale_value_input: bool = True
+            rescale_value_input: bool = True,
+            intent_classes: int = 0,
     ):
         super(BasicActorCriticNetwork, self).__init__()
         self.dict_input_layer = DictInputLayer()
@@ -236,6 +237,12 @@ class BasicActorCriticNetwork(nn.Module):
             n_value_heads=n_value_heads,
             rescale_input=rescale_value_input
         )
+        self.intent_classes = int(intent_classes)
+        self.intent_head = (
+            nn.Conv2d(self.base_out_channels, self.intent_classes, kernel_size=1)
+            if self.intent_classes > 0
+            else None
+        )
 
     def forward(
             self,
@@ -254,11 +261,18 @@ class BasicActorCriticNetwork(nn.Module):
             **actor_kwargs
         )
         baseline = self.baseline(self.baseline_base(base_out), input_mask, subtask_embeddings)
-        return dict(
+        output = dict(
             actions=actions,
             policy_logits=policy_logits,
             baseline=baseline
         )
+        if self.intent_head is not None:
+            batch_players, _, height, width = base_out.shape
+            intent_logits = self.intent_head(base_out).view(
+                batch_players // 2, 2, self.intent_classes, height, width
+            )
+            output["intent_logits"] = intent_logits.permute(0, 1, 3, 4, 2).contiguous()
+        return output
 
     def sample_actions(self, *args, **kwargs):
         return self.forward(*args, sample=True, **kwargs)
