@@ -1,0 +1,13 @@
+defaults:
+- survival_strategic_strength_v4_stable_2gpu
+- _self_
+
+name: survival_strategic_strength_v4_stable_2gpu_throughput
+
+# Increase rollout supply and queue headroom without changing the learner's
+# trajectory batch, optimizer-update count, reward schedule, LR, or KL anchor.
+num_actors: 4
+n_actor_envs: 16
+num_buffers: 8
+batch_size: 4
+unroll_length: 16
