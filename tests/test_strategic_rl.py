@@ -36,7 +36,12 @@ from lux_ai.strategic_rl.reward import StrategicPotentialRewardV2, SurvivalPoten
 from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics, run_matched_matches
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
-from lux_ai.strategic_rl.train_eval import full_checkpoint, promotion_decision, run_training_segment
+from lux_ai.strategic_rl.train_eval import (
+    full_checkpoint,
+    load_reused_baseline_evaluation,
+    promotion_decision,
+    run_training_segment,
+)
 from lux_ai.strategic_rl.tta import (
     ROT180_ACTION_INDICES,
     rot180_ensemble_outputs,
@@ -620,6 +625,63 @@ def test_training_segment_uses_hydra_append_for_resume_paths(monkeypatch, tmp_pa
     assert "weights_only=false" in captured["command"]
     assert "total_steps=1000" in captured["command"]
     assert "stop_after_step=250" in captured["command"]
+
+
+def test_reused_baseline_requires_exact_schedule_and_backend(tmp_path: Path):
+    evaluation_dir = tmp_path / "baseline_evaluation"
+    evaluation_dir.mkdir()
+    records = [
+        {
+            "backend": "internal_batched",
+            "opponent": "first_place",
+            "seed": 2021,
+            "map_size": 12,
+            "candidate_player": player,
+            "winner": player,
+            "candidate_city_survival": 0.75,
+            "candidate_final_city_tiles": 1,
+            "candidate_final_units": 1,
+        }
+        for player in (0, 1)
+    ]
+    (evaluation_dir / "games.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    report = summarize(records, bootstrap_samples=10)
+    (evaluation_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    reused = load_reused_baseline_evaluation(
+        evaluation_dir,
+        opponent_name="first_place",
+        seed_start=2021,
+        seeds=1,
+        map_sizes=(12,),
+        eval_backend="internal",
+        bootstrap_samples=10,
+    )
+    assert reused["backend"] == "internal"
+    assert reused["summary"]["opponents"]["first_place"]["matched_pairs"] == 1
+
+    with pytest.raises(ValueError, match="schedule does not match"):
+        load_reused_baseline_evaluation(
+            evaluation_dir,
+            opponent_name="first_place",
+            seed_start=2021,
+            seeds=1,
+            map_sizes=(12, 16),
+            eval_backend="internal",
+            bootstrap_samples=10,
+        )
+    with pytest.raises(ValueError, match="backend is internal"):
+        load_reused_baseline_evaluation(
+            evaluation_dir,
+            opponent_name="first_place",
+            seed_start=2021,
+            seeds=1,
+            map_sizes=(12,),
+            eval_backend="official",
+            bootstrap_samples=10,
+        )
 
 
 def _cpu_strength_flags(intent_aux_enabled: bool):

@@ -88,6 +88,20 @@ uv run --locked luxsr-train-eval \
   --seeds 5 --map-sizes 12 16 24 32
 ```
 
+To start a new run without repeating an unchanged baseline evaluation, point
+`--reuse-baseline-evaluation` at the previous run's `baseline_evaluation` directory. The command validates the
+opponent, complete seed/map/orientation schedule, evaluation backend, and report against `games.jsonl` before it
+creates the new run directory:
+
+```bash
+uv run --locked luxsr-train-eval \
+  --base-checkpoint /absolute/path/to/base_weights.pt \
+  --reuse-baseline-evaluation /absolute/path/to/previous_run/baseline_evaluation \
+  --run-root /absolute/path/to/new_run \
+  --seeds 10 --map-sizes 12 16 24 32 \
+  --eval-backend internal
+```
+
 The baseline and every milestone use the same seeds, map sizes, and both player orientations. By default, training
 stops when score rate is more than 5 percentage points below the old 5M baseline or city-extinction rate is more
 than 5 points above it. Results and decisions are written atomically to `evaluation_progress.json`. Increase

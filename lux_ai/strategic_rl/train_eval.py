@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from .evaluate import load_records, summarize
 from .evaluate_checkpoint import FIRST_PLACE_AGENT, evaluate_checkpoint
 from .prepare_eval_agent import ROOT
 
@@ -66,6 +67,86 @@ def write_progress(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def load_reused_baseline_evaluation(
+    evaluation_dir: Path,
+    *,
+    opponent_name: str,
+    seed_start: int,
+    seeds: int,
+    map_sizes: tuple[int, ...],
+    eval_backend: str,
+    bootstrap_samples: int,
+) -> dict:
+    """Validate and load an existing matched baseline without rerunning games."""
+    evaluation_dir = evaluation_dir.expanduser().resolve()
+    games_path = evaluation_dir / "games.jsonl"
+    report_path = evaluation_dir / "report.json"
+    if not games_path.is_file() or not report_path.is_file():
+        raise FileNotFoundError(
+            f"Reused baseline requires games.jsonl and report.json: {evaluation_dir}"
+        )
+
+    records = load_records(games_path)
+    expected = {
+        (seed, map_size, candidate_player)
+        for seed in range(seed_start, seed_start + seeds)
+        for map_size in map_sizes
+        for candidate_player in (0, 1)
+    }
+    actual = []
+    for record in records:
+        if record["opponent"] != opponent_name:
+            raise ValueError(
+                f"Reused baseline opponent mismatch: expected {opponent_name}, "
+                f"found {record['opponent']}"
+            )
+        if "map_size" not in record or "candidate_final_city_tiles" not in record:
+            raise ValueError("Reused baseline lacks map_size or city-extinction diagnostics")
+        actual.append(
+            (int(record["seed"]), int(record["map_size"]), int(record["candidate_player"]))
+        )
+    if len(actual) != len(set(actual)):
+        raise ValueError("Reused baseline contains duplicate seed/map/orientation games")
+    actual_set = set(actual)
+    if actual_set != expected:
+        missing = sorted(expected - actual_set)
+        unexpected = sorted(actual_set - expected)
+        raise ValueError(
+            "Reused baseline schedule does not match the requested evaluation: "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+        )
+
+    record_backends = {
+        "internal" if record.get("backend") == "internal_batched" else "official"
+        for record in records
+    }
+    if len(record_backends) != 1:
+        raise ValueError(f"Reused baseline mixes evaluation backends: {sorted(record_backends)}")
+    selected_backend = next(iter(record_backends))
+    if eval_backend != "auto" and selected_backend != eval_backend:
+        raise ValueError(
+            f"Reused baseline backend is {selected_backend}, but --eval-backend is {eval_backend}"
+        )
+
+    summary = summarize(records, bootstrap_samples=bootstrap_samples)
+    saved_report = json.loads(report_path.read_text(encoding="utf-8"))
+    for key in ("matched_pairs", "score_rate", "candidate_city_extinction_rate"):
+        saved = saved_report.get("opponents", {}).get(opponent_name, {}).get(key)
+        recomputed = summary["opponents"][opponent_name][key]
+        if saved != recomputed:
+            raise ValueError(
+                f"Reused baseline report does not match games.jsonl for {key}: "
+                f"report={saved}, recomputed={recomputed}"
+            )
+    return {
+        "summary": summary,
+        "source": str(evaluation_dir),
+        "backend": selected_backend,
+        "games": str(games_path),
+        "report": str(report_path),
+    }
+
+
 def run_training_segment(
     *,
     config_name: str,
@@ -92,40 +173,67 @@ def run_training_segment(
 
 def run_train_eval(args: argparse.Namespace) -> dict:
     run_root = args.run_root.expanduser().resolve()
-    run_root.mkdir(parents=True, exist_ok=False)
-    progress_path = run_root / "evaluation_progress.json"
+    base_checkpoint = args.base_checkpoint.expanduser().resolve()
+    if not base_checkpoint.is_file():
+        raise FileNotFoundError(f"Missing base checkpoint: {base_checkpoint}")
     milestones = sorted(set(args.milestones))
     if not milestones or milestones[-1] > args.total_steps or milestones[0] <= 0:
         raise ValueError("milestones must be positive and no larger than total_steps")
 
-    baseline_result = evaluate_checkpoint(
-        args.base_checkpoint,
-        args.opponent,
-        run_root / "baseline_evaluation",
-        opponent_name=args.opponent_name,
-        seed_start=args.seed_start,
-        seeds=args.seeds,
-        map_sizes=tuple(args.map_sizes),
-        python=args.engine_python,
-        timeout=args.timeout,
-        bootstrap_samples=args.bootstrap_samples,
-        workers=args.workers,
-        backend=args.eval_backend,
-        device=args.eval_device,
-        batch_games=args.eval_batch_games,
-        parity_games=args.parity_games,
+    if args.reuse_baseline_evaluation is not None:
+        baseline_result = load_reused_baseline_evaluation(
+            args.reuse_baseline_evaluation,
+            opponent_name=args.opponent_name,
+            seed_start=args.seed_start,
+            seeds=args.seeds,
+            map_sizes=tuple(args.map_sizes),
+            eval_backend=args.eval_backend,
+            bootstrap_samples=args.bootstrap_samples,
+        )
+    else:
+        baseline_result = None
+    milestone_eval_backend = (
+        baseline_result["backend"]
+        if baseline_result is not None and args.eval_backend == "auto"
+        else args.eval_backend
     )
+
+    run_root.mkdir(parents=True, exist_ok=False)
+    progress_path = run_root / "evaluation_progress.json"
+    if baseline_result is None:
+        baseline_result = evaluate_checkpoint(
+            base_checkpoint,
+            args.opponent,
+            run_root / "baseline_evaluation",
+            opponent_name=args.opponent_name,
+            seed_start=args.seed_start,
+            seeds=args.seeds,
+            map_sizes=tuple(args.map_sizes),
+            python=args.engine_python,
+            timeout=args.timeout,
+            bootstrap_samples=args.bootstrap_samples,
+            workers=args.workers,
+            backend=args.eval_backend,
+            device=args.eval_device,
+            batch_games=args.eval_batch_games,
+            parity_games=args.parity_games,
+        )
     progress = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "config_name": args.config_name,
-        "base_checkpoint": str(args.base_checkpoint.expanduser().resolve()),
+        "base_checkpoint": str(base_checkpoint),
         "baseline": baseline_result["summary"],
+        "baseline_evaluation": {
+            "reused": args.reuse_baseline_evaluation is not None,
+            "source": baseline_result.get("source", str(run_root / "baseline_evaluation")),
+            "backend": baseline_result.get("backend"),
+        },
         "milestones": [],
     }
     write_progress(progress_path, progress)
 
-    load_checkpoint = args.base_checkpoint.expanduser().resolve()
+    load_checkpoint = base_checkpoint
     weights_only = True
     for target in milestones:
         stage_dir = run_root / f"step_{target:07d}"
@@ -152,7 +260,7 @@ def run_train_eval(args: argparse.Namespace) -> dict:
             timeout=args.timeout,
             bootstrap_samples=args.bootstrap_samples,
             workers=args.workers,
-            backend=args.eval_backend,
+            backend=milestone_eval_backend,
             device=args.eval_device,
             batch_games=args.eval_batch_games,
             parity_games=args.parity_games,
@@ -191,6 +299,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-baseline-evaluation",
+        type=Path,
+        help=(
+            "Reuse an existing baseline_evaluation directory after validating its "
+            "opponent, seeds, map sizes, orientations, backend, and report."
+        ),
+    )
     parser.add_argument("--config-name", default="survival_strategic_strength_v3")
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--milestones", type=int, nargs="+", default=(250_000, 500_000, 750_000, 1_000_000))
