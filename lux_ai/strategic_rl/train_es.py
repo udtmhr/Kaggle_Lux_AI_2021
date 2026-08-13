@@ -47,6 +47,7 @@ from .train_distill import ShardDataset, _compact_collate, _select_entity_logits
 from .tta import rot180_ensemble_outputs
 
 SCHEMA_VERSION = 1
+_ENV_CREATION_LOCK = Lock()
 _MODEL_CREATION_LOCK = Lock()
 
 
@@ -398,7 +399,17 @@ class InternalMatchEvaluator:
         env_flags.n_actor_envs = len(specs)
         env_flags.reward_space = GameResultReward
         env_flags.reward_space_kwargs = {}
-        env = create_env(env_flags, self.device, teacher_flags=opponent_flags, seed=specs[0].seed)
+        # kaggle_environments' Lux module owns a process in module-global state;
+        # concurrent make/reset during LuxEnv construction can wait forever on
+        # the wrong process queue. Only construction needs serialization: each
+        # LuxEnv uses its own Dimensions subprocess afterwards.
+        with _ENV_CREATION_LOCK:
+            env = create_env(
+                env_flags,
+                self.device,
+                teacher_flags=opponent_flags,
+                seed=specs[0].seed,
+            )
         try:
             for game, spec in zip(env.unwrapped, specs):
                 game.configuration["seed"] = spec.seed - 1

@@ -1,0 +1,9 @@
+defaults:
+- survival_strategic_strength_v4_stable
+- _self_
+
+name: survival_strategic_strength_v4_stable_2gpu
+
+# RTX 3090 x2: keep rollout/TTA/league inference away from learner updates.
+actor_device: cuda:0
+learner_device: cuda:1
