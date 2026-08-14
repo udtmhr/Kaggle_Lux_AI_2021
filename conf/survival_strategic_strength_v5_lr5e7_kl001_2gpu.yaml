@@ -1,0 +1,22 @@
+defaults:
+- survival_strategic_strength_v4_stable_2gpu_throughput
+- _self_
+
+name: survival_strategic_strength_v5_lr5e7_kl001_2gpu
+
+# Fresh-optimizer pilot from the evaluated strength-v4 100k policy bundle.
+weights_only: true
+total_steps: 100000
+stop_after_step: null
+
+# Arm A: only LR changes relative to strength-v4.  Reward, league, actor FP32,
+# learner AMP, rollout topology, and all other objectives remain inherited.
+optimizer_kwargs:
+  lr: 5.0e-7
+  eps: 3.0e-4
+teacher_kl_cost: 0.01
+teacher_kl_cost_start: 0.01
+teacher_kl_cost_end: 0.01
+teacher_kl_cost_floor: 0.01
+teacher_kl_decay_steps: 100000
+teacher_kl_delay_steps: 0

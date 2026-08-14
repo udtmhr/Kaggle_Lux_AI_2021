@@ -159,6 +159,21 @@ parallel rows additionally record `candidate_group_size`, aggregate group throug
 was active. Only revisit EGGROLL if `backend_profile.forward_fraction` shows neural forward as the bottleneck. Keep ES
 artifacts even if the final promotion gate reports `not_promoted`.
 
+For the actor-head-only search with an independent 4-pair screen and 20-pair confirmation gate, use
+`conf/survival_strategic_es_actor_head_twostage.yaml`. The sigma pilot is mandatory for this configuration;
+do not pass `--force-sigma`. A tied screen may advance to confirmation, but confirmation accepts only a strictly
+positive score delta with no excessive city-extinction regression. The screen and confirmation metrics are both
+stored in `generations.jsonl`.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked luxsr-train-es \
+  --init-checkpoint outputs/strength_winloss_001/step_1000000/0657088_weights.pt \
+  --config outputs/strength_winloss_001/step_1000000/config.yaml \
+  --es-config conf/survival_strategic_es_actor_head_twostage.yaml \
+  --run-dir outputs/es_actor_head_twostage_001 \
+  --device cuda --candidate-workers 2 --workers 2
+```
+
 ### Reusable official-CLI agent bundle
 
 Export the inference runtime once with an initial evaluated checkpoint. The archive contains observation construction,

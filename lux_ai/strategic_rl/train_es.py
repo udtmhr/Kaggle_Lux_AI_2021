@@ -53,6 +53,7 @@ _MODEL_CREATION_LOCK = Lock()
 
 @dataclass(frozen=True)
 class ESConfig:
+    parameter_scope: str
     pilot_sigmas: tuple[float, ...]
     pilot_directions: int
     pilot_games_per_candidate: int
@@ -60,6 +61,9 @@ class ESConfig:
     directions: int
     games_per_candidate: int
     gate_pairs: int
+    gate_confirm_pairs: int
+    gate_confirm_seed_start: int
+    gate_require_score_improvement: bool
     active_probability: float
     active_warmup_generations: int
     active_rank: int
@@ -119,6 +123,7 @@ def load_es_config(path: Path) -> tuple[ESConfig, list[dict], tuple[Path, ...]]:
     search = values["search"]
     evaluation = values["evaluation"]
     config = ESConfig(
+        parameter_scope=str(search.get("parameter_scope", "all_policy")),
         pilot_sigmas=tuple(float(value) for value in search["pilot_sigmas"]),
         pilot_directions=int(search["pilot_directions"]),
         pilot_games_per_candidate=int(search["pilot_games_per_candidate"]),
@@ -126,6 +131,13 @@ def load_es_config(path: Path) -> tuple[ESConfig, list[dict], tuple[Path, ...]]:
         directions=int(search["directions"]),
         games_per_candidate=int(search["games_per_candidate"]),
         gate_pairs=int(evaluation["gate_pairs"]),
+        gate_confirm_pairs=int(evaluation.get("gate_confirm_pairs", 0)),
+        gate_confirm_seed_start=int(
+            evaluation.get("gate_confirm_seed_start", int(evaluation["gate_seed_start"]) + 1_000_000)
+        ),
+        gate_require_score_improvement=bool(
+            evaluation.get("gate_require_score_improvement", False)
+        ),
         active_probability=float(search["active_probability"]),
         active_warmup_generations=int(search["active_warmup_generations"]),
         active_rank=int(search["active_rank"]),
@@ -164,6 +176,12 @@ def load_es_config(path: Path) -> tuple[ESConfig, list[dict], tuple[Path, ...]]:
             raise ValueError(f"{name} must be positive")
     if config.action_probe_states < 0 or config.active_warmup_generations < 0:
         raise ValueError("action_probe_states and active_warmup_generations must be non-negative")
+    if config.parameter_scope not in {"all_policy", "actor_head"}:
+        raise ValueError(f"unsupported ES parameter scope: {config.parameter_scope}")
+    if config.gate_confirm_pairs < 0:
+        raise ValueError("gate_confirm_pairs must be non-negative")
+    if 0 < config.gate_confirm_pairs <= config.gate_pairs:
+        raise ValueError("gate_confirm_pairs must be zero or greater than gate_pairs")
     if not 0.0 <= config.active_probability <= 1.0:
         raise ValueError("active_probability must be in [0, 1]")
     if not config.map_sizes or any(size not in (12, 16, 24, 32) for size in config.map_sizes):
@@ -249,6 +267,26 @@ def paired_schedule(
                 )
             pair += 1
     return tuple(schedule)
+
+
+def quality_gate_result(
+    old_metrics: Mapping,
+    new_metrics: Mapping,
+    *,
+    max_city_extinction_delta: float,
+    require_score_improvement: bool,
+) -> dict:
+    score_delta = float(new_metrics["score_rate"] - old_metrics["score_rate"])
+    extinction_delta = float(
+        new_metrics["candidate_city_extinction_rate"]
+        - old_metrics["candidate_city_extinction_rate"]
+    )
+    score_passed = score_delta > 0.0 if require_score_improvement else score_delta >= 0.0
+    return {
+        "passed": score_passed and extinction_delta <= max_city_extinction_delta,
+        "score_delta": score_delta,
+        "city_extinction_delta": extinction_delta,
+    }
 
 
 def load_deployment_action_config(agent: Path | None = None) -> DeploymentActionConfig:
@@ -969,12 +1007,15 @@ def _select_backend(args, model_config, init_checkpoint, opponents, run_dir, ini
 def _apply_overrides(config: ESConfig, args) -> ESConfig:
     values = asdict(config)
     for field, argument in (
+        ("parameter_scope", args.parameter_scope),
         ("pilot_directions", args.pilot_directions),
         ("pilot_games_per_candidate", args.pilot_games_per_candidate),
         ("generations", args.generations),
         ("directions", args.directions),
         ("games_per_candidate", args.games_per_candidate),
         ("gate_pairs", args.gate_pairs),
+        ("gate_confirm_pairs", args.gate_confirm_pairs),
+        ("gate_require_score_improvement", args.gate_require_score_improvement),
         ("action_probe_states", args.action_probe_states),
         ("formal_seeds", args.formal_seeds),
     ):
@@ -1008,7 +1049,11 @@ def run(args: argparse.Namespace) -> dict:
     initial_state = load_policy_state(init_checkpoint)
     model.load_state_dict(initial_state, strict=True)
     model.eval()
-    parameter_space = ParameterSpace(model, scale_floor=config.scale_floor)
+    parameter_space = ParameterSpace(
+        model,
+        scale_floor=config.scale_floor,
+        parameter_scope=config.parameter_scope,
+    )
     center = parameter_space.flatten_model(model)
     init_sha = sha256_file(init_checkpoint)
     config_sha = sha256_file(model_config)
@@ -1025,7 +1070,12 @@ def run(args: argparse.Namespace) -> dict:
         "model_config_sha256": config_sha,
         "evolved_parameters": parameter_space.dimension,
         "evolved_parameter_names": parameter_space.names,
-        "excluded_prefixes": ["baseline_base.", "baseline.", "intent_head."],
+        "parameter_scope": config.parameter_scope,
+        "excluded_prefixes": (
+            ["baseline_base.", "baseline.", "intent_head."]
+            if config.parameter_scope == "all_policy"
+            else ["base_model.", "baseline_base.", "baseline.", "intent_head."]
+        ),
         "opponents": [opponent.name for opponent in opponents],
         "history_checkpoints": [str(path) for path in history],
         "runtime": {
@@ -1050,7 +1100,15 @@ def run(args: argparse.Namespace) -> dict:
             raise FileNotFoundError(f"missing ES manifest for resume: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         requested_search = json.loads(json.dumps(asdict(config)))
-        if manifest.get("search") != requested_search:
+        saved_search = dict(manifest.get("search", {}))
+        saved_search.setdefault("parameter_scope", "all_policy")
+        saved_search.setdefault("gate_confirm_pairs", 0)
+        saved_search.setdefault("gate_require_score_improvement", False)
+        saved_search.setdefault(
+            "gate_confirm_seed_start",
+            int(saved_search.get("gate_seed_start", config.gate_seed_start)) + 1_000_000,
+        )
+        if saved_search != requested_search:
             raise ValueError("ES resume search configuration changed; use the original CLI/config")
         if manifest.get("history_checkpoints") != validation["history_checkpoints"]:
             raise ValueError("ES resume active-subspace history checkpoints changed")
@@ -1317,25 +1375,37 @@ def run(args: argparse.Namespace) -> dict:
         update = optimizer.update(gradient)
         has_update = bool(torch.linalg.vector_norm(update) > 1e-12)
         proposal = center + parameter_space.scales * update
+        two_stage_gate = config.gate_confirm_pairs > 0
+        screen_namespace = "gate-screen" if two_stage_gate else "gate"
         gate_schedule = paired_schedule(
             generation=generation,
             pairs=config.gate_pairs,
             opponents=opponent_names,
             seed_start=config.gate_seed_start,
             map_sizes=config.map_sizes,
-            namespace="gate",
+            namespace=screen_namespace,
         )
-        old_gate, new_gate = _candidate_results(
+        screen_old, screen_new = _candidate_results(
             requests=[
                 CandidateRequest(
-                    f"g{generation:04d}-gate-old",
+                    f"g{generation:04d}-{screen_namespace}-old",
                     center,
-                    {"phase": "gate", "generation": generation, "role": "old"},
+                    {
+                        "phase": "gate",
+                        "gate_stage": "screen",
+                        "generation": generation,
+                        "role": "old",
+                    },
                 ),
                 CandidateRequest(
-                    f"g{generation:04d}-gate-new",
+                    f"g{generation:04d}-{screen_namespace}-new",
                     proposal,
-                    {"phase": "gate", "generation": generation, "role": "new"},
+                    {
+                        "phase": "gate",
+                        "gate_stage": "screen",
+                        "generation": generation,
+                        "role": "new",
+                    },
                 ),
             ],
             evaluator=evaluator,
@@ -1347,15 +1417,74 @@ def run(args: argparse.Namespace) -> dict:
             output=run_dir / "fitness.jsonl",
             candidate_workers=effective_candidate_workers,
         )
-        score_delta = new_gate["metrics"]["score_rate"] - old_gate["metrics"]["score_rate"]
-        extinction_delta = (
-            new_gate["metrics"]["candidate_city_extinction_rate"]
-            - old_gate["metrics"]["candidate_city_extinction_rate"]
+        screen_result = quality_gate_result(
+            screen_old["metrics"],
+            screen_new["metrics"],
+            max_city_extinction_delta=config.max_city_extinction_delta,
+            require_score_improvement=(
+                config.gate_require_score_improvement if not two_stage_gate else False
+            ),
         )
-        accepted = (
+        confirm_gate = None
+        old_gate, new_gate = screen_old, screen_new
+        final_result = screen_result
+        if has_update and two_stage_gate and screen_result["passed"]:
+            confirm_schedule = paired_schedule(
+                generation=generation,
+                pairs=config.gate_confirm_pairs,
+                opponents=opponent_names,
+                seed_start=config.gate_confirm_seed_start,
+                map_sizes=config.map_sizes,
+                namespace="gate-confirm",
+            )
+            confirm_old, confirm_new = _candidate_results(
+                requests=[
+                    CandidateRequest(
+                        f"g{generation:04d}-gate-confirm-old",
+                        center,
+                        {
+                            "phase": "gate",
+                            "gate_stage": "confirm",
+                            "generation": generation,
+                            "role": "old",
+                        },
+                    ),
+                    CandidateRequest(
+                        f"g{generation:04d}-gate-confirm-new",
+                        proposal,
+                        {
+                            "phase": "gate",
+                            "gate_stage": "confirm",
+                            "generation": generation,
+                            "role": "new",
+                        },
+                    ),
+                ],
+                evaluator=evaluator,
+                model=model,
+                parameter_space=parameter_space,
+                schedule=confirm_schedule,
+                tie_break_weight=config.tie_break_weight,
+                cache=result_cache,
+                output=run_dir / "fitness.jsonl",
+                candidate_workers=effective_candidate_workers,
+            )
+            final_result = quality_gate_result(
+                confirm_old["metrics"],
+                confirm_new["metrics"],
+                max_city_extinction_delta=config.max_city_extinction_delta,
+                require_score_improvement=config.gate_require_score_improvement,
+            )
+            confirm_gate = {
+                "old": confirm_old["metrics"],
+                "new": confirm_new["metrics"],
+                **final_result,
+            }
+            old_gate, new_gate = confirm_old, confirm_new
+        accepted = bool(
             has_update
-            and score_delta >= 0.0
-            and extinction_delta <= config.max_city_extinction_delta
+            and final_result["passed"]
+            and (not two_stage_gate or confirm_gate is not None)
         )
         if accepted:
             center = proposal
@@ -1380,10 +1509,17 @@ def run(args: argparse.Namespace) -> dict:
             "accepted": accepted,
             "rejection_reason": None if accepted else ("quality_gate" if has_update else "zero_gradient"),
             "sigma": sigma,
-            "score_delta": score_delta,
-            "city_extinction_delta": extinction_delta,
+            "score_delta": final_result["score_delta"],
+            "city_extinction_delta": final_result["city_extinction_delta"],
             "old_gate": old_gate["metrics"],
             "new_gate": new_gate["metrics"],
+            "gate_stage": "confirm" if confirm_gate is not None else "screen",
+            "screen_gate": {
+                "old": screen_old["metrics"],
+                "new": screen_new["metrics"],
+                **screen_result,
+            },
+            "confirm_gate": confirm_gate,
             "direction_kinds": {kind: direction_kinds.count(kind) for kind in sorted(set(direction_kinds))},
             "clipup_speed": float(torch.linalg.vector_norm(optimizer.velocity)) if optimizer.velocity is not None else 0,
         }
@@ -1564,12 +1700,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Skip the usefulness pilot and use this sigma (intended for smoke/debug runs).",
     )
+    parser.add_argument("--parameter-scope", choices=("all_policy", "actor_head"))
     parser.add_argument("--pilot-directions", type=int)
     parser.add_argument("--pilot-games-per-candidate", type=int)
     parser.add_argument("--generations", type=int)
     parser.add_argument("--directions", type=int)
     parser.add_argument("--games-per-candidate", type=int)
     parser.add_argument("--gate-pairs", type=int)
+    parser.add_argument("--gate-confirm-pairs", type=int)
+    parser.add_argument(
+        "--gate-require-score-improvement",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require a strictly positive score delta at the final quality-gate stage.",
+    )
     parser.add_argument("--action-probe-states", type=int)
     parser.add_argument("--formal-seeds", type=int)
     return parser.parse_args()

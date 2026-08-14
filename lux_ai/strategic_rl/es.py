@@ -10,11 +10,19 @@ import torch
 from torch import nn
 
 EVOLVED_PREFIXES = ("base_model.", "actor_base.", "actor.")
+PARAMETER_SCOPE_PREFIXES = {
+    "all_policy": EVOLVED_PREFIXES,
+    "actor_head": ("actor_base.", "actor."),
+}
 
 
-def evolved_parameter_names(model: nn.Module) -> list[str]:
+def evolved_parameter_names(model: nn.Module, parameter_scope: str = "all_policy") -> list[str]:
     """Return policy parameters that can affect deployed actions."""
-    return [name for name, _ in model.named_parameters() if name.startswith(EVOLVED_PREFIXES)]
+    try:
+        prefixes = PARAMETER_SCOPE_PREFIXES[parameter_scope]
+    except KeyError as error:
+        raise ValueError(f"unsupported ES parameter scope: {parameter_scope}") from error
+    return [name for name, _ in model.named_parameters() if name.startswith(prefixes)]
 
 
 def _average_ranks(values: Sequence[float]) -> torch.Tensor:
@@ -75,13 +83,19 @@ def policy_fitness(records: Sequence[Mapping], tie_break_weight: float = 0.01) -
 class ParameterSpace:
     """Flat, layer-scaled coordinates for action-affecting model parameters."""
 
-    def __init__(self, model: nn.Module, scale_floor: float = 1e-3):
+    def __init__(
+        self,
+        model: nn.Module,
+        scale_floor: float = 1e-3,
+        parameter_scope: str = "all_policy",
+    ):
         if scale_floor <= 0:
             raise ValueError("scale_floor must be positive")
-        selected_names = set(evolved_parameter_names(model))
+        selected_names = set(evolved_parameter_names(model, parameter_scope))
         selected = [(name, parameter) for name, parameter in model.named_parameters() if name in selected_names]
         if not selected:
-            raise ValueError("model has no action-affecting parameters")
+            raise ValueError(f"model has no parameters for ES scope {parameter_scope!r}")
+        self.parameter_scope = parameter_scope
         self.names = [name for name, _ in selected]
         self.shapes = [tuple(parameter.shape) for _, parameter in selected]
         self.numels = [parameter.numel() for _, parameter in selected]

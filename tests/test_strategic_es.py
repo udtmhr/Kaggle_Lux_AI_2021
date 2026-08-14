@@ -25,7 +25,9 @@ from lux_ai.strategic_rl.train_es import (
     _candidate_results,
     _save_es_state,
     load_deployment_action_config,
+    load_es_config,
     paired_schedule,
+    quality_gate_result,
 )
 
 
@@ -58,6 +60,16 @@ def test_parameter_space_evolves_policy_and_excludes_value_and_intent():
     assert torch.equal(model.baseline.weight, baseline)
     assert torch.equal(model.actor_base.weight_u, spectral_buffer)
     assert torch.equal(model.policy_counter, integer_buffer)
+
+
+def test_actor_head_parameter_space_excludes_backbone_and_value_heads():
+    model = TinyPolicy()
+    space = ParameterSpace(model, parameter_scope="actor_head")
+    assert space.parameter_scope == "actor_head"
+    assert all(name.startswith(("actor_base.", "actor.")) for name in space.names)
+    assert not any(name.startswith("base_model.") for name in space.names)
+    with pytest.raises(ValueError, match="unsupported ES parameter scope"):
+        ParameterSpace(model, parameter_scope="unknown")
 
 
 def test_rank_utilities_average_ties_and_antithetic_gradient_direction():
@@ -174,6 +186,37 @@ def test_training_and_gate_schedules_are_deterministic_and_paired():
     ]
 
 
+def test_two_stage_quality_gate_screens_ties_but_confirm_requires_improvement():
+    old = {"score_rate": 0.5, "candidate_city_extinction_rate": 0.1}
+    tied = {"score_rate": 0.5, "candidate_city_extinction_rate": 0.1}
+    improved = {"score_rate": 0.55, "candidate_city_extinction_rate": 0.1}
+    unsafe = {"score_rate": 0.55, "candidate_city_extinction_rate": 0.2}
+    assert quality_gate_result(
+        old,
+        tied,
+        max_city_extinction_delta=0.05,
+        require_score_improvement=False,
+    )["passed"]
+    assert not quality_gate_result(
+        old,
+        tied,
+        max_city_extinction_delta=0.05,
+        require_score_improvement=True,
+    )["passed"]
+    assert quality_gate_result(
+        old,
+        improved,
+        max_city_extinction_delta=0.05,
+        require_score_improvement=True,
+    )["passed"]
+    assert not quality_gate_result(
+        old,
+        unsafe,
+        max_city_extinction_delta=0.05,
+        require_score_improvement=True,
+    )["passed"]
+
+
 def test_deployment_collision_resolver_prevents_friendly_duplicate_destination():
     players = [Player(0), Player(1)]
     players[0].units = [
@@ -232,6 +275,18 @@ def test_es_config_paths_exist():
         "first_place",
         "initial_model",
     ]
+    legacy_config, _, _ = load_es_config(config_path)
+    assert legacy_config.parameter_scope == "all_policy"
+    assert legacy_config.gate_confirm_pairs == 0
+    assert not legacy_config.gate_require_score_improvement
+
+    actor_config, _, _ = load_es_config(
+        root / "conf" / "survival_strategic_es_actor_head_twostage.yaml"
+    )
+    assert actor_config.parameter_scope == "actor_head"
+    assert actor_config.gate_pairs == 4
+    assert actor_config.gate_confirm_pairs == 20
+    assert actor_config.gate_require_score_improvement
 
 
 def test_resume_state_preserves_next_clipup_update(tmp_path):

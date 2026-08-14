@@ -1,0 +1,11 @@
+defaults:
+- survival_strategic_strength_v5_lr5e7_kl001_2gpu
+- _self_
+
+name: survival_strategic_strength_v5_lr5e7_kl002_2gpu
+
+# Arm B differs from Arm A only in the fixed teacher-KL anchor.
+teacher_kl_cost: 0.02
+teacher_kl_cost_start: 0.02
+teacher_kl_cost_end: 0.02
+teacher_kl_cost_floor: 0.02
