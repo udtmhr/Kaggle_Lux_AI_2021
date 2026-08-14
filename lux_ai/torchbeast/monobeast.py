@@ -263,8 +263,14 @@ def state_dict_max_abs_diff(left: Mapping[str, torch.Tensor], right: Mapping[str
 
 
 def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: bool = False) -> None:
-    """Synchronize the rollout model and optionally verify every saved tensor."""
-    actor_model.load_state_dict(learner_model.state_dict())
+    """Synchronize the rollout model through owned CPU tensors.
+
+    The actor model can live in CUDA IPC memory shared with spawned rollout
+    processes.  A direct cross-GPU ``load_state_dict`` into that storage can
+    return without updating it, so use CPU as the synchronization boundary.
+    """
+    learner_state = model_state_dict_cpu(learner_model)
+    actor_model.load_state_dict(learner_state)
     actor_cuda_devices = {
         tensor.device
         for tensor in actor_model.state_dict().values()
@@ -275,7 +281,7 @@ def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: b
     if verify:
         difference = state_dict_max_abs_diff(
             model_state_dict_cpu(actor_model),
-            model_state_dict_cpu(learner_model),
+            learner_state,
         )
         if difference != 0.0:
             raise RuntimeError(f"Learner-to-actor model synchronization failed: max_abs_diff={difference}")
@@ -1366,6 +1372,7 @@ def train(flags):
             )
 
     timer = timeit.default_timer
+    training_failed = False
     try:
         last_checkpoint_time = timer()
         while step < training_stop_step:
@@ -1391,6 +1398,11 @@ def train(flags):
     except KeyboardInterrupt:
         # Try checkpointing and joining actors then quit.
         return
+    except BaseException:
+        # Preserve the original training exception. A final actor sync would
+        # otherwise be able to replace it with a secondary checkpoint error.
+        training_failed = True
+        raise
     else:
         for thread in learner_threads:
             thread.join()
@@ -1399,6 +1411,11 @@ def train(flags):
         for _ in range(flags.num_actors):
             free_queue.put(None)
         for actor in actor_processes:
-            actor.join(timeout=1)
-        cp_path = str(step).zfill(int(math.log10(flags.total_steps)) + 1)
-        checkpoint(cp_path)
+            actor.join(timeout=10)
+            if actor.is_alive():
+                logging.warning("Terminating rollout actor that did not stop after the shutdown signal")
+                actor.terminate()
+                actor.join(timeout=10)
+        if not training_failed:
+            cp_path = str(step).zfill(int(math.log10(flags.total_steps)) + 1)
+            checkpoint(cp_path)

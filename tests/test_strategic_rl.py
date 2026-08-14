@@ -751,7 +751,13 @@ def test_intent_head_only_requires_enabled_head():
 
 
 def test_model_state_validation_detects_update_and_syncs_actor():
-    actor = torch.nn.Linear(3, 2)
+    class RecordingLinear(torch.nn.Linear):
+        def load_state_dict(self, state_dict, *args, **kwargs):
+            self.loaded_state_devices = {tensor.device.type for tensor in state_dict.values()}
+            self.loaded_state_pointers = {name: tensor.data_ptr() for name, tensor in state_dict.items()}
+            return super().load_state_dict(state_dict, *args, **kwargs)
+
+    actor = RecordingLinear(3, 2)
     learner = torch.nn.Linear(3, 2)
     initial = model_state_dict_cpu(actor)
     with torch.no_grad():
@@ -762,6 +768,11 @@ def test_model_state_validation_detects_update_and_syncs_actor():
 
     sync_actor_model(actor, learner, verify=True)
 
+    assert actor.loaded_state_devices == {"cpu"}
+    assert all(
+        actor.loaded_state_pointers[name] != tensor.data_ptr()
+        for name, tensor in learner.state_dict().items()
+    )
     assert state_dict_max_abs_diff(model_state_dict_cpu(actor), model_state_dict_cpu(learner)) == 0.0
 
 
