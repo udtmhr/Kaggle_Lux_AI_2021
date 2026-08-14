@@ -57,6 +57,9 @@ from ..strategic_rl.league import (
     rule_based_guidance,
 )
 from ..strategic_rl.schedules import teacher_kl_coefficient
+from ..strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
+from ..strategic_rl.categorical_value import hl_gauss_loss, support_outside_fraction
+from ..strategic_rl.curriculum import SnapshotPool
 from ..strategic_rl.tta import rot180_ensemble_outputs
 
 
@@ -192,6 +195,36 @@ def compute_baseline_loss(
     return reduce(baseline_loss, reduction=reduction)
 
 
+def compute_categorical_baseline_loss(
+    logits: torch.Tensor,
+    value_targets: torch.Tensor,
+    reduction: str,
+    player_mask: Optional[torch.Tensor],
+    trajectory_normalize: bool,
+    value_min: float,
+    value_max: float,
+    sigma_ratio: float,
+) -> torch.Tensor:
+    loss = hl_gauss_loss(
+        logits, value_targets, value_min=value_min, value_max=value_max, sigma_ratio=sigma_ratio
+    )
+    if player_mask is not None:
+        loss = loss * player_mask
+    if trajectory_normalize:
+        weights = torch.ones_like(loss) if player_mask is None else player_mask
+        return trajectory_weighted_mean(loss, weights)
+    return reduce(loss, reduction=reduction)
+
+
+def explained_variance(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+    targets = targets.detach().float()
+    predictions = predictions.detach().float()
+    variance = targets.var(unbiased=False)
+    if variance <= 1e-12:
+        return float("nan")
+    return float((1.0 - (targets - predictions).var(unbiased=False) / variance).item())
+
+
 def compute_policy_gradient_loss(
     action_log_probs: torch.Tensor,
     advantages: torch.Tensor,
@@ -206,12 +239,30 @@ def compute_policy_gradient_loss(
 
 
 def _load_model_state(model: nn.Module, state_dict: Mapping, allow_new_intent_head: bool) -> None:
-    if not allow_new_intent_head:
+    allow_value_migration = getattr(model, "value_critic", "scalar") == "categorical_hl_gauss"
+    if not allow_new_intent_head and not allow_value_migration:
         model.load_state_dict(state_dict)
         return
+    if allow_value_migration:
+        current = model.state_dict()
+        invalid = [
+            key for key, value in state_dict.items()
+            if (key not in current or current[key].shape != value.shape)
+            and not key.startswith("baseline.")
+        ]
+        if invalid:
+            raise RuntimeError(f"Incompatible checkpoint tensors outside value head: {invalid}")
+        state_dict = {
+            key: value for key, value in state_dict.items()
+            if key in current and current[key].shape == value.shape
+        }
     incompatible = model.load_state_dict(state_dict, strict=False)
     unexpected = list(incompatible.unexpected_keys)
-    missing = [key for key in incompatible.missing_keys if not key.startswith("intent_head.")]
+    missing = [
+        key for key in incompatible.missing_keys
+        if not (allow_new_intent_head and key.startswith("intent_head."))
+        and not (allow_value_migration and key.startswith("baseline."))
+    ]
     if unexpected or missing:
         raise RuntimeError(f"Incompatible checkpoint: missing={missing}, unexpected={unexpected}")
     if incompatible.missing_keys:
@@ -293,7 +344,9 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
     mixed_precision = getattr(flags, "actor_mixed_precision", flags.use_mixed_precision)
     with amp.autocast("cuda", enabled=mixed_precision and flags.actor_device.type == "cuda"):
         if not getattr(flags, "actor_policy_tta_rot180", False):
-            return actor_model(env_output)
+            output = actor_model(env_output)
+            output.pop("baseline_logits", None)
+            return output
         output = rot180_ensemble_outputs(actor_model, env_output)
     output["actions"] = {
         entity: DictActor.logits_to_actions(
@@ -303,6 +356,7 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
         ).view(*logits.shape[:-1], -1)
         for entity, logits in output["policy_logits"].items()
     }
+    output.pop("baseline_logits", None)
     return output
 
 
@@ -512,6 +566,7 @@ def act(
     snapshot_versions,
     snapshot_lock,
     reward_game_counter,
+    actor_policy_version,
     buffers: Buffers,
 ):
     if flags.debug:
@@ -549,6 +604,9 @@ def act(
             exploration=float(getattr(flags, "pfsp_exploration", 0.02)),
         )
         league_rng = np.random.default_rng(None if flags.seed is None else flags.seed + 100000 + actor_index)
+        curriculum_enabled = bool(getattr(flags, "state_curriculum_enabled", False))
+        snapshot_pool = SnapshotPool(capacity=int(getattr(flags, "snapshot_pool_capacity", 2048)))
+        pending_snapshot_priorities = {}
         selected_opponents = [
             _sample_league_index(
                 flags, league_opponents, league_sampler, pfsp_sampler, league_outcomes, league_rng
@@ -560,6 +618,10 @@ def act(
             env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
         )
         agent_output = actor_model_output(flags, actor_model, env_output)
+        agent_output["policy_version"] = torch.full(
+            (flags.n_actor_envs,), int(actor_policy_version.value), dtype=torch.int64,
+            device=flags.actor_device,
+        )
         _attach_rule_guidance(
             flags, env, env_output, agent_output, league_opponents, selected_opponents, learner_players
         )
@@ -576,6 +638,18 @@ def act(
                 timings.reset()
 
                 agent_output = actor_model_output(flags, actor_model, env_output)
+                agent_output["policy_version"] = torch.full(
+                    (flags.n_actor_envs,), int(actor_policy_version.value), dtype=torch.int64,
+                    device=flags.actor_device,
+                )
+                if curriculum_enabled and pending_snapshot_priorities:
+                    for env_index, (snapshot_id, reward, previous_value, player) in list(
+                        pending_snapshot_priorities.items()
+                    ):
+                        next_value = float(agent_output["baseline"][env_index, player].item())
+                        td_error = reward + float(flags.discounting) * next_value - previous_value
+                        snapshot_pool.update_priority(snapshot_id, td_error)
+                    pending_snapshot_priorities.clear()
                 _attach_rule_guidance(
                     flags, env, env_output, agent_output, league_opponents, selected_opponents, learner_players
                 )
@@ -603,6 +677,26 @@ def act(
                 )
                 agent_output["actions"] = actions
                 env_output = env.step(actions)
+                if curriculum_enabled:
+                    snapshot_interval = max(int(getattr(flags, "snapshot_capture_interval", 16)), 1)
+                    capture_indices = [
+                        index for index, game in enumerate(env.unwrapped)
+                        if not bool(env_output["done"][index]) and game.game_state.turn % snapshot_interval == 0
+                    ]
+                    if capture_indices:
+                        opponent_names = [league_opponents[selected_opponents[index]].name for index in capture_indices]
+                        for env_index, payload in zip(
+                            capture_indices, env.capture_snapshots(capture_indices, opponent_names)
+                        ):
+                            payload["learner_player"] = int(learner_players[env_index])
+                            snapshot_id = snapshot_pool.add(payload)
+                            player = learner_players[env_index]
+                            pending_snapshot_priorities[env_index] = (
+                                snapshot_id,
+                                float(env_output["reward"][env_index, player].item()),
+                                float(agent_output["baseline"][env_index, player].item()),
+                                player,
+                            )
                 _set_learner_player_info(
                     env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
                 )
@@ -618,6 +712,21 @@ def act(
                     }
 
                     env_output = env.reset()
+                    restored_metadata = {}
+                    if curriculum_enabled:
+                        restored = {}
+                        for env_index in cached_done.nonzero(as_tuple=False).flatten().tolist():
+                            entry = snapshot_pool.choose_episode_start(
+                                league_rng,
+                                snapshot_probability=float(getattr(flags, "snapshot_start_probability", 0.30)),
+                            )
+                            if entry is not None:
+                                restored[env_index] = entry.payload
+                                restored_metadata[env_index] = (
+                                    entry.payload["opponent"], int(entry.payload.get("learner_player", 0))
+                                )
+                        if restored:
+                            env_output = env.restore_snapshots(restored)
                     env_output["reward"] = cached_reward
                     env_output["done"] = cached_done
                     env_output["info"]["actions_taken"] = cached_info_actions_taken
@@ -628,15 +737,23 @@ def act(
                         opponent_reward = float(cached_reward[env_index, 1 - learner_player])
                         score = 1.0 if learner_reward > opponent_reward else 0.0 if learner_reward < opponent_reward else 0.5
                         _record_league_outcome(league_outcomes, selected_opponents[env_index], score)
-                        selected_opponents[env_index] = _sample_league_index(
-                            flags,
-                            league_opponents,
-                            league_sampler,
-                            pfsp_sampler,
-                            league_outcomes,
-                            league_rng,
-                        )
-                        learner_players[env_index] = int(league_rng.integers(0, 2))
+                        if env_index in restored_metadata:
+                            opponent_name, learner_player = restored_metadata[env_index]
+                            selected_opponents[env_index] = next(
+                                index for index, opponent in enumerate(league_opponents)
+                                if opponent.name == opponent_name
+                            )
+                            learner_players[env_index] = learner_player
+                        else:
+                            selected_opponents[env_index] = _sample_league_index(
+                                flags,
+                                league_opponents,
+                                league_sampler,
+                                pfsp_sampler,
+                                league_outcomes,
+                                league_rng,
+                            )
+                            learner_players[env_index] = int(league_rng.integers(0, 2))
                 timings.time("step")
 
                 fill_buffers_inplace(buffers[index], dict(**env_output, **agent_output), t + 1)
@@ -689,6 +806,7 @@ def learn(
     total_games_played: int,
     learner_step: int = 0,
     baseline_only: bool = False,
+    behavior_kl_controller: Optional[BehaviorKLController] = None,
     model_update_reference: Optional[Mapping[str, torch.Tensor]] = None,
     verify_actor_sync: bool = False,
     lock=threading.Lock(),
@@ -731,6 +849,11 @@ def learn(
             combined_learner_entropy = torch.zeros_like(combined_behavior_action_log_probs)
             action_counts = torch.zeros_like(combined_behavior_action_log_probs)
             entropies = {}
+            normalized_entropies = {}
+            active_entity_counts = {}
+            combined_forward_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
+            combined_reverse_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
+            behavior_kl_counts = torch.zeros_like(combined_behavior_action_log_probs)
             for act_space in batch["actions"].keys():
                 actions = batch["actions"][act_space]
                 actions_taken_mask = batch["info"]["actions_taken"][act_space]
@@ -776,6 +899,22 @@ def learn(
                 entropies[act_space] = (
                     -(reduce(learner_policy_entropy, reduction="sum") / n_actions_taken).detach().cpu().item()
                 )
+                normalized_entropy_sum, active_count = masked_normalized_entropy(
+                    learner_policy_logits, any_actions_taken
+                )
+                normalized_entropies[act_space] = float(
+                    (normalized_entropy_sum / active_count.clamp_min(1)).detach().cpu().item()
+                )
+                active_entity_counts[act_space] = int(active_count.detach().cpu().item())
+                forward_kl, kl_counts = masked_policy_kl(
+                    learner_policy_logits, behavior_policy_logits, any_actions_taken, reverse=False
+                )
+                reverse_kl, _ = masked_policy_kl(
+                    learner_policy_logits, behavior_policy_logits, any_actions_taken, reverse=True
+                )
+                combined_forward_behavior_kl += forward_kl
+                combined_reverse_behavior_kl += reverse_kl
+                behavior_kl_counts += kl_counts
 
             discounts = (~batch["done"]).float() * flags.discounting
             discounts = discounts.unsqueeze(-1).expand_as(combined_behavior_action_log_probs)
@@ -836,13 +975,20 @@ def learn(
                 reduction=flags.reduction,
                 trajectory_weights=action_counts if trajectory_normalize else None,
             )
-            baseline_loss = compute_baseline_loss(
-                values,
-                td_lambda_returns.vs,
-                reduction=flags.reduction,
-                player_mask=learner_player_mask_batch,
-                trajectory_normalize=trajectory_normalize,
-            )
+            if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss":
+                baseline_loss = compute_categorical_baseline_loss(
+                    learner_outputs["baseline_logits"], td_lambda_returns.vs,
+                    reduction=flags.reduction, player_mask=learner_player_mask_batch,
+                    trajectory_normalize=trajectory_normalize,
+                    value_min=float(getattr(flags, "value_support_min", -2.0)),
+                    value_max=float(getattr(flags, "value_support_max", 2.0)),
+                    sigma_ratio=float(getattr(flags, "value_hl_gauss_sigma_ratio", 0.75)),
+                )
+            else:
+                baseline_loss = compute_baseline_loss(
+                    values, td_lambda_returns.vs, reduction=flags.reduction,
+                    player_mask=learner_player_mask_batch, trajectory_normalize=trajectory_normalize,
+                )
             teacher_kl_cost = teacher_kl_coefficient(flags, learner_step)
             reduced_teacher_kl = (
                 trajectory_weighted_mean(combined_teacher_kl_loss, action_counts)
@@ -866,6 +1012,24 @@ def learn(
                 else reduce(combined_learner_entropy, reduction=flags.reduction)
             )
             entropy_loss = flags.entropy_cost * reduced_entropy
+            reduced_reverse_behavior_kl = trajectory_weighted_mean(
+                combined_reverse_behavior_kl, behavior_kl_counts
+            )
+            reduced_forward_behavior_kl = trajectory_weighted_mean(
+                combined_forward_behavior_kl, behavior_kl_counts
+            )
+            behavior_kl_loss = torch.zeros_like(baseline_loss)
+            overall_normalized_entropy = (
+                sum(normalized_entropies[key] * active_entity_counts[key] for key in normalized_entropies)
+                / max(sum(active_entity_counts.values()), 1)
+            )
+            if behavior_kl_controller is not None:
+                behavior_kl_controller.observe(
+                    learner_step,
+                    float(reduced_reverse_behavior_kl.detach().cpu().item()),
+                    overall_normalized_entropy,
+                )
+                behavior_kl_loss = behavior_kl_controller.beta * reduced_reverse_behavior_kl
 
             rule_aux_loss = torch.zeros_like(baseline_loss)
             if getattr(flags, "rule_aux_enabled", False):
@@ -915,6 +1079,7 @@ def learn(
                     + teacher_kl_loss
                     + teacher_baseline_loss
                     + entropy_loss
+                    + behavior_kl_loss
                     + rule_aux_loss
                     + intent_aux_loss
                 )
@@ -969,11 +1134,39 @@ def learn(
                     "teacher_kl_loss": teacher_kl_loss.detach().item(),
                     "teacher_baseline_loss": teacher_baseline_loss.detach().item(),
                     "entropy_loss": entropy_loss.detach().item(),
+                    "behavior_kl_loss": behavior_kl_loss.detach().item(),
                     "rule_aux_loss": rule_aux_loss.detach().item(),
                     "intent_aux_loss": intent_aux_loss.detach().item(),
                     "total_loss": total_loss.detach().item(),
                 },
                 "Entropy": {"overall": sum(e for e in entropies.values() if not math.isnan(e)), **entropies},
+                "Normalized_Entropy": {"overall": overall_normalized_entropy, **normalized_entropies},
+                "Active_Entities": active_entity_counts,
+                "Behavior_Policy": {
+                    "forward_kl": float(reduced_forward_behavior_kl.detach().cpu().item()),
+                    "reverse_kl": float(reduced_reverse_behavior_kl.detach().cpu().item()),
+                    "beta": behavior_kl_controller.beta if behavior_kl_controller is not None else 0.0,
+                    "target": behavior_kl_controller.target if behavior_kl_controller is not None else None,
+                    "ema_kl": behavior_kl_controller.ema_kl if behavior_kl_controller is not None else None,
+                    "log_rho_mean": float(vtrace_returns.log_rhos.mean().detach().cpu().item()),
+                    "log_rho_p95": float(torch.quantile(vtrace_returns.log_rhos.detach().float(), 0.95).cpu().item()),
+                    "log_rho_max": float(vtrace_returns.log_rhos.max().detach().cpu().item()),
+                    "vtrace_rho_clipped_fraction": float((vtrace_returns.log_rhos > 0).float().mean().cpu().item()),
+                    "learner_version": int(learner_step),
+                    "actor_version_min": int(batch["policy_version"].min().cpu().item()),
+                    "actor_version_max": int(batch["policy_version"].max().cpu().item()),
+                    "buffer_lag_max": int(learner_step - batch["policy_version"].min().cpu().item()),
+                },
+                "Value": {
+                    "explained_variance": explained_variance(values, td_lambda_returns.vs),
+                    "target_std": float(td_lambda_returns.vs.detach().float().std(unbiased=False).cpu().item()),
+                    "bias": float((values.detach() - td_lambda_returns.vs.detach()).float().mean().cpu().item()),
+                    "support_outside_fraction": float(support_outside_fraction(
+                        td_lambda_returns.vs.detach(),
+                        float(getattr(flags, "value_support_min", -2.0)),
+                        float(getattr(flags, "value_support_max", 2.0)),
+                    ).cpu().item()) if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss" else 0.0,
+                },
                 "Teacher_KL_Divergence": {
                     "overall": sum(tkld for tkld in teacher_kl_losses.values() if not math.isnan(tkld)),
                     **teacher_kl_losses,
@@ -1004,16 +1197,31 @@ def learn(
             optimizer.zero_grad()
             if flags.use_mixed_precision:
                 grad_scaler.scale(total_loss).backward()
+                grad_scaler.unscale_(optimizer)
                 if flags.clip_grads is not None:
-                    grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
+                else:
+                    gradient_norm = torch.sqrt(sum(
+                        parameter.grad.detach().float().square().sum()
+                        for parameter in learner_model.parameters() if parameter.grad is not None
+                    ))
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
             else:
                 total_loss.backward()
                 if flags.clip_grads is not None:
-                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
+                else:
+                    gradient_norm = torch.sqrt(sum(
+                        parameter.grad.detach().float().square().sum()
+                        for parameter in learner_model.parameters() if parameter.grad is not None
+                    ))
                 optimizer.step()
+            stats["Gradient"] = {
+                "norm_before_clip": float(gradient_norm.detach().cpu().item()),
+                "clipped": float(gradient_norm.detach().cpu().item() > float(flags.clip_grads))
+                if flags.clip_grads is not None else 0.0,
+            }
             if lr_scheduler is not None:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=UserWarning)
@@ -1097,6 +1305,7 @@ def train(flags):
         else 0
     )
     reward_game_counter = mp.Value("q", restored_games)
+    actor_policy_version = mp.Value("q", 0)
 
     example_env = create_env(flags, torch.device("cpu"), teacher_flags=league_obs_flags)
     example_output = example_env.reset(force=True)
@@ -1153,6 +1362,7 @@ def train(flags):
                 snapshot_versions,
                 snapshot_lock,
                 reward_game_counter,
+                actor_policy_version,
                 buffers,
             ),
         )
@@ -1247,11 +1457,20 @@ def train(flags):
         else:
             logging.warning("Loading old checkpoint_state without 'total_games_played' saved. Starting at step 0.")
     training_start_step = step
+    actor_policy_version.value = step
+    behavior_kl_controller = BehaviorKLController.from_flags(
+        flags,
+        checkpoint_state.get("behavior_kl_controller")
+        if checkpoint_state is not None and not flags.weights_only else None,
+    )
     initial_learner_state = model_state_dict_cpu(learner_model)
     verify_model_updates = bool(getattr(flags, "verify_model_updates", True))
     learner_lock = threading.Lock()
     snapshot_last_step = int(checkpoint_state.get("learner_snapshot_last_step", step)) if checkpoint_state else step
     snapshot_next_slot = int(checkpoint_state.get("learner_snapshot_next_slot", 0)) if checkpoint_state else 0
+    max_support_outside_fraction = float(
+        checkpoint_state.get("max_support_outside_fraction", 0.0) if checkpoint_state else 0.0
+    )
 
     def maybe_update_learner_snapshot(current_step: int) -> None:
         nonlocal snapshot_last_step, snapshot_next_slot
@@ -1271,7 +1490,7 @@ def train(flags):
 
     def batch_and_learn(learner_idx, lock=threading.Lock()):
         """Thread target for the learning process."""
-        nonlocal step, total_games_played, stats
+        nonlocal step, total_games_played, stats, max_support_outside_fraction
         timings = prof.Timings()
         while step < training_stop_step:
             timings.reset()
@@ -1299,6 +1518,7 @@ def train(flags):
                     total_games_played=total_games_played,
                     learner_step=step,
                     baseline_only=step / (t * b) < flags.n_value_warmup_batches,
+                    behavior_kl_controller=behavior_kl_controller,
                     model_update_reference=(
                         initial_learner_state
                         if verify_model_updates and step == training_start_step
@@ -1308,7 +1528,12 @@ def train(flags):
                     lock=learner_lock,
                 )
                 with lock:
+                    max_support_outside_fraction = max(
+                        max_support_outside_fraction,
+                        float(stats.get("Value", {}).get("support_outside_fraction", 0.0)),
+                    )
                     step += t * b
+                    actor_policy_version.value = step
                     maybe_update_learner_snapshot(step)
                     if not flags.disable_wandb:
                         wandb.log(stats, step=step)
@@ -1361,12 +1586,36 @@ def train(flags):
                     "learner_snapshot_last_step": snapshot_last_step,
                     "learner_snapshot_next_slot": snapshot_next_slot,
                     "model_update_max_abs": model_update_max_abs,
+                    "max_support_outside_fraction": max_support_outside_fraction,
+                    "evaluation_eligible": max_support_outside_fraction <= 0.001,
+                    "behavior_kl_controller": (
+                        behavior_kl_controller.state_dict() if behavior_kl_controller is not None else None
+                    ),
+                    "value_head_metadata": {
+                        "type": getattr(flags, "value_critic", "scalar"),
+                        "num_bins": int(getattr(flags, "value_num_bins", 101)),
+                        "support": [
+                            float(getattr(flags, "value_support_min", -2.0)),
+                            float(getattr(flags, "value_support_max", 2.0)),
+                        ],
+                        "sigma_ratio": float(getattr(flags, "value_hl_gauss_sigma_ratio", 0.75)),
+                    },
                 },
                 checkpoint_path + ".pt",
             )
             atomic_torch_save(
                 {
                     "model_state_dict": learner_state,
+                    "max_support_outside_fraction": max_support_outside_fraction,
+                    "evaluation_eligible": max_support_outside_fraction <= 0.001,
+                    "value_head_metadata": {
+                        "type": getattr(flags, "value_critic", "scalar"),
+                        "num_bins": int(getattr(flags, "value_num_bins", 101)),
+                        "support": [
+                            float(getattr(flags, "value_support_min", -2.0)),
+                            float(getattr(flags, "value_support_max", 2.0)),
+                        ],
+                    },
                 },
                 checkpoint_path + "_weights.pt",
             )

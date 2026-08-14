@@ -19,6 +19,7 @@ from ..lux_gym.act_spaces import BaseActSpace, ACTION_MEANINGS
 from ..lux_gym.obs_spaces import BaseObsSpace
 from ..lux_gym.reward_spaces import GameResultReward
 from ..utility_constants import MAX_BOARD_SIZE
+from ..strategic_rl.curriculum import encode_action_dict
 
 # In case dir_path is removed in production environment
 try:
@@ -99,6 +100,8 @@ class LuxEnv(gym.Env):
         self.pos_to_unit_dict = dict()
         self.pos_to_city_tile_dict = dict()
         self.reset_count = 0
+        self.raw_action_history: List[Dict[str, list]] = []
+        self.episode_configuration: Dict[str, Any] = {}
 
         self._dimension_process = None
         self._q = None
@@ -143,6 +146,7 @@ class LuxEnv(gym.Env):
 
     def reset(self, observation_updates: Optional[List[str]] = None) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         self.game_state = Game()
+        self.raw_action_history = []
         self.reset_count = (self.reset_count + 1) % self.restart_subproc_after_n_resets
         # There seems to be a gradual memory leak somewhere, so we restart the dimension process every once in a while
         if self.reset_count == 0:
@@ -151,6 +155,7 @@ class LuxEnv(gym.Env):
             assert observation_updates is None, "Game is being run automatically"
             # 1.2: Initialize a blank state game if new episode is starting
             self.configuration["seed"] += 1
+            self.episode_configuration = copy.deepcopy(dict(self.configuration))
             initiate = {
                 "type": "start",
                 "agent_names": [],  # unsure if this is provided?
@@ -188,6 +193,7 @@ class LuxEnv(gym.Env):
 
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         if self.run_game_automatically:
+            self.raw_action_history.append(encode_action_dict(action))
             actions_processed, actions_taken = self.process_actions(action)
             self._step(actions_processed)
             self.info["actions_taken"] = actions_taken

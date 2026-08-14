@@ -212,6 +212,23 @@ class VecEnv(gym.Env):
         self.last_outs = self._run(lambda index: self.envs[index].step(actions[index]), list(range(len(self.envs))))
         return VecEnv._vectorize_env_outs(self.last_outs)
 
+    def capture_snapshots(self, indices: List[int], opponents: List[str]) -> list[dict]:
+        from ..strategic_rl.curriculum import capture_env_snapshot
+        return [
+            capture_env_snapshot(self.envs[index], opponent)
+            for index, opponent in zip(indices, opponents)
+        ]
+
+    def restore_snapshots(self, snapshots: Dict[int, dict]):
+        from ..strategic_rl.curriculum import restore_env_snapshot
+        restored = self._run(
+            lambda index: restore_env_snapshot(self.envs[index], snapshots[index]),
+            list(snapshots),
+        )
+        for index, output in zip(snapshots, restored):
+            self.last_outs[index] = output
+        return VecEnv._vectorize_env_outs(self.last_outs)
+
     def render(self, idx: int, mode: str = "human", **kwargs):
         # noinspection PyArgumentList
         return self.envs[idx].render(mode, **kwargs)
@@ -259,6 +276,12 @@ class PytorchEnv(gym.Wrapper):
         }
         return tuple([self._to_tensor(out) for out in super(PytorchEnv, self).step(action)])
 
+    def capture_snapshots(self, indices: List[int], opponents: List[str]) -> list[dict]:
+        return self.env.capture_snapshots(indices, opponents)
+
+    def restore_snapshots(self, snapshots: Dict[int, dict]):
+        return tuple(self._to_tensor(out) for out in self.env.restore_snapshots(snapshots))
+
     def _to_tensor(self, x: Union[Dict, np.ndarray]) -> Dict[str, Union[Dict, torch.Tensor]]:
         if isinstance(x, dict):
             return {key: self._to_tensor(val) for key, val in x.items()}
@@ -285,3 +308,9 @@ class DictEnv(gym.Wrapper):
 
     def step(self, action):
         return DictEnv._dict_env_out(super(DictEnv, self).step(action))
+
+    def capture_snapshots(self, indices: List[int], opponents: List[str]) -> list[dict]:
+        return self.env.capture_snapshots(indices, opponents)
+
+    def restore_snapshots(self, snapshots: Dict[int, dict]):
+        return DictEnv._dict_env_out(self.env.restore_snapshots(snapshots))

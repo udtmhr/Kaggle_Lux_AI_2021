@@ -1,0 +1,11 @@
+defaults:
+- survival_strategic_strength_v7_categorical_2gpu
+- _self_
+
+name: survival_strategic_strength_v8_curriculum_2gpu
+weights_only: true
+total_steps: 100000
+state_curriculum_enabled: true
+snapshot_start_probability: 0.30
+snapshot_pool_capacity: 2048
+snapshot_capture_interval: 16

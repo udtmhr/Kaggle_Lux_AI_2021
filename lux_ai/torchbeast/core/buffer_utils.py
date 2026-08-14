@@ -106,6 +106,7 @@ def create_buffers(
         done=dict(size=(t + 1, n), dtype=torch.bool),
         policy_logits={},
         baseline=dict(size=(t + 1, n, p), dtype=torch.float32),
+        policy_version=dict(size=(t + 1, n), dtype=torch.int64),
         actions={},
     )
     act_space = flags.act_space()

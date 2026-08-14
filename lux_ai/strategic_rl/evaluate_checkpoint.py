@@ -93,7 +93,7 @@ def _run_batched_matches(
         for start in range(0, len(pending), batch_games):
             records = evaluator.evaluate(candidate_state, pending[start : start + batch_games])
             for key, value in evaluator.last_profile.items():
-                if key.endswith("_seconds"):
+                if isinstance(value, (int, float)):
                     profile_totals[key] = profile_totals.get(key, 0.0) + float(value)
             for record in records:
                 record["backend"] = "internal_batched"
@@ -113,7 +113,18 @@ def _run_batched_matches(
         "forward_fraction": forward_seconds / max(elapsed, 1e-12),
         "device": str(resolved_device),
         "batch_games": batch_games,
+        "candidate_digest": getattr(evaluator, "candidate_digest", None),
+        "rng_scheme": getattr(evaluator, "rng_scheme", None),
     }
+    for key, changed in list(profile.items()):
+        if key.endswith(".changed"):
+            active_key = key[:-len(".changed")] + ".active"
+            profile[key[:-len(".changed")] + ".change_rate"] = changed / max(profile.get(active_key, 0.0), 1.0)
+        if key.endswith(".friendly_collision_candidates"):
+            active_key = key[:-len(".friendly_collision_candidates")] + ".actionable_units"
+            profile[key[:-len(".friendly_collision_candidates")] + ".friendly_collision_rate"] = (
+                changed / max(profile.get(active_key, 0.0), 1.0)
+            )
     (output_dir / "backend_profile.json").write_text(
         json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -162,6 +173,17 @@ def evaluate_checkpoint(
         raise ValueError(f"Unsupported map size: {map_sizes}")
     if backend not in {"auto", "official", "internal"}:
         raise ValueError(f"Unsupported evaluation backend: {backend}")
+    try:
+        checkpoint_metadata = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    except (EOFError, RuntimeError):
+        # Some tests and legacy bundles use an external/empty checkpoint stub.
+        checkpoint_metadata = {}
+    if checkpoint_metadata.get("evaluation_eligible") is False:
+        fraction = checkpoint_metadata.get("max_support_outside_fraction")
+        raise ValueError(
+            f"Categorical critic support gate failed ({fraction:.3%} outside support); "
+            "redesign support before evaluation"
+        )
     label = checkpoint_label(checkpoint)
     agent_dir = (
         Path(tempfile.gettempdir()) / f"lux_candidate_{label}" if agent_dir is None else agent_dir.expanduser().resolve()

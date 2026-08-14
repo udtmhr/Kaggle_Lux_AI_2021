@@ -10,6 +10,7 @@ from .in_blocks import DictInputLayer
 from ..lux.game_constants import GAME_CONSTANTS
 from ..lux_gym.act_spaces import MAX_OVERLAPPING_ACTIONS
 from ..lux_gym.reward_spaces import RewardSpec
+from ..strategic_rl.categorical_value import categorical_value
 
 
 class DictActor(nn.Module):
@@ -180,6 +181,35 @@ class BaselineLayer(nn.Module):
         return x * (self.reward_max - self.reward_min) + self.reward_min
 
 
+class CategoricalBaselineLayer(nn.Module):
+    def __init__(
+            self, in_channels: int, reward_space: RewardSpec, n_value_heads: int,
+            rescale_input: bool, num_bins: int, value_min: float, value_max: float):
+        super(CategoricalBaselineLayer, self).__init__()
+        if n_value_heads != 1:
+            raise ValueError("Categorical critic currently supports one value head")
+        self.rescale_input = rescale_input
+        self.num_bins = int(num_bins)
+        self.value_min = float(value_min)
+        self.value_max = float(value_max)
+        self.zero_sum = bool(reward_space.zero_sum)
+        self.linear = nn.Linear(in_channels, self.num_bins)
+
+    def forward(self, x: torch.Tensor, input_mask: torch.Tensor, value_head_idxs: Optional[torch.Tensor]):
+        if self.rescale_input:
+            x = torch.flatten(x, start_dim=-2, end_dim=-1).sum(dim=-1)
+            denominator = torch.flatten(input_mask, start_dim=-2, end_dim=-1).sum(dim=-1).clamp_min(1)
+            x = x / denominator
+        else:
+            x = torch.flatten(x, start_dim=-2, end_dim=-1).mean(dim=-1)
+        logits = self.linear(x).view(-1, 2, self.num_bins)
+        values = categorical_value(logits, self.value_min, self.value_max)
+        if self.zero_sum:
+            difference = 0.5 * (values[:, 0] - values[:, 1])
+            values = torch.stack((difference, -difference), dim=-1)
+        return values, logits
+
+
 class BasicActorCriticNetwork(nn.Module):
     def __init__(
             self,
@@ -192,6 +222,10 @@ class BasicActorCriticNetwork(nn.Module):
             n_value_heads: int = 1,
             rescale_value_input: bool = True,
             intent_classes: int = 0,
+            value_critic: str = "scalar",
+            value_num_bins: int = 101,
+            value_support_min: float = -2.0,
+            value_support_max: float = 2.0,
     ):
         super(BasicActorCriticNetwork, self).__init__()
         self.dict_input_layer = DictInputLayer()
@@ -231,12 +265,22 @@ class BasicActorCriticNetwork(nn.Module):
             n_channels=self.base_out_channels,
             activation=actor_critic_activation
         )
-        self.baseline = BaselineLayer(
-            in_channels=self.base_out_channels,
-            reward_space=reward_space,
-            n_value_heads=n_value_heads,
-            rescale_input=rescale_value_input
-        )
+        self.value_critic = value_critic
+        if value_critic == "categorical_hl_gauss":
+            self.baseline = CategoricalBaselineLayer(
+                in_channels=self.base_out_channels, reward_space=reward_space,
+                n_value_heads=n_value_heads, rescale_input=rescale_value_input,
+                num_bins=value_num_bins, value_min=value_support_min, value_max=value_support_max,
+            )
+        elif value_critic == "scalar":
+            self.baseline = BaselineLayer(
+                in_channels=self.base_out_channels,
+                reward_space=reward_space,
+                n_value_heads=n_value_heads,
+                rescale_input=rescale_value_input
+            )
+        else:
+            raise ValueError(f"Unknown value_critic: {value_critic}")
         self.intent_classes = int(intent_classes)
         self.intent_head = (
             nn.Conv2d(self.base_out_channels, self.intent_classes, kernel_size=1)
@@ -260,12 +304,18 @@ class BasicActorCriticNetwork(nn.Module):
             sample=sample,
             **actor_kwargs
         )
-        baseline = self.baseline(self.baseline_base(base_out), input_mask, subtask_embeddings)
+        baseline_output = self.baseline(self.baseline_base(base_out), input_mask, subtask_embeddings)
+        if self.value_critic == "categorical_hl_gauss":
+            baseline, baseline_logits = baseline_output
+        else:
+            baseline, baseline_logits = baseline_output, None
         output = dict(
             actions=actions,
             policy_logits=policy_logits,
             baseline=baseline
         )
+        if baseline_logits is not None:
+            output["baseline_logits"] = baseline_logits
         if self.intent_head is not None:
             batch_players, _, height, width = base_out.shape
             intent_logits = self.intent_head(base_out).view(

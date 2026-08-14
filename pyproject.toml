@@ -12,6 +12,7 @@ dependencies = [
     "kaggle-environments==1.12.0",
     "numpy==1.24.4",
     "omegaconf",
+    "pandas>=2.3.3",
     "psutil",
     "pyyaml",
     "scipy",

@@ -28,6 +28,9 @@ from lux_ai.strategic_rl.league import (
     rule_based_guidance,
 )
 from lux_ai.strategic_rl.models import SurvivalStrategicBackbone
+from lux_ai.strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
+from lux_ai.strategic_rl.categorical_value import categorical_value, hl_gauss_encode, support_outside_fraction
+from lux_ai.strategic_rl.curriculum import SnapshotPool, turn_band
 from lux_ai.strategic_rl.obs import night_turns_between
 from lux_ai.strategic_rl.prepare_data import _discover_replays
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
@@ -61,6 +64,61 @@ from lux_ai.torchbeast.monobeast import (
     trajectory_weighted_mean,
 )
 from lux_ai.utils import flags_to_namespace
+
+
+def test_behavior_policy_kl_is_finite_with_masked_actions():
+    behavior = torch.tensor([[[[[[[0.0, float("-inf"), 1.0]]]]]]])
+    learner = torch.tensor([[[[[[[0.5, float("-inf"), 0.0]]]]]]])
+    active = torch.ones(behavior.shape[:-1], dtype=torch.bool)
+    forward, counts = masked_policy_kl(learner, behavior, active, reverse=False)
+    reverse, _ = masked_policy_kl(learner, behavior, active, reverse=True)
+    entropy, entropy_count = masked_normalized_entropy(learner, active)
+    assert torch.isfinite(forward).all() and torch.isfinite(reverse).all()
+    assert counts.item() == entropy_count.item() == 1
+    assert 0 <= (entropy / entropy_count).item() <= 1
+    learner.requires_grad_(True)
+    backward_kl, _ = masked_policy_kl(learner, behavior, active, reverse=True)
+    backward_kl.sum().backward()
+    assert torch.isfinite(learner.grad).all()
+
+
+def test_behavior_kl_controller_calibration_bounds_abort_and_resume():
+    controller = BehaviorKLController(auto_steps=2)
+    controller.observe(0, 0.001, 0.8)
+    controller.observe(2, 0.2, 0.8)
+    assert controller.target == pytest.approx(0.05)
+    assert 1e-4 <= controller.beta <= 1.0
+    restored = BehaviorKLController()
+    restored.load_state_dict(controller.state_dict())
+    assert restored.state_dict() == controller.state_dict()
+    restored.ema_kl = 1.0
+    with pytest.raises(RuntimeError, match="Behavior KL abort"):
+        for _ in range(5):
+            restored.observe(3, 1.0, 0.8)
+
+
+def test_hl_gauss_encode_decode_zero_sum_and_support_detection():
+    targets = torch.tensor([-2.0, -0.5, 0.0, 1.25, 2.0])
+    labels = hl_gauss_encode(targets)
+    assert torch.allclose(labels.sum(dim=-1), torch.ones_like(targets), atol=1e-6)
+    decoded = categorical_value(labels.clamp_min(1e-12).log())
+    assert torch.allclose(decoded, targets, atol=0.08)
+    assert support_outside_fraction(torch.tensor([-2.1, 0.0, 2.1]), -2.0, 2.0).item() == pytest.approx(2 / 3)
+
+
+def test_snapshot_pool_strata_ratio_and_td_error_priority():
+    pool = SnapshotPool(capacity=20, td_error_ema_decay=0.0)
+    low_id = pool.add({"turn": 20, "map_size": 12, "opponent": "a"}, priority=1.0)
+    high_id = pool.add({"turn": 30, "map_size": 12, "opponent": "a"}, priority=1.0)
+    pool.update_priority(high_id, 100.0)
+    rng = np.random.default_rng(7)
+    samples = [pool.sample(rng, prioritized_probability=1.0).snapshot_id for _ in range(200)]
+    assert samples.count(high_id) > 180
+    assert turn_band(0) == 0 and turn_band(359) == 4
+    rng = np.random.default_rng(9)
+    snapshot_starts = sum(pool.choose_episode_start(rng, 0.3) is not None for _ in range(5000))
+    assert snapshot_starts / 5000 == pytest.approx(0.3, abs=0.03)
+    assert low_id != high_id
 
 
 def test_night_turn_count_boundaries():
@@ -726,6 +784,62 @@ def test_intent_head_can_be_enabled_or_disabled():
         disabled_flags = _cpu_strength_flags(False)
         disabled = create_model(disabled_flags, torch.device("cpu"))
         assert "intent_logits" not in disabled(model_input, sample=False)
+    finally:
+        env.close()
+
+
+def test_categorical_critic_forward_is_zero_sum_and_keeps_policy_schema():
+    flags = _cpu_strength_flags(False)
+    flags.value_critic = "categorical_hl_gauss"
+    flags.value_num_bins = 101
+    flags.value_support_min = -2.0
+    flags.value_support_max = 2.0
+    env = create_env(flags, torch.device("cpu"))
+    try:
+        model_input = env.reset(force=True)
+        output = create_model(flags, torch.device("cpu"))(model_input, sample=False)
+        assert output["baseline_logits"].shape == (1, 2, 101)
+        assert torch.allclose(output["baseline"].sum(dim=-1), torch.zeros(1), atol=1e-6)
+        assert output["policy_logits"].keys() == model_input["info"]["available_actions_mask"].keys()
+    finally:
+        env.close()
+
+
+def test_engine_snapshot_replay_round_trip_transition_matches():
+    flags = _cpu_strength_flags(False)
+    env = create_env(flags, torch.device("cpu"))
+    try:
+        output = env.reset(force=True)
+        actions = {
+            entity: torch.zeros((*mask.shape[:-1], 4), dtype=torch.long)
+            for entity, mask in output["info"]["available_actions_mask"].items()
+        }
+        env.step(actions)
+        snapshot = env.capture_snapshots([0], ["test"])[0]
+        env.step(actions)
+
+        def signature():
+            game = env.unwrapped[0].game_state
+            roads = tuple(
+                round(float(cell.road), 6) for row in game.map.map for cell in row
+            )
+            players = tuple(
+                (
+                    player.research_points,
+                    tuple(sorted((unit.id, unit.pos.x, unit.pos.y, unit.cooldown, unit.cargo.wood,
+                                  unit.cargo.coal, unit.cargo.uranium) for unit in player.units)),
+                    tuple(sorted((city.cityid, city.fuel, city.light_upkeep,
+                                  tuple(sorted((tile.pos.x, tile.pos.y, tile.cooldown) for tile in city.citytiles)))
+                                 for city in player.cities.values())),
+                )
+                for player in game.players
+            )
+            return game.turn, roads, players
+
+        expected = signature()
+        env.restore_snapshots({0: snapshot})
+        env.step(actions)
+        assert signature() == expected
     finally:
         env.close()
 

@@ -24,6 +24,7 @@ from lux_ai.strategic_rl.train_es import (
     OfficialMatchEvaluator,
     _candidate_results,
     _save_es_state,
+    friendly_collision_candidates,
     load_deployment_action_config,
     load_es_config,
     paired_schedule,
@@ -248,6 +249,9 @@ def test_deployment_collision_resolver_prevents_friendly_duplicate_destination()
     )
     assert rankings["worker"][0, 0, 0, 0, 0].item() == east
     assert rankings["worker"][0, 0, 2, 0, 0].item() == no_op
+    raw_rankings = {entity: entity_logits[0].argsort(dim=-1, descending=True) for entity, entity_logits in logits.items()}
+    candidates, active = friendly_collision_candidates(game_state, 0, raw_rankings)
+    assert (candidates, active) == (1, 2)
 
 
 def test_deployment_settings_follow_each_agent_bundle():

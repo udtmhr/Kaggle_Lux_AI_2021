@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -22,7 +23,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from ..lux_gym import create_env
-from ..lux_gym.act_spaces import MAX_OVERLAPPING_ACTIONS
+from ..lux_gym.act_spaces import ACTION_MEANINGS, MAX_OVERLAPPING_ACTIONS
 from ..lux_gym.reward_spaces import GameResultReward
 from ..nns import create_model
 from ..nns.models import DictActor
@@ -49,6 +50,55 @@ from .tta import rot180_ensemble_outputs
 SCHEMA_VERSION = 1
 _ENV_CREATION_LOCK = Lock()
 _MODEL_CREATION_LOCK = Lock()
+INTERNAL_RNG_SCHEME = "lux-internal-v2:seed-map-orientation"
+
+
+def policy_state_digest(state: Mapping[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state):
+        tensor = state[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def internal_match_rng_id(spec: MatchSpec) -> str:
+    payload = f"{INTERNAL_RNG_SCHEME}:{spec.seed}:{spec.map_size}:{spec.candidate_player}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def friendly_collision_candidates(game_state, player: int, rankings: Mapping[str, torch.Tensor]) -> tuple[int, int]:
+    """Count raw top-ranked unit destinations that conflict off friendly cities."""
+    city_positions = {
+        city_tile.pos.astuple()
+        for city in game_state.players[player].cities.values()
+        for city_tile in city.citytiles
+    }
+    destinations = set()
+    stack_indices = defaultdict(int)
+    candidates = 0
+    active = 0
+    for unit in game_state.players[player].units:
+        if not unit.can_act():
+            continue
+        entity = "worker" if unit.is_worker() else "cart"
+        position = unit.pos.astuple()
+        stack_key = entity, position
+        plane = stack_indices[stack_key]
+        stack_indices[stack_key] += 1
+        if plane >= rankings[entity].shape[0]:
+            continue
+        action = int(rankings[entity][plane, player, unit.pos.x, unit.pos.y, 0].item())
+        meaning = ACTION_MEANINGS[entity][action]
+        destination = position
+        if meaning.startswith("MOVE_"):
+            destination = unit.pos.translate(meaning.split("_")[1], 1).astuple()
+        active += 1
+        if destination in destinations and destination not in city_positions:
+            candidates += 1
+        destinations.add(destination)
+    return candidates, active
 
 
 @dataclass(frozen=True)
@@ -415,6 +465,8 @@ class InternalMatchEvaluator:
         evaluation_started = time.monotonic()
         self.last_profile = defaultdict(float)
         records = []
+        self.candidate_digest = policy_state_digest(candidate_state)
+        self.rng_scheme = INTERNAL_RNG_SCHEME
         grouped = defaultdict(list)
         for spec in schedule:
             grouped[spec.opponent].append(spec)
@@ -507,6 +559,12 @@ class InternalMatchEvaluator:
                     )
                     for player, policy_output, action_config in players:
                         if action_config.use_collision_detection:
+                            unresolved = _ranked_actions(policy_output)
+                            collision_candidates, collision_active = friendly_collision_candidates(
+                                env.unwrapped[index].game_state,
+                                player,
+                                {entity: actions[index] for entity, actions in unresolved.items()},
+                            )
                             resolved = resolve_collision_rankings(
                                 env.unwrapped[index].game_state,
                                 player,
@@ -521,6 +579,24 @@ class InternalMatchEvaluator:
                             rankings = {
                                 entity: actions.unsqueeze(1) for entity, actions in resolved.items()
                             }
+                            for entity in ("worker", "cart"):
+                                raw_top = unresolved[entity][index, :, player, ..., 0]
+                                resolved_top = rankings[entity][0, :, player, ..., 0].to(raw_top.device)
+                                active = output["info"]["available_actions_mask"][entity][
+                                    index, :, player
+                                ].any(dim=-1)
+                                active_count = int(active.sum().item())
+                                changed_count = int(((raw_top != resolved_top) & active).sum().item())
+                                turn = int(env.unwrapped[index].game_state.turn)
+                                turn_band = min(turn // 80, 4)
+                                prefix = f"resolver.map_{spec.map_size}.turn_band_{turn_band}.{entity}"
+                                self.last_profile[f"{prefix}.active"] += active_count
+                                self.last_profile[f"{prefix}.changed"] += changed_count
+                            collision_prefix = f"resolver.map_{spec.map_size}.turn_band_{turn_band}"
+                            self.last_profile[f"{collision_prefix}.friendly_collision_candidates"] += (
+                                collision_candidates
+                            )
+                            self.last_profile[f"{collision_prefix}.actionable_units"] += collision_active
                         else:
                             rankings = {
                                 entity: actions[index : index + 1]
@@ -553,6 +629,9 @@ class InternalMatchEvaluator:
                             "map_size": spec.map_size,
                             "candidate_player": spec.candidate_player,
                             "winner": winner,
+                            "candidate_digest": self.candidate_digest,
+                            "rng_scheme": self.rng_scheme,
+                            "rng_id": internal_match_rng_id(spec),
                             **tracker.summary(),
                         }
                     )

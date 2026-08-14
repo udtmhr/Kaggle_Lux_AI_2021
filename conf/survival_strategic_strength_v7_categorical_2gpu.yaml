@@ -1,0 +1,13 @@
+defaults:
+- survival_strategic_strength_v6_behavior_kl_2gpu
+- _self_
+
+name: survival_strategic_strength_v7_categorical_2gpu
+weights_only: true
+total_steps: 100000
+n_value_warmup_batches: 2000
+value_critic: categorical_hl_gauss
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75

@@ -166,5 +166,9 @@ def _create_model(
         n_value_heads=1,
         rescale_value_input=flags.rescale_value_input,
         intent_classes=(4 if getattr(flags, "intent_aux_enabled", False) else 0),
+        value_critic=getattr(flags, "value_critic", "scalar"),
+        value_num_bins=int(getattr(flags, "value_num_bins", 101)),
+        value_support_min=float(getattr(flags, "value_support_min", -2.0)),
+        value_support_max=float(getattr(flags, "value_support_max", 2.0)),
     )
     return model.to(device=device)
