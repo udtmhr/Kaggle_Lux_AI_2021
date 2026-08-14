@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from lux_ai.strategic_rl.evaluate import summarize
 from lux_ai.strategic_rl.train_ab import (
     final_promotion_decision,
     map_score_rate,
     paired_score_difference_lcb,
+    run_ab,
     select_winning_arm,
     stage_gate_decision,
 )
@@ -115,3 +118,72 @@ def test_final_promotion_requires_all_absolute_and_nonregression_gates():
     )
     assert failed["passed"] is False
     assert len(failed["reasons"]) == 6
+
+
+def test_run_ab_reuses_validated_gate_baseline(monkeypatch, tmp_path: Path):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    initial_checkpoint = inputs / "initial_weights.pt"
+    initial_config = inputs / "initial.yaml"
+    base_checkpoint = inputs / "base_weights.pt"
+    base_config = inputs / "base.yaml"
+    teacher = inputs / "teacher.py"
+    for path in (initial_checkpoint, initial_config, base_checkpoint, base_config, teacher):
+        path.touch()
+
+    reused = tmp_path / "reused"
+    reused.mkdir()
+    records = [
+        {
+            "backend": "internal_batched",
+            "opponent": "first_place",
+            "seed": 2021,
+            "map_size": 32,
+            "candidate_player": player,
+            "winner": player,
+            "candidate_city_survival": 0.75,
+            "candidate_final_city_tiles": 1,
+            "candidate_final_units": 1,
+        }
+        for player in (0, 1)
+    ]
+    (reused / "games.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    (reused / "report.json").write_text(json.dumps(summarize(records, bootstrap_samples=10)), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.train_ab._evaluate",
+        lambda *args, **kwargs: pytest.fail("validated baseline should be reused"),
+    )
+    monkeypatch.setattr(
+        "lux_ai.strategic_rl.train_ab._train_and_evaluate_stage",
+        lambda **kwargs: {"decision": {"passed": False, "reasons": ["test stop"]}},
+    )
+    args = SimpleNamespace(
+        initial_checkpoint=initial_checkpoint,
+        initial_config=initial_config,
+        base_checkpoint=base_checkpoint,
+        base_config=base_config,
+        teacher_opponent=teacher,
+        run_root=tmp_path / "run",
+        reuse_baseline_evaluation=reused,
+        pilot_steps=25_000,
+        extension_steps=(50_000, 100_000),
+        map_sizes=(32,),
+        gate_seed_start=2021,
+        gate_seeds=1,
+        final_seed_start=12021,
+        final_seeds=1,
+        teacher_name="first_place",
+        eval_backend="internal",
+        bootstrap_samples=10,
+        arm_a_config_name="arm_a",
+        arm_b_config_name="arm_b",
+    )
+    result = run_ab(args)
+
+    assert result["status"] == "stopped_no_pilot_passed"
+    assert result["gate_baseline_evaluation"] == {
+        "reused": True,
+        "source": str(reused.resolve()),
+        "backend": "internal",
+    }

@@ -14,6 +14,7 @@ from .prepare_eval_agent import prepare_eval_agent
 from .train_eval import (
     checkpoint_model_max_abs_diff,
     full_checkpoint,
+    load_reused_baseline_evaluation,
     run_training_segment,
     write_progress,
 )
@@ -292,6 +293,18 @@ def run_ab(args: argparse.Namespace) -> dict:
     if args.final_seed_start < args.gate_seed_start + args.gate_seeds:
         raise ValueError("final seeds must not overlap the gate seeds")
 
+    reused_baseline = None
+    if args.reuse_baseline_evaluation is not None:
+        reused_baseline = load_reused_baseline_evaluation(
+            args.reuse_baseline_evaluation,
+            opponent_name=args.teacher_name,
+            seed_start=args.gate_seed_start,
+            seeds=args.gate_seeds,
+            map_sizes=tuple(args.map_sizes),
+            eval_backend=args.eval_backend,
+            bootstrap_samples=args.bootstrap_samples,
+        )
+
     run_root.mkdir(parents=True, exist_ok=False)
     progress_path = run_root / "ab_progress.json"
     progress = {
@@ -303,22 +316,33 @@ def run_ab(args: argparse.Namespace) -> dict:
     }
     write_progress(progress_path, progress)
 
-    baseline_result = _evaluate(
-        initial_checkpoint,
-        teacher_opponent,
-        run_root / "gate_initial_vs_teacher",
-        config=initial_config,
-        opponent_name=args.teacher_name,
-        seed_start=args.gate_seed_start,
-        seeds=args.gate_seeds,
-        args=args,
-        backend=args.eval_backend,
-    )
-    gate_backend = baseline_result["backend"]["selected"]
+    if reused_baseline is None:
+        baseline_result = _evaluate(
+            initial_checkpoint,
+            teacher_opponent,
+            run_root / "gate_initial_vs_teacher",
+            config=initial_config,
+            opponent_name=args.teacher_name,
+            seed_start=args.gate_seed_start,
+            seeds=args.gate_seeds,
+            args=args,
+            backend=args.eval_backend,
+        )
+        gate_backend = baseline_result["backend"]["selected"]
+        baseline_source = str(run_root / "gate_initial_vs_teacher")
+    else:
+        baseline_result = reused_baseline
+        gate_backend = reused_baseline["backend"]
+        baseline_source = reused_baseline["source"]
     baseline_map32_score = map_score_rate(Path(baseline_result["games"]), 32)
     progress["gate_baseline"] = baseline_result["summary"]
     progress["gate_backend"] = gate_backend
     progress["gate_baseline_map32_score"] = baseline_map32_score
+    progress["gate_baseline_evaluation"] = {
+        "reused": reused_baseline is not None,
+        "source": baseline_source,
+        "backend": gate_backend,
+    }
     progress["status"] = "training_pilots"
     write_progress(progress_path, progress)
 
@@ -479,6 +503,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--base-config", type=Path)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-baseline-evaluation",
+        type=Path,
+        help=(
+            "Reuse an initial-vs-teacher evaluation after validating games.jsonl/report.json, "
+            "opponent, gate seeds, map sizes, orientations, and backend."
+        ),
+    )
     parser.add_argument("--arm-a-config-name", default="survival_strategic_strength_v5_lr5e7_kl001_2gpu")
     parser.add_argument("--arm-b-config-name", default="survival_strategic_strength_v5_lr5e7_kl002_2gpu")
     parser.add_argument("--pilot-steps", type=int, default=25_000)
