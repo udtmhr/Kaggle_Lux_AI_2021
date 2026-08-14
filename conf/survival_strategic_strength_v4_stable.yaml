@@ -10,6 +10,10 @@ weights_only: true
 total_steps: 300000
 stop_after_step: null
 
+# Abort before evaluation if an optimizer step, learner-to-actor sync, or saved
+# checkpoint fails to change and preserve the policy tensors.
+verify_model_updates: true
+
 # The previous 100k -> 1M continuation drifted away from the teacher while its
 # learning rate was still close to 1e-5.  Use a smaller fresh-optimizer stage.
 optimizer_kwargs:

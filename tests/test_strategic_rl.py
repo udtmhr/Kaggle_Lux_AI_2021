@@ -37,6 +37,7 @@ from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
 from lux_ai.strategic_rl.train_eval import (
+    checkpoint_model_max_abs_diff,
     full_checkpoint,
     load_reused_baseline_evaluation,
     promotion_decision,
@@ -54,6 +55,9 @@ from lux_ai.torchbeast.monobeast import (
     compute_baseline_loss,
     compute_teacher_kl_loss,
     configure_trainable_parameters,
+    model_state_dict_cpu,
+    state_dict_max_abs_diff,
+    sync_actor_model,
     trajectory_weighted_mean,
 )
 from lux_ai.utils import flags_to_namespace
@@ -602,6 +606,18 @@ def test_quality_gate_and_full_checkpoint_selection(tmp_path: Path):
     assert full_checkpoint(tmp_path) == tmp_path / "200.pt"
 
 
+def test_checkpoint_model_difference_detects_identical_and_updated_policy(tmp_path: Path):
+    base = tmp_path / "base.pt"
+    identical = tmp_path / "identical.pt"
+    updated = tmp_path / "updated.pt"
+    torch.save({"model_state_dict": {"weight": torch.tensor([1.0, 2.0])}}, base)
+    torch.save({"model_state_dict": {"weight": torch.tensor([1.0, 2.0])}}, identical)
+    torch.save({"model_state_dict": {"weight": torch.tensor([1.0, 2.25])}}, updated)
+
+    assert checkpoint_model_max_abs_diff(base, identical) == 0.0
+    assert checkpoint_model_max_abs_diff(base, updated) == 0.25
+
+
 def test_training_segment_uses_hydra_append_for_resume_paths(monkeypatch, tmp_path: Path):
     captured = {}
 
@@ -732,6 +748,26 @@ def test_intent_head_only_requires_enabled_head():
     model = create_model(flags, torch.device("cpu"))
     with pytest.raises(ValueError, match="intent_aux_enabled=true"):
         configure_trainable_parameters(model, intent_head_only=True)
+
+
+def test_model_state_validation_detects_update_and_syncs_actor():
+    actor = torch.nn.Linear(3, 2)
+    learner = torch.nn.Linear(3, 2)
+    initial = model_state_dict_cpu(actor)
+    with torch.no_grad():
+        learner.weight.fill_(0.5)
+        learner.bias.fill_(-0.25)
+
+    assert state_dict_max_abs_diff(model_state_dict_cpu(learner), initial) > 0.0
+
+    sync_actor_model(actor, learner, verify=True)
+
+    assert state_dict_max_abs_diff(model_state_dict_cpu(actor), model_state_dict_cpu(learner)) == 0.0
+
+
+def test_model_state_validation_rejects_incompatible_states():
+    with pytest.raises(RuntimeError, match="Incompatible model states"):
+        state_dict_max_abs_diff({"weight": torch.ones(1)}, {"bias": torch.ones(1)})
 
 
 def test_rule_guidance_emits_masked_intent_targets():

@@ -234,6 +234,54 @@ def configure_trainable_parameters(model: nn.Module, intent_head_only: bool) -> 
     return trainable_parameters, trainable_names
 
 
+def model_state_dict_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Return an owned CPU snapshot suitable for validation and checkpointing."""
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def state_dict_max_abs_diff(left: Mapping[str, torch.Tensor], right: Mapping[str, torch.Tensor]) -> float:
+    """Return the largest absolute tensor difference, rejecting incompatible states."""
+    if left.keys() != right.keys():
+        missing = sorted(set(right) - set(left))
+        unexpected = sorted(set(left) - set(right))
+        raise RuntimeError(f"Incompatible model states: missing={missing}, unexpected={unexpected}")
+    max_abs_diff = 0.0
+    for name, left_tensor in left.items():
+        right_tensor = right[name]
+        if left_tensor.shape != right_tensor.shape or left_tensor.dtype != right_tensor.dtype:
+            raise RuntimeError(
+                f"Incompatible tensor {name}: {left_tensor.shape}/{left_tensor.dtype} != "
+                f"{right_tensor.shape}/{right_tensor.dtype}"
+            )
+        if torch.is_floating_point(left_tensor) or torch.is_complex(left_tensor):
+            difference = (left_tensor.detach().cpu() - right_tensor.detach().cpu()).abs()
+            if difference.numel():
+                max_abs_diff = max(max_abs_diff, float(difference.max().item()))
+        elif not torch.equal(left_tensor.detach().cpu(), right_tensor.detach().cpu()):
+            return float("inf")
+    return max_abs_diff
+
+
+def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: bool = False) -> None:
+    """Synchronize the rollout model and optionally verify every saved tensor."""
+    actor_model.load_state_dict(learner_model.state_dict())
+    actor_cuda_devices = {
+        tensor.device
+        for tensor in actor_model.state_dict().values()
+        if tensor.device.type == "cuda"
+    }
+    for device in actor_cuda_devices:
+        torch.cuda.synchronize(device)
+    if verify:
+        difference = state_dict_max_abs_diff(
+            model_state_dict_cpu(actor_model),
+            model_state_dict_cpu(learner_model),
+        )
+        if difference != 0.0:
+            raise RuntimeError(f"Learner-to-actor model synchronization failed: max_abs_diff={difference}")
+        logging.info("Verified learner-to-actor model synchronization: max_abs_diff=0")
+
+
 @torch.inference_mode()
 def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_output: Dict) -> Dict:
     mixed_precision = getattr(flags, "actor_mixed_precision", flags.use_mixed_precision)
@@ -635,6 +683,8 @@ def learn(
     total_games_played: int,
     learner_step: int = 0,
     baseline_only: bool = False,
+    model_update_reference: Optional[Mapping[str, torch.Tensor]] = None,
+    verify_actor_sync: bool = False,
     lock=threading.Lock(),
 ) -> Tuple[Dict, int]:
     """Performs a learning (optimization) step."""
@@ -963,8 +1013,18 @@ def learn(
                     warnings.filterwarnings("ignore", category=UserWarning)
                     lr_scheduler.step()
 
+            if model_update_reference is not None:
+                model_update_max_abs = state_dict_max_abs_diff(
+                    model_state_dict_cpu(learner_model), model_update_reference
+                )
+                if model_update_max_abs == 0.0:
+                    raise RuntimeError(
+                        "Optimizer step did not change the learner model; refusing to continue a no-op run"
+                    )
+                stats["Misc"]["model_update_max_abs"] = model_update_max_abs
+
         # noinspection PyTypeChecker
-        actor_model.load_state_dict(learner_model.state_dict())
+        sync_actor_model(actor_model, learner_model, verify=verify_actor_sync)
         return stats, total_games_played
 
 
@@ -1180,6 +1240,10 @@ def train(flags):
         # Backwards compatibility
         else:
             logging.warning("Loading old checkpoint_state without 'total_games_played' saved. Starting at step 0.")
+    training_start_step = step
+    initial_learner_state = model_state_dict_cpu(learner_model)
+    verify_model_updates = bool(getattr(flags, "verify_model_updates", True))
+    learner_lock = threading.Lock()
     snapshot_last_step = int(checkpoint_state.get("learner_snapshot_last_step", step)) if checkpoint_state else step
     snapshot_next_slot = int(checkpoint_state.get("learner_snapshot_next_slot", 0)) if checkpoint_state else 0
 
@@ -1191,8 +1255,9 @@ def train(flags):
         if current_step - snapshot_last_step < interval:
             return
         slot = snapshot_slots[snapshot_next_slot % len(snapshot_slots)]
-        with snapshot_lock:
-            atomic_torch_save({"model_state_dict": actor_model.state_dict()}, snapshot_paths[slot])
+        with learner_lock, snapshot_lock:
+            sync_actor_model(actor_model, learner_model, verify=verify_model_updates)
+            atomic_torch_save({"model_state_dict": model_state_dict_cpu(learner_model)}, snapshot_paths[slot])
             snapshot_versions[slot] += 1
         snapshot_next_slot = (snapshot_next_slot + 1) % len(snapshot_slots)
         snapshot_last_step = current_step
@@ -1228,6 +1293,13 @@ def train(flags):
                     total_games_played=total_games_played,
                     learner_step=step,
                     baseline_only=step / (t * b) < flags.n_value_warmup_batches,
+                    model_update_reference=(
+                        initial_learner_state
+                        if verify_model_updates and step == training_start_step
+                        else None
+                    ),
+                    verify_actor_sync=verify_model_updates and step == training_start_step,
+                    lock=learner_lock,
                 )
                 with lock:
                     step += t * b
@@ -1249,39 +1321,49 @@ def train(flags):
 
     def checkpoint(checkpoint_path: Union[str, Path]):
         logging.info(f"Saving checkpoint to {checkpoint_path}")
-        atomic_torch_save(
-            {
-                "model_state_dict": actor_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "step": step,
-                "total_games_played": total_games_played,
-                "reward_games_completed": reward_game_counter.value,
-                "trainable_parameter_names": trainable_parameter_names,
-                "league_outcomes": {
-                    opponent.name: {
-                        "wins": float(league_outcomes[0][index]),
-                        "games": int(league_outcomes[1][index]),
-                    }
-                    for index, opponent in enumerate(league_opponents)
+        with learner_lock:
+            sync_actor_model(actor_model, learner_model, verify=verify_model_updates)
+            learner_state = model_state_dict_cpu(learner_model)
+            model_update_max_abs = state_dict_max_abs_diff(learner_state, initial_learner_state)
+            if verify_model_updates and step > training_start_step and model_update_max_abs == 0.0:
+                raise RuntimeError(
+                    "Training steps advanced but the learner model is unchanged; refusing to save a no-op checkpoint"
+                )
+            logging.info("Checkpoint learner delta from run start: max_abs_diff=%.9g", model_update_max_abs)
+            atomic_torch_save(
+                {
+                    "model_state_dict": learner_state,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "step": step,
+                    "total_games_played": total_games_played,
+                    "reward_games_completed": reward_game_counter.value,
+                    "trainable_parameter_names": trainable_parameter_names,
+                    "league_outcomes": {
+                        opponent.name: {
+                            "wins": float(league_outcomes[0][index]),
+                            "games": int(league_outcomes[1][index]),
+                        }
+                        for index, opponent in enumerate(league_opponents)
+                    },
+                    "learner_snapshot_state_dicts": {
+                        str(slot): torch.load(
+                            snapshot_paths[slot], map_location=torch.device("cpu"), weights_only=False
+                        )["model_state_dict"]
+                        for slot in snapshot_slots
+                    },
+                    "learner_snapshot_last_step": snapshot_last_step,
+                    "learner_snapshot_next_slot": snapshot_next_slot,
+                    "model_update_max_abs": model_update_max_abs,
                 },
-                "learner_snapshot_state_dicts": {
-                    str(slot): torch.load(
-                        snapshot_paths[slot], map_location=torch.device("cpu"), weights_only=False
-                    )["model_state_dict"]
-                    for slot in snapshot_slots
+                checkpoint_path + ".pt",
+            )
+            atomic_torch_save(
+                {
+                    "model_state_dict": learner_state,
                 },
-                "learner_snapshot_last_step": snapshot_last_step,
-                "learner_snapshot_next_slot": snapshot_next_slot,
-            },
-            checkpoint_path + ".pt",
-        )
-        atomic_torch_save(
-            {
-                "model_state_dict": actor_model.state_dict(),
-            },
-            checkpoint_path + "_weights.pt",
-        )
+                checkpoint_path + "_weights.pt",
+            )
 
     timer = timeit.default_timer
     try:

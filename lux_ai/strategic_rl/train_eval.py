@@ -60,6 +60,26 @@ def full_checkpoint(run_dir: Path) -> Path:
     return max(checkpoints)[1]
 
 
+def checkpoint_model_max_abs_diff(left_path: Path, right_path: Path) -> float:
+    """Compare the policy tensors stored in two checkpoints."""
+    left = torch.load(left_path, map_location="cpu", weights_only=False)["model_state_dict"]
+    right = torch.load(right_path, map_location="cpu", weights_only=False)["model_state_dict"]
+    if left.keys() != right.keys():
+        raise ValueError("Cannot compare checkpoints with different model-state keys")
+    maximum = 0.0
+    for name, left_tensor in left.items():
+        right_tensor = right[name]
+        if left_tensor.shape != right_tensor.shape or left_tensor.dtype != right_tensor.dtype:
+            raise ValueError(f"Cannot compare incompatible checkpoint tensor: {name}")
+        if torch.is_floating_point(left_tensor) or torch.is_complex(left_tensor):
+            difference = (left_tensor - right_tensor).abs()
+            if difference.numel():
+                maximum = max(maximum, float(difference.max().item()))
+        elif not torch.equal(left_tensor, right_tensor):
+            return float("inf")
+    return maximum
+
+
 def write_progress(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -247,6 +267,22 @@ def run_train_eval(args: argparse.Namespace) -> dict:
             python=args.python,
         )
         checkpoint = full_checkpoint(stage_dir)
+        model_update_max_abs = checkpoint_model_max_abs_diff(load_checkpoint, checkpoint)
+        if model_update_max_abs == 0.0:
+            progress["milestones"].append(
+                {
+                    "target_step": target,
+                    "checkpoint": str(checkpoint),
+                    "model_update_max_abs": model_update_max_abs,
+                    "decision": {
+                        "passed": False,
+                        "reasons": ["checkpoint policy is identical to the segment input"],
+                    },
+                }
+            )
+            progress["status"] = "stopped_by_model_integrity_gate"
+            write_progress(progress_path, progress)
+            return progress
         evaluation = evaluate_checkpoint(
             checkpoint,
             args.opponent,
@@ -276,6 +312,7 @@ def run_train_eval(args: argparse.Namespace) -> dict:
             {
                 "target_step": target,
                 "checkpoint": str(checkpoint),
+                "model_update_max_abs": model_update_max_abs,
                 "evaluation": evaluation["summary"],
                 "decision": decision,
             }
