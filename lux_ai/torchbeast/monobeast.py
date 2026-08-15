@@ -1436,6 +1436,10 @@ def train(flags):
     def lr_lambda(epoch):
         min_pct = flags.min_lr_mod
         pct_complete = min(epoch * t * b, flags.total_steps) / flags.total_steps
+        if getattr(flags, "lr_schedule", "linear") == "cosine":
+            # cosine annealing: 1.0 -> min_pct
+            return min_pct + (1.0 - min_pct) * 0.5 * (1.0 + math.cos(math.pi * pct_complete))
+        # Default: linear decay (existing behavior)
         scaled_pct_complete = pct_complete * (1.0 - min_pct)
         return 1.0 - scaled_pct_complete
 

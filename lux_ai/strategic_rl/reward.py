@@ -245,3 +245,33 @@ class StrategicPotentialRewardV2(BaseRewardSpace):
         else:
             self.previous = potential
         return tuple(np.clip(rewards, -1.0, 1.0)), done
+
+
+class StrategicPotentialRewardV3(StrategicPotentialRewardV2):
+    """Phase-aware zero-sum shaping for survival, delivery, and safe expansion.
+    Includes final tile count difference scaling for finer-grained terminal signals.
+    """
+
+    def __init__(
+        self,
+        tile_diff_scale: float = 8.0,
+        tile_diff_weight: float = 0.3,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.tile_diff_scale = float(tile_diff_scale)
+        self.tile_diff_weight = float(tile_diff_weight)
+
+    def compute_rewards_and_done(self, game_state, done):
+        rewards, done = super().compute_rewards_and_done(game_state, done)
+        if done:
+            player_tiles = [p.city_tile_count for p in game_state.players]
+            tile_diff = player_tiles[0] - player_tiles[1]
+            tile_bonus = np.tanh(tile_diff / self.tile_diff_scale) * self.tile_diff_weight
+            
+            rewards_list = list(rewards)
+            rewards_list[0] += tile_bonus
+            rewards_list[1] -= tile_bonus
+            rewards = tuple(np.clip(rewards_list, -1.0, 1.0))
+            
+        return rewards, done

@@ -123,3 +123,10 @@ state_curriculum_enabled: false
 snapshot_start_probability: 0.30
 snapshot_pool_capacity: 2048
 snapshot_capture_interval: 16
+
+# 衝突ペナルティ: ユニット消滅時にリワードを減算するインセンティブ。
+# cost=0 で無効（既存の学習に影響なし）。
+collision_penalty_cost: 0.0
+collision_penalty_ramp_start: 0.0
+collision_penalty_ramp_end: 0.0
+collision_penalty_ramp_steps: 50000

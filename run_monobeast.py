@@ -112,8 +112,8 @@ def main(flags: DictConfig):
         new_flags = OmegaConf.load(Path(flags.load_dir) / "config.yaml")
         # Preserve every saved setting and apply only explicitly supplied task
         # overrides. Merging the selected base config here can silently reset
-        # options such as use_teacher when resuming.
         flags = merge_resume_config(new_flags, selected_flags, cli_conf)
+        logging.info(f"After merge_resume_config: total_steps={flags.get('total_steps')}, weights_only={flags.get('weights_only')}")
 
     flags = get_default_flags(flags)
     original_cwd = Path(get_original_cwd())

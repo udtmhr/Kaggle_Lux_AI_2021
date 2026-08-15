@@ -1,0 +1,92 @@
+defaults:
+- survival_strategic_strength_v10_curriculum_1gpu
+- _self_
+
+name: survival_strategic_strength_v11_longrun_1gpu
+
+# 1GPU構成
+actor_device: cuda:0
+learner_device: cuda:0
+
+# v10 100kの重みを初期値として使う
+weights_only: true
+total_steps: 5000000
+
+# 報酬関数をV3に変更
+reward_space: StrategicPotentialRewardV3
+reward_space_kwargs:
+  shaping_weight: 0.015
+  decay_games: 20000
+  shaping_floor: 0.003
+  discounting: 0.999
+  max_step_shaping: 0.02
+  tile_diff_scale: 8.0
+  tile_diff_weight: 0.3
+reward_config_version: 5
+
+# 学習率を微増 + cosineスケジューラ
+optimizer_kwargs:
+  lr: 1.0e-6
+  eps: 3.0e-4
+min_lr_mod: 0.1
+lr_schedule: cosine
+
+# selfplayのweight増加
+league_opponents:
+  - name: base_0100096
+    kind: snapshot
+    weight: 0.15
+    fixed_probability: 0.25
+    checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/strength_winloss_001/step_0100000/0100096_weights.pt
+  - name: first_place
+    kind: teacher
+    weight: 0.20
+    fixed_probability: 0.2
+    config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+    checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+  - name: selfplay
+    kind: selfplay
+    weight: 0.25
+  - name: learner_snapshot_0
+    kind: learner_snapshot
+    slot: 0
+    weight: 0.10
+  - name: learner_snapshot_1
+    kind: learner_snapshot
+    slot: 1
+    weight: 0.10
+  - name: past_59822400
+    kind: teacher
+    weight: 0.08
+    config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+    checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+  - name: past_28576448
+    kind: teacher
+    weight: 0.08
+    config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+    checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+  - name: rule_economy
+    kind: rule_based
+    strategy: economy
+    weight: 0.02
+  - name: rule_survival
+    kind: rule_based
+    strategy: survival
+    weight: 0.01
+  - name: rule_expansion
+    kind: rule_based
+    strategy: expansion
+    weight: 0.01
+league_config_version: 6
+
+# カリキュラム学習は継続
+state_curriculum_enabled: true
+snapshot_start_probability: 0.30
+snapshot_pool_capacity: 2048
+snapshot_capture_interval: 16
+
+# Learner snapshotを500kステップ毎に更新
+learner_snapshot_interval_steps: 500000
+
+# 500kステップごとの中間チェックポイント
+checkpoint_freq: 120.0

@@ -1,0 +1,26 @@
+defaults:
+- survival_strategic_strength_v6_behavior_kl_2gpu
+- _self_
+
+name: survival_strategic_strength_v9b_collision_mse_1gpu
+actor_device: cuda:0
+learner_device: cuda:0
+
+# v6 Behavior KL 100k 重みからの fresh optimizer ロード
+weights_only: true
+total_steps: 100000
+
+# Categorical critic は使わない（MSE scalar critic を維持）
+# → arm_A との差分で Categorical の効果を分離測定
+
+# --- 衝突ペナルティ（arm_A と同一設定）---
+collision_penalty_cost: 0.005
+collision_penalty_ramp_start: 0.005
+collision_penalty_ramp_end: 0.02
+collision_penalty_ramp_steps: 50000
+
+# --- LR 管理 ---
+optimizer_kwargs:
+  lr: 5.0e-7
+  eps: 3.0e-4
+min_lr_mod: 1.0

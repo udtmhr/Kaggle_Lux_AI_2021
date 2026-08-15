@@ -81,4 +81,19 @@ def create_reward_space(flags, reward_game_counter=None) -> reward_spaces.BaseRe
 
     if reward_game_counter is not None and hasattr(reward_space, "set_global_game_counter"):
         reward_space.set_global_game_counter(reward_game_counter)
+
+    # 衝突ペナルティが有効な場合、reward spaceをラッパーで包む
+    collision_cost = float(getattr(flags, "collision_penalty_cost", 0.0))
+    if collision_cost > 0.0:
+        from ..strategic_rl.collision_penalty import CollisionPenaltyWrapper
+        reward_space = CollisionPenaltyWrapper(
+            inner=reward_space,
+            penalty_start=float(getattr(flags, "collision_penalty_ramp_start", collision_cost)),
+            penalty_end=float(getattr(flags, "collision_penalty_ramp_end", collision_cost)),
+            ramp_steps=int(getattr(flags, "collision_penalty_ramp_steps", 50_000)),
+        )
+        if reward_game_counter is not None:
+            reward_space.set_global_game_counter(reward_game_counter)
+
     return reward_space
+

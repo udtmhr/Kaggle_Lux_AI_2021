@@ -1,0 +1,9 @@
+defaults:
+- survival_strategic_strength_v10_curriculum_1gpu
+- _self_
+
+name: survival_strategic_strength_v10_curriculum_1m_1gpu
+# 前回の100k学習の状態（オプティマイザ等）を完全に復元して再開するため false に設定
+weights_only: false
+# 学習ステップを 1M (1,000,000) に延長
+total_steps: 1000000

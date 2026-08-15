@@ -37,3 +37,43 @@ step are restored.
   importance ratios, value accuracy, and gradient diagnostics using identical keys.
 - Promotion still requires the paired bootstrap and extinction/survival gates; a
   finite loss or completed run is not promotion evidence.
+
+## Stage 1 results (v5/v6/v7)
+
+- **v5 (Control)**: v4ベースラインと同等。改善なし。
+- **v6 (Behavior KL)**: v4と同等。衝突率 4-6.5%。大マップ (map_32) で弱い。
+- **v7 (Categorical)**: 学習崩壊。warmup不足 + LR減衰 (min_lr_mod: 0.10) が原因。
+
+## Stage 2: v9 collision penalty + categorical fix
+
+v6 Behavior KL 100k重みを出発点に、並行2arm構成で学習。
+
+| 設定 | arm_A (v9a) | arm_B (v9b) |
+|------|:-----------:|:-----------:|
+| Config | `v9a_collision_categorical_2gpu` | `v9b_collision_mse_2gpu` |
+| Critic | Categorical HL-Gauss | Scalar MSE |
+| Warmup | 15,000 batches (baseline_only) | — |
+| 衝突ペナルティ | 0.005→0.02 ramp (50k steps) | 同左 |
+| LR | 5e-7 constant (min_lr_mod=1.0) | 同左 |
+
+```bash
+# arm_A
+ulimit -n 8192
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked python run_monobeast.py \
+  --config-name survival_strategic_strength_v9a_collision_categorical_2gpu \
+  +load_dir=<v6_100k_bundle_path> \
+  +checkpoint_file=<v6_100k_weights_file>
+
+# arm_B
+ulimit -n 8192
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked python run_monobeast.py \
+  --config-name survival_strategic_strength_v9b_collision_mse_2gpu \
+  +load_dir=<v6_100k_bundle_path> \
+  +checkpoint_file=<v6_100k_weights_file>
+```
+
+### Early gates (25k)
+
+- `explained_variance > 0.8` (arm_Aのみ)
+- `entropy_loss ≠ nan`, `vtrace_pg_loss ≠ nan` (両arm)
+- `friendly_collision_rate` がベースライン比10%以上減少 (両arm)

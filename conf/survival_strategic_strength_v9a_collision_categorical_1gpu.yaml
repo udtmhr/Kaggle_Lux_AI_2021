@@ -1,0 +1,37 @@
+defaults:
+- survival_strategic_strength_v6_behavior_kl_2gpu
+- _self_
+
+name: survival_strategic_strength_v9a_collision_categorical_1gpu
+actor_device: cuda:0
+learner_device: cuda:0
+
+# v6 Behavior KL 100k 重みからの fresh optimizer ロード
+weights_only: true
+total_steps: 100000
+
+# --- Categorical critic（修正版）---
+# v7 の失敗を受けて warmup を大幅延長。baseline_only モードで
+# 方策勾配をフリーズし、value head のみを先行学習させる。
+value_critic: categorical_hl_gauss
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75
+n_value_warmup_batches: 0
+
+# --- 衝突ペナルティ ---
+# ユニット消滅にペナルティを付与し衝突回避を学習させる。
+# 50k ステップかけて 0.005 → 0.02 へランプアップ。
+collision_penalty_cost: 0.005
+collision_penalty_ramp_start: 0.005
+collision_penalty_ramp_end: 0.02
+collision_penalty_ramp_steps: 50000
+
+# --- LR 管理 ---
+# v7 では min_lr_mod: 0.10 により LR が 1/10 に減衰していた。
+# 定数 LR を保証するため 1.0 に固定。
+optimizer_kwargs:
+  lr: 5.0e-7
+  eps: 3.0e-4
+min_lr_mod: 1.0
