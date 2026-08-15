@@ -2,10 +2,10 @@ defaults:
 - survival_strategic_strength_v10_curriculum_1gpu
 - _self_
 
-name: survival_strategic_strength_v11_longrun_1gpu
+name: survival_strategic_strength_v11_longrun_2gpu
 
-# 1GPU構成
-actor_device: cuda:0
+# 2GPU構成
+actor_device: cuda:1
 learner_device: cuda:0
 
 # v10 100kの重みを初期値として使う
