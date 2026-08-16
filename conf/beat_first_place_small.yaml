@@ -1,0 +1,26 @@
+defaults:
+- survival_strategic
+- _self_
+
+name: beat_first_place_small
+group: scratch_distill_impala
+
+# Small architecture
+n_blocks: 6
+hidden_dim: 48
+kernel_size: 5
+
+# Opponents: Heavily exploit 1st place
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.20
+- name: first_place
+  kind: teacher
+  weight: 0.80
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+
+# Initial weights from small distillation
+teacher_load_dir: outputs/distill_small
+teacher_checkpoint_file: best.pt

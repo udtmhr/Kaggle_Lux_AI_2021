@@ -1,0 +1,20 @@
+defaults:
+- survival_strategic
+- _self_
+
+name: survival_strategic_relative_counts_v1
+reward_config_version: 3
+reward_space: RelativeCountPotentialReward
+reward_space_kwargs:
+  # r_t = alpha * delta[(own - enemy) weighted counts] / count_scale.
+  # City tiles are weighted more heavily than units, and per-step shaping is
+  # bounded so the terminal game result remains the main objective.
+  city_tile_weight: 2.0
+  unit_weight: 0.5
+  shaping_weight: 0.05
+  count_scale: 10.0
+  max_step_shaping: 0.05
+  decay_games: 14000
+
+total_steps: 5000000
+teacher_kl_decay_steps: 5000000

@@ -1,0 +1,21 @@
+defaults:
+- survival_strategic_strength_v10_curriculum_1gpu
+- _self_
+
+name: beat_first_place_v10
+
+# Disable state curriculum to focus entirely on full game against 1st place
+state_curriculum_enabled: false
+
+# Focus training explicitly on exploiting the 1st place model
+league_sampling: fixed
+league_config_version: 100
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.20
+- name: first_place
+  kind: teacher
+  weight: 0.80
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt

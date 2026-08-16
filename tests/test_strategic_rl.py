@@ -35,7 +35,7 @@ from lux_ai.strategic_rl.obs import night_turns_between
 from lux_ai.strategic_rl.prepare_data import _discover_replays
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
-from lux_ai.strategic_rl.reward import StrategicPotentialRewardV2, SurvivalPotentialReward
+from lux_ai.strategic_rl.reward import RelativeCountPotentialReward, StrategicPotentialRewardV2, SurvivalPotentialReward
 from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics, run_matched_matches
 from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
@@ -561,6 +561,62 @@ def test_survival_shaping_uses_shared_global_game_count():
     reward._increment_game_count()
     assert counter.value == 9539
     assert reward.games == 0
+
+
+def test_relative_count_reward_uses_temporal_change_in_opponent_advantage():
+    def state(turn, city_tiles, units):
+        return SimpleNamespace(
+            turn=turn,
+            players=[
+                SimpleNamespace(city_tile_count=city_tiles[0], units=[object()] * units[0]),
+                SimpleNamespace(city_tile_count=city_tiles[1], units=[object()] * units[1]),
+            ],
+        )
+
+    reward = RelativeCountPotentialReward(
+        city_tile_weight=1.0,
+        unit_weight=0.5,
+        shaping_weight=0.1,
+        count_scale=1.0,
+        max_step_shaping=1.0,
+        decay_games=100,
+    )
+
+    initial, _ = reward.compute_rewards_and_done(state(0, (1, 1), (1, 1)), False)
+    city_gain, _ = reward.compute_rewards_and_done(state(1, (2, 1), (1, 1)), False)
+    unchanged, _ = reward.compute_rewards_and_done(state(2, (2, 1), (1, 1)), False)
+    enemy_unit_gain, _ = reward.compute_rewards_and_done(state(3, (2, 1), (1, 2)), False)
+
+    assert np.allclose(initial, (0.0, 0.0))
+    assert np.allclose(city_gain, (0.1, -0.1))
+    assert np.allclose(unchanged, (0.0, 0.0))
+    assert np.allclose(enemy_unit_gain, (-0.05, 0.05))
+
+
+def test_relative_count_reward_adds_terminal_result_and_resets():
+    reward = RelativeCountPotentialReward(shaping_weight=0.0)
+    initial = SimpleNamespace(
+        turn=0,
+        players=[
+            SimpleNamespace(city_tile_count=1, units=[object()]),
+            SimpleNamespace(city_tile_count=1, units=[object()]),
+        ],
+    )
+    terminal = SimpleNamespace(
+        turn=10,
+        players=[
+            SimpleNamespace(city_tile_count=2, units=[object()]),
+            SimpleNamespace(city_tile_count=1, units=[object()]),
+        ],
+    )
+
+    reward.compute_rewards_and_done(initial, False)
+    rewards, done = reward.compute_rewards_and_done(terminal, True)
+
+    assert done is True
+    assert rewards == (1.0, -1.0)
+    assert reward.games == 1
+    assert reward.initialized is False
 
 
 def test_teacher_kl_ignores_fully_masked_invalid_entities():

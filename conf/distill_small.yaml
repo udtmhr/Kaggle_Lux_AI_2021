@@ -1,0 +1,124 @@
+defaults:
+- override hydra/job_logging: colorlog
+- override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: ./outputs/distill_small/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+name: distill_small
+project: Lux_AI_2021_strategic
+entity: null
+group: distill
+
+act_space: BasicActionSpace
+obs_space: SurvivalStrategicObs
+obs_space_kwargs: {}
+reward_space: GameResultReward
+reward_space_kwargs: {}
+
+total_steps: 20000000
+num_actors: 2
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+
+model_arch: survival_strategic
+n_blocks: 6
+attention_blocks: 4
+n_heads: 6
+hidden_dim: 48
+embedding_dim: 16
+n_merge_layers: 1
+normalize: false
+sum_player_embeddings: false
+use_index_select: false
+rescale_value_input: true
+rescale_se_input: true
+kernel_size: 5
+
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 0.00005
+  eps: 0.0003
+min_lr_mod: 0.01
+
+entropy_cost: 0.0002
+baseline_cost: 1.0
+teacher_kl_cost: 0.005
+teacher_kl_cost_start: 0.01
+teacher_kl_cost_end: 0.001
+teacher_kl_decay_steps: 20000000
+teacher_kl_delay_steps: 0
+teacher_baseline_cost: 0.0
+actor_policy_tta_rot180: true
+teacher_policy_tta_rot180: true
+lmb: 0.9
+reduction: sum
+
+use_teacher: false
+teacher_load_dir: null
+teacher_checkpoint_file: null
+
+league_enabled: true
+league_config_version: 2
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.40
+- name: first_place
+  kind: teacher
+  weight: 0.20
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: past_59822400
+  kind: teacher
+  weight: 0.10
+  config: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/59822400_weights.pt
+- name: past_28576448
+  kind: teacher
+  weight: 0.20
+  config: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/10-10_11-18-12_28576448/lux_ai/rl_agent/28576448_weights.pt
+- name: rule_based
+  kind: rule_based
+  weight: 0.10
+
+actor_device: cuda:0
+learner_device: cuda:0
+disable_wandb: true
+model_log_freq: 100
+sharing_strategy: file_descriptor
+seed: 2021
+num_buffers: 4
+use_mixed_precision: true
+actor_mixed_precision: false
+clip_grads: 10.0
+checkpoint_freq: 30.0
+num_learner_threads: 1
+debug: false
+weights_only: true
+n_value_warmup_batches: 0
+
+behavior_kl_target: null
+behavior_kl_auto_steps: 20000
+behavior_kl_dual_lr: 0.05
+behavior_kl_abort_multiplier: 4.0
+
+value_critic: scalar
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75
+
+state_curriculum_enabled: false
+snapshot_start_probability: 0.30
+snapshot_pool_capacity: 2048
+snapshot_capture_interval: 16
+
+collision_penalty_cost: 0.0
+collision_penalty_ramp_start: 0.0
+collision_penalty_ramp_end: 0.0
+collision_penalty_ramp_steps: 50000

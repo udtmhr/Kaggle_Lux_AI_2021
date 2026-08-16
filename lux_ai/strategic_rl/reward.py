@@ -78,6 +78,108 @@ class SurvivalPotentialReward(BaseRewardSpace):
         return tuple(np.clip(rewards, -1.0, 1.0)), done
 
 
+class RelativeCountPotentialReward(BaseRewardSpace):
+    """Reward temporal improvements in city-tile and unit count advantage.
+
+    The shaping signal for player ``i`` is the change in
+    ``potential_i - potential_opponent``.  This rewards both creating/keeping
+    friendly assets and destroying/preventing enemy assets without repeatedly
+    rewarding an advantage that has not changed.
+    """
+
+    def __init__(
+        self,
+        city_tile_weight: float = 2.0,
+        unit_weight: float = 0.5,
+        shaping_weight: float = 0.05,
+        count_scale: float = 10.0,
+        max_step_shaping: float = 0.05,
+        decay_games: int = 14000,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if city_tile_weight < 0.0 or unit_weight < 0.0:
+            raise ValueError("count weights must be non-negative")
+        if shaping_weight < 0.0:
+            raise ValueError("shaping_weight must be non-negative")
+        if count_scale <= 0.0:
+            raise ValueError("count_scale must be positive")
+        if max_step_shaping < 0.0:
+            raise ValueError("max_step_shaping must be non-negative")
+        self.city_tile_weight = float(city_tile_weight)
+        self.unit_weight = float(unit_weight)
+        self.shaping_weight = float(shaping_weight)
+        self.count_scale = float(count_scale)
+        self.max_step_shaping = float(max_step_shaping)
+        self.decay_games = max(int(decay_games), 1)
+        self.games = 0
+        self.global_game_counter = None
+        self.current_alpha = self.shaping_weight
+        self.previous_relative = np.zeros(2, dtype=np.float64)
+        self.initialized = False
+
+    @staticmethod
+    def get_reward_spec() -> RewardSpec:
+        return RewardSpec(-1.0, 1.0, True, False)
+
+    def set_global_game_counter(self, counter) -> None:
+        self.global_game_counter = counter
+
+    def _game_count(self) -> int:
+        return self.games if self.global_game_counter is None else int(self.global_game_counter.value)
+
+    def _increment_game_count(self) -> None:
+        if self.global_game_counter is None:
+            self.games += 1
+            return
+        with self.global_game_counter.get_lock():
+            self.global_game_counter.value += 1
+
+    def shaping_alpha(self) -> float:
+        return self.shaping_weight * max(0.0, 1.0 - self._game_count() / self.decay_games)
+
+    def get_info(self):
+        return {
+            "LOGGING_shaping_alpha": np.asarray([self.current_alpha], dtype=np.float32),
+            "LOGGING_shaping_games": np.asarray([self._game_count()], dtype=np.float32),
+        }
+
+    def _relative_potential(self, game_state) -> np.ndarray:
+        potentials = np.asarray(
+            [
+                self.city_tile_weight * player.city_tile_count
+                + self.unit_weight * len(player.units)
+                for player in game_state.players
+            ],
+            dtype=np.float64,
+        )
+        return potentials - potentials[::-1]
+
+    def compute_rewards_and_done(self, game_state, done):
+        relative = self._relative_potential(game_state)
+        self.current_alpha = self.shaping_alpha()
+        if not self.initialized or game_state.turn == 0:
+            delta = np.zeros(2, dtype=np.float64)
+            self.initialized = True
+        else:
+            delta = relative - self.previous_relative
+        shaping = np.clip(
+            self.current_alpha * delta / self.count_scale,
+            -self.max_step_shaping,
+            self.max_step_shaping,
+        )
+        rewards = shaping
+        if done:
+            terminal = [int(GameResultReward.compute_player_reward(p)) for p in game_state.players]
+            rewards += (rankdata(terminal) - 1.0) * 2.0 - 1.0
+            self._increment_game_count()
+            self.previous_relative[:] = 0.0
+            self.initialized = False
+        else:
+            self.previous_relative = relative
+        return tuple(np.clip(rewards, -1.0, 1.0)), done
+
+
 class StrategicPotentialRewardV2(BaseRewardSpace):
     """Phase-aware zero-sum shaping for survival, delivery, and safe expansion.
 

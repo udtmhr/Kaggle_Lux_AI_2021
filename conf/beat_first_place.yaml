@@ -1,0 +1,48 @@
+defaults:
+- conv_config
+- _self_
+
+name: beat_first_place
+project: Lux_AI_2021
+
+# Architecture matches 1st place bot
+model_arch: conv_model
+n_blocks: 24
+hidden_dim: 128
+embedding_dim: 32
+kernel_size: 5
+obs_space: FixedShapeContinuousObsV2
+
+# Load 1st place bot weights
+weights_only: true
+load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/
+checkpoint_file: 062179520_weights.pt
+
+# Training settings
+total_steps: 2000000
+actor_device: cuda:1
+learner_device: cuda:0
+batch_size: 4
+unroll_length: 16
+n_actor_envs: 16
+
+optimizer_kwargs:
+  lr: 5.0e-6
+  eps: 0.0003
+
+# Reward
+reward_space: GameResultReward
+
+# League: play mainly against 1st place to exploit it
+league_opponents:
+  - name: first_place
+    kind: teacher
+    weight: 0.8
+    config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+    checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+  - name: selfplay
+    kind: selfplay
+    weight: 0.2
+league_config_version: 6
+
+checkpoint_freq: 30.0

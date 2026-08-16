@@ -1,0 +1,552 @@
+Evaluating outputs/survival_strategic/2026-08-15/12-02-58/100096_weights.pt against first_place...
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+{
+  ranks: [
+    { rank: 1, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-12-p1.json',
+  seed: 2021
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-12-p0.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-16-p0.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-16-p1.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-24-p0.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-24-p1.json',
+  seed: 2021
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-32-p0.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2021-size-32-p1.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-12-p0.json',
+  seed: 2022
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-12-p1.json',
+  seed: 2022
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-16-p1.json',
+  seed: 2022
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-16-p0.json',
+  seed: 2022
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-24-p0.json',
+  seed: 2022
+}
+{
+  ranks: [
+    { rank: 1, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-24-p1.json',
+  seed: 2022
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-32-p0.json',
+  seed: 2022
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2022-size-32-p1.json',
+  seed: 2022
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-12-p0.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-12-p1.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-16-p0.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-16-p1.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-24-p1.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-24-p0.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-32-p0.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2023-size-32-p1.json',
+  seed: 2023
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-12-p1.json',
+  seed: 2024
+}
+Loading environment lux_ai_s2 failed: No module named 'vec_noise'
+{"candidate_city_survival": 0.8475783475783476, "candidate_final_city_tiles": 29, "candidate_final_units": 29, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.0644106067683418, "map_size": 12, "opponent": "first_place", "replay": "seed-2021-size-12-p1.json", "seed": 2021, "winner": 1}
+{"candidate_city_survival": 0.8294111967947093, "candidate_final_city_tiles": 30, "candidate_final_units": 30, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.07446203126382772, "map_size": 12, "opponent": "first_place", "replay": "seed-2021-size-12-p0.json", "seed": 2021, "winner": 0}
+{"candidate_city_survival": 0.582644824311491, "candidate_final_city_tiles": 3, "candidate_final_units": 5, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.160438739863388, "map_size": 16, "opponent": "first_place", "replay": "seed-2021-size-16-p0.json", "seed": 2021, "winner": 1}
+{"candidate_city_survival": 0.7709638400814871, "candidate_final_city_tiles": 11, "candidate_final_units": 11, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.1327178569968714, "map_size": 16, "opponent": "first_place", "replay": "seed-2021-size-16-p1.json", "seed": 2021, "winner": 0}
+{"candidate_city_survival": 0.8099453741028729, "candidate_final_city_tiles": 39, "candidate_final_units": 39, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.046539205743811034, "map_size": 24, "opponent": "first_place", "replay": "seed-2021-size-24-p0.json", "seed": 2021, "winner": 1}
+{"candidate_city_survival": 0.9341983974885851, "candidate_final_city_tiles": 124, "candidate_final_units": 124, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.03690946650064294, "map_size": 24, "opponent": "first_place", "replay": "seed-2021-size-24-p1.json", "seed": 2021, "winner": 0}
+{"candidate_city_survival": 0.7148942316221728, "candidate_final_city_tiles": 219, "candidate_final_units": 219, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.17406712281941983, "map_size": 32, "opponent": "first_place", "replay": "seed-2021-size-32-p0.json", "seed": 2021, "winner": 0}
+{"candidate_city_survival": 0.722546286814635, "candidate_final_city_tiles": 194, "candidate_final_units": 194, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.10159391208081495, "map_size": 32, "opponent": "first_place", "replay": "seed-2021-size-32-p1.json", "seed": 2021, "winner": 0}
+{"candidate_city_survival": 0.809556819360741, "candidate_final_city_tiles": 7, "candidate_final_units": 12, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.13068642423543875, "map_size": 12, "opponent": "first_place", "replay": "seed-2022-size-12-p0.json", "seed": 2022, "winner": 1}
+{"candidate_city_survival": 0.8463608516240095, "candidate_final_city_tiles": 24, "candidate_final_units": 23, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.07374940956957932, "map_size": 12, "opponent": "first_place", "replay": "seed-2022-size-12-p1.json", "seed": 2022, "winner": 0}
+{"candidate_city_survival": 0.6991770088261317, "candidate_final_city_tiles": 9, "candidate_final_units": 9, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.17672232811874133, "map_size": 16, "opponent": "first_place", "replay": "seed-2022-size-16-p1.json", "seed": 2022, "winner": 0}
+{"candidate_city_survival": 0.8601190476190477, "candidate_final_city_tiles": 16, "candidate_final_units": 16, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.11902776834723294, "map_size": 16, "opponent": "first_place", "replay": "seed-2022-size-16-p0.json", "seed": 2022, "winner": 0}
+{"candidate_city_survival": 0.7782848679400404, "candidate_final_city_tiles": 23, "candidate_final_units": 28, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.12421831207583346, "map_size": 24, "opponent": "first_place", "replay": "seed-2022-size-24-p0.json", "seed": 2022, "winner": 1}
+{"candidate_city_survival": 0.8053252578681319, "candidate_final_city_tiles": 132, "candidate_final_units": 132, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.07185315787002172, "map_size": 24, "opponent": "first_place", "replay": "seed-2022-size-24-p1.json", "seed": 2022, "winner": 1}
+{"candidate_city_survival": 0.7106929965816312, "candidate_final_city_tiles": 15, "candidate_final_units": 18, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.14782028896762747, "map_size": 32, "opponent": "first_place", "replay": "seed-2022-size-32-p0.json", "seed": 2022, "winner": 1}
+{"candidate_city_survival": 0.7478663212066672, "candidate_final_city_tiles": 27, "candidate_final_units": 30, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.14379951338981237, "map_size": 32, "opponent": "first_place", "replay": "seed-2022-size-32-p1.json", "seed": 2022, "winner": 0}
+{"candidate_city_survival": 0.9176587301587301, "candidate_final_city_tiles": 22, "candidate_final_units": 22, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.05345505900984433, "map_size": 12, "opponent": "first_place", "replay": "seed-2023-size-12-p0.json", "seed": 2023, "winner": 0}
+{"candidate_city_survival": 0.7775372775372776, "candidate_final_city_tiles": 4, "candidate_final_units": 4, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.04738010502259207, "map_size": 12, "opponent": "first_place", "replay": "seed-2023-size-12-p1.json", "seed": 2023, "winner": 0}
+{"candidate_city_survival": 0.8726492129269907, "candidate_final_city_tiles": 25, "candidate_final_units": 25, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.024293888045114693, "map_size": 16, "opponent": "first_place", "replay": "seed-2023-size-16-p0.json", "seed": 2023, "winner": 1}
+{"candidate_city_survival": 0.8059163059163059, "candidate_final_city_tiles": 11, "candidate_final_units": 13, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.06743514735664745, "map_size": 16, "opponent": "first_place", "replay": "seed-2023-size-16-p1.json", "seed": 2023, "winner": 0}
+{"candidate_city_survival": 0.7872651538396768, "candidate_final_city_tiles": 119, "candidate_final_units": 119, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.09351474728104187, "map_size": 24, "opponent": "first_place", "replay": "seed-2023-size-24-p1.json", "seed": 2023, "winner": 0}
+{"candidate_city_survival": 0.8104835027791003, "candidate_final_city_tiles": 146, "candidate_final_units": 145, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.06153624528079165, "map_size": 24, "opponent": "first_place", "replay": "seed-2023-size-24-p0.json", "seed": 2023, "winner": 1}
+{"candidate_city_survival": 0.821811643212805, "candidate_final_city_tiles": 236, "candidate_final_units": 236, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.12091805754111956, "map_size": 32, "opponent": "first_place", "replay": "seed-2023-size-32-p0.json", "seed": 2023, "winner": 1}
+{"candidate_city_survival": 0.7038529063551038, "candidate_final_city_tiles": 221, "candidate_final_units": 221, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.12731944126585937, "map_size": 32, "opponent": "first_place", "replay": "seed-2023-size-32-p1.json", "seed": 2023, "winner": 0}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-12-p0.json',
+  seed: 2024
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-16-p0.json',
+  seed: 2024
+}
+{
+  ranks: [
+    { rank: 1, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-16-p1.json',
+  seed: 2024
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-24-p0.json',
+  seed: 2024
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-24-p1.json',
+  seed: 2024
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-32-p0.json',
+  seed: 2024
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2024-size-32-p1.json',
+  seed: 2024
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-12-p1.json',
+  seed: 2025
+}
+{
+  ranks: [
+    { rank: 1, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' },
+    {
+      rank: 2,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-12-p0.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-16-p0.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-16-p1.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-24-p0.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-24-p1.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-32-p0.json',
+  seed: 2025
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 1, name: '/tmp/lux_candidate_100096/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/seed-2025-size-32-p1.json',
+  seed: 2025
+}
+{"candidate_city_survival": 0.7394593253968254, "candidate_final_city_tiles": 0, "candidate_final_units": 0, "candidate_last_response_turn": 318, "candidate_player": 1, "candidate_stranded_fuel": 0.0656717759990046, "map_size": 12, "opponent": "first_place", "replay": "seed-2024-size-12-p1.json", "seed": 2024, "winner": 0}
+{"candidate_city_survival": 0.566017316017316, "candidate_final_city_tiles": 0, "candidate_final_units": 4, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.12302918674714795, "map_size": 12, "opponent": "first_place", "replay": "seed-2024-size-12-p0.json", "seed": 2024, "winner": 1}
+{"candidate_city_survival": 0.7666666666666666, "candidate_final_city_tiles": 29, "candidate_final_units": 29, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.08898540848054624, "map_size": 16, "opponent": "first_place", "replay": "seed-2024-size-16-p0.json", "seed": 2024, "winner": 1}
+{"candidate_city_survival": 0.910959595959596, "candidate_final_city_tiles": 59, "candidate_final_units": 59, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.02463508799831617, "map_size": 16, "opponent": "first_place", "replay": "seed-2024-size-16-p1.json", "seed": 2024, "winner": 1}
+{"candidate_city_survival": 0.8703517399265361, "candidate_final_city_tiles": 123, "candidate_final_units": 123, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.08210122367489933, "map_size": 24, "opponent": "first_place", "replay": "seed-2024-size-24-p0.json", "seed": 2024, "winner": 0}
+{"candidate_city_survival": 0.8178535678535679, "candidate_final_city_tiles": 34, "candidate_final_units": 34, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.10088926711386774, "map_size": 24, "opponent": "first_place", "replay": "seed-2024-size-24-p1.json", "seed": 2024, "winner": 0}
+{"candidate_city_survival": 0.6738255024015389, "candidate_final_city_tiles": 13, "candidate_final_units": 22, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.1617775852334182, "map_size": 32, "opponent": "first_place", "replay": "seed-2024-size-32-p0.json", "seed": 2024, "winner": 1}
+{"candidate_city_survival": 0.7196587418106327, "candidate_final_city_tiles": 26, "candidate_final_units": 26, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.12516352269046555, "map_size": 32, "opponent": "first_place", "replay": "seed-2024-size-32-p1.json", "seed": 2024, "winner": 0}
+{"candidate_city_survival": 0.7430655763989097, "candidate_final_city_tiles": 4, "candidate_final_units": 8, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.025065922703717977, "map_size": 12, "opponent": "first_place", "replay": "seed-2025-size-12-p1.json", "seed": 2025, "winner": 0}
+{"candidate_city_survival": 0.8753363406141184, "candidate_final_city_tiles": 49, "candidate_final_units": 49, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.04223156853043048, "map_size": 12, "opponent": "first_place", "replay": "seed-2025-size-12-p0.json", "seed": 2025, "winner": 0}
+{"candidate_city_survival": 0.7685823163764339, "candidate_final_city_tiles": 6, "candidate_final_units": 6, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.16360962707337742, "map_size": 16, "opponent": "first_place", "replay": "seed-2025-size-16-p0.json", "seed": 2025, "winner": 1}
+{"candidate_city_survival": 0.6641855058521725, "candidate_final_city_tiles": 1, "candidate_final_units": 3, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.1967971642418372, "map_size": 16, "opponent": "first_place", "replay": "seed-2025-size-16-p1.json", "seed": 2025, "winner": 0}
+{"candidate_city_survival": 0.486970001675884, "candidate_final_city_tiles": 4, "candidate_final_units": 6, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.1594236467450936, "map_size": 24, "opponent": "first_place", "replay": "seed-2025-size-24-p0.json", "seed": 2025, "winner": 1}
+{"candidate_city_survival": 0.6785791369124703, "candidate_final_city_tiles": 89, "candidate_final_units": 89, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.1387334588822754, "map_size": 24, "opponent": "first_place", "replay": "seed-2025-size-24-p1.json", "seed": 2025, "winner": 0}
+{"candidate_city_survival": 0.866483390944383, "candidate_final_city_tiles": 251, "candidate_final_units": 250, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.041128468486734904, "map_size": 32, "opponent": "first_place", "replay": "seed-2025-size-32-p0.json", "seed": 2025, "winner": 1}
+{"candidate_city_survival": 0.8342710544575218, "candidate_final_city_tiles": 270, "candidate_final_units": 270, "candidate_last_response_turn": 359, "candidate_player": 1, "candidate_stranded_fuel": 0.050450016862309384, "map_size": 32, "opponent": "first_place", "replay": "seed-2025-size-32-p1.json", "seed": 2025, "winner": 0}
+{
+  "agent": "/tmp/lux_candidate_100096/main.py",
+  "backend": {
+    "batch_games": null,
+    "device": "auto",
+    "parity": "not_requested",
+    "requested": "official",
+    "selected": "official"
+  },
+  "games": "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/games.jsonl",
+  "report": "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_100096_vs_first_place/report.json",
+  "summary": {
+    "opponents": {
+      "first_place": {
+        "bootstrap_lcb95": 0.1,
+        "candidate_city_extinction_rate": 0.05,
+        "candidate_city_survival": 0.7737251545452817,
+        "candidate_unit_extinction_rate": 0.025,
+        "matched_pairs": 20,
+        "paired_delta_from_even": -0.275,
+        "score_rate": 0.225
+      }
+    },
+    "schema_version": 1
+  }
+}

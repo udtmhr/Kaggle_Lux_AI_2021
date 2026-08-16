@@ -1,0 +1,177 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/run_monobeast.py:95: Hydra14MigrationWarning: 
+The version_base parameter is not specified.
+Hydra will assume defaults for version 1.1.
+Hydra 1.4 will remove this compatibility behavior.
+Before upgrading to Hydra 1.4, set version_base="1.3" and test your application.
+See https://hydra.cc/docs/upgrades/1.3_to_1.4/prepare_for_1_4/ for preparation instructions.
+  @hydra.main(config_path="conf", config_name="resume_config")
+[DEBUG:3596927 utils:279 2026-08-15 17:47:04,378] Setting JobRuntime:name=UNKNOWN_NAME
+[DEBUG:3596927 utils:279 2026-08-15 17:47:04,378] Setting JobRuntime:name=run_monobeast
+/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+[[36m2026-08-15 17:47:04,632[0m][[34mroot[0m][[32mINFO[0m] - name: survival_strategic_strength_v12_beat_first_place_2gpu
+project: Lux_AI_2021_strategic
+entity: null
+group: scratch_distill_impala
+act_space: BasicActionSpace
+obs_space: SurvivalStrategicObs
+obs_space_kwargs: {}
+reward_space: StrategicPotentialRewardV3
+reward_space_kwargs:
+  shaping_weight: 0.015
+  decay_games: 20000
+  shaping_floor: 0.003
+  discounting: 0.999
+  max_step_shaping: 0.02
+  tile_diff_scale: 5.0
+  tile_diff_weight: 1.0
+total_steps: 5000000
+num_actors: 4
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+model_arch: survival_strategic
+n_blocks: 12
+attention_blocks: 4
+n_heads: 6
+hidden_dim: 96
+embedding_dim: 16
+n_merge_layers: 1
+normalize: false
+sum_player_embeddings: false
+use_index_select: false
+rescale_value_input: true
+rescale_se_input: true
+kernel_size: 5
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 2.0e-06
+  eps: 0.0003
+min_lr_mod: 0.1
+entropy_cost: 0.0002
+baseline_cost: 1.0
+teacher_kl_cost: 0.01
+teacher_kl_cost_start: 0.01
+teacher_kl_cost_end: 0.01
+teacher_kl_decay_steps: 100000
+teacher_kl_delay_steps: 0
+teacher_baseline_cost: 0.0
+actor_policy_tta_rot180: true
+teacher_policy_tta_rot180: true
+lmb: 0.9
+reduction: sum
+use_teacher: true
+teacher_load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/artifacts/teachers/first_place
+teacher_checkpoint_file: 062179520_weights.pt
+league_enabled: true
+league_config_version: 7
+league_opponents:
+- name: first_place
+  kind: teacher
+  weight: 0.6
+  fixed_probability: 0.5
+  config: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: selfplay
+  kind: selfplay
+  weight: 0.2
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.1
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.1
+actor_device: cuda:1
+learner_device: cuda:0
+disable_wandb: true
+model_log_freq: 100
+sharing_strategy: file_descriptor
+seed: 2021
+num_buffers: 8
+use_mixed_precision: true
+actor_mixed_precision: false
+clip_grads: 10.0
+checkpoint_freq: 120.0
+num_learner_threads: 1
+debug: false
+weights_only: true
+n_value_warmup_batches: 0
+behavior_kl_target: auto
+behavior_kl_auto_steps: 20000
+behavior_kl_dual_lr: 0.05
+behavior_kl_abort_multiplier: 4.0
+value_critic: categorical_hl_gauss
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75
+state_curriculum_enabled: true
+snapshot_start_probability: 0.3
+snapshot_pool_capacity: 2048
+snapshot_capture_interval: 16
+collision_penalty_cost: 0.005
+collision_penalty_ramp_start: 0.005
+collision_penalty_ramp_end: 0.02
+collision_penalty_ramp_steps: 50000
+reward_config_version: 6
+objective_config_version: 1
+loss_normalization: trajectory
+normalize_advantages: true
+advantage_clip: 5.0
+rule_aux_enabled: false
+rule_aux_cost: 0.02
+rule_aux_strategy: economy
+intent_aux_enabled: false
+intent_aux_cost: 0.01
+league_sampling: pfsp
+pfsp_power: 1.0
+pfsp_teacher_floor: 0.25
+pfsp_exploration: 0.05
+pfsp_prior_games: 20
+learner_snapshot_interval_steps: 500000
+teacher_kl_cost_floor: 0.01
+stop_after_step: null
+verify_model_updates: true
+lr_schedule: cosine
+load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/survival_strategic/2026-08-15/12-02-58
+checkpoint_file: 100096_weights.pt
+intent_head_only_finetune: false
+[0m
+Error executing job with overrides: ['+load_dir=/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/survival_strategic/2026-08-15/12-02-58', '+checkpoint_file=100096_weights.pt', '++total_steps=5000000', '++weights_only=true']
+Traceback (most recent call last):
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/run_monobeast.py", line 143, in main
+    train(flags)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/lux_ai/torchbeast/monobeast.py", line 1318, in train
+    actor_model = create_model(flags, flags.actor_device, teacher_model_flags=league_obs_flags, is_teacher_model=False)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/lux_ai/nns/__init__.py", line 32, in create_model
+    return _create_model(
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/lux_ai/nns/__init__.py", line 174, in _create_model
+    return model.to(device=device)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1355, in to
+    return self._apply(convert)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  [Previous line repeated 1 more time]
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 942, in _apply
+    param_applied = fn(param)
+  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/.venv/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1341, in convert
+    return t.to(
+RuntimeError: CUDA error: invalid device ordinal
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

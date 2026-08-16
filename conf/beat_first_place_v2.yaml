@@ -1,0 +1,19 @@
+defaults:
+- survival_strategic
+- _self_
+
+name: beat_first_place_v2
+
+# League: play mainly against 1st place to exploit it
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.20
+- name: first_place
+  kind: teacher
+  weight: 0.80
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+
+league_config_version: 7
+checkpoint_freq: 30.0

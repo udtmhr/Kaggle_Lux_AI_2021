@@ -1,0 +1,56 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 1, agentID: 1, name: '/tmp/lux_candidate_0019776/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2021-size-12-p1.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_0019776/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2021-size-12-p0.json',
+  seed: 2021
+}
+{
+  ranks: [
+    {
+      rank: 1,
+      agentID: 1,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    },
+    { rank: 2, agentID: 0, name: '/tmp/lux_candidate_0019776/main.py' }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2022-size-12-p0.json',
+  seed: 2022
+}
+{
+  ranks: [
+    { rank: 1, agentID: 1, name: '/tmp/lux_candidate_0019776/main.py' },
+    {
+      rank: 2,
+      agentID: 0,
+      name: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py'
+    }
+  ],
+  replayFile: '/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2022-size-12-p1.json',
+  seed: 2022
+}
+Loading environment lux_ai_s2 failed: No module named 'vec_noise'
+{"candidate_city_survival": 0.8867327117327117, "candidate_final_city_tiles": 10, "candidate_final_units": 10, "candidate_last_response_turn": 359, "candidate_player": 0, "candidate_stranded_fuel": 0.058960076799426636, "map_size": 12, "opponent": "first_place", "replay": "seed-2022-size-12-p0.json", "seed": 2022, "winner": 1}
+{"candidate_city_survival": 0.8201725308919405, "candidate_final_city_tiles": 33, "candidate_final_units": 5, "candidate_last_response_turn": 317, "candidate_player": 1, "candidate_stranded_fuel": 0.12614409617878272, "map_size": 12, "opponent": "first_place", "replay": "seed-2022-size-12-p1.json", "seed": 2022, "winner": 1}
+2 evaluation match(es) failed; successful matches were saved: seed=2021, map_size=12, candidate_player=1: Candidate stopped responding after turn 0; refusing to record this as a valid loss: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2021-size-12-p1.json; seed=2021, map_size=12, candidate_player=0: Candidate stopped responding after turn 0; refusing to record this as a valid loss: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/evaluation/step_0019776_vs_first_place/.backend_parity/official/seed-2021-size-12-p0.json

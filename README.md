@@ -51,6 +51,18 @@ uv run python run_monobeast.py --config-name survival_strategic_shaping \
   load_dir=/absolute/path/to/outputs/distill_v1 checkpoint_file=best.pt weights_only=true
 ```
 
+To train with temporal changes in relative city-tile and unit counts instead,
+start a separate run with the dedicated reward configuration:
+
+```bash
+uv run python run_monobeast.py --config-name survival_strategic_relative_counts \
+  load_dir=/absolute/path/to/outputs/distill_v1 checkpoint_file=best.pt weights_only=true
+```
+
+This uses `delta[(own - enemy) weighted counts]` for shaping, clips each step,
+decays shaping over 14,000 globally counted games, and retains the terminal
+win/draw/loss reward as the primary objective.
+
 Use `latest.pt` only to resume the same distillation run; it also contains optimizer state.
 
 Promotion evaluation must use both orientations for every seed. Store one JSON object per game with `opponent`,
