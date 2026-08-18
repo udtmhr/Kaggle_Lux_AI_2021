@@ -61,6 +61,8 @@ def create_env(
         reward_space = create_reward_space(flags, reward_game_counter=reward_game_counter)
         env = RewardSpaceWrapper(env, reward_space)
         env = env.obs_space.wrap_env(env)
+        from .wrappers import RulePriorWrapper
+        env = RulePriorWrapper(env)
         env = PadFixedShapeEnv(env)
         env = LoggingEnv(env, reward_space)
         envs.append(env)

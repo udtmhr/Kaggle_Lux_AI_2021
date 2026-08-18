@@ -35,7 +35,7 @@ def rotate_observations_180(observations: Mapping[str, torch.Tensor]) -> dict[st
 def rotate_policy_180(policy: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Rotate spatial axes and remap directional actions into the rotated frame."""
     return {
-        entity: torch.rot90(values, 2, dims=(-3, -2))[..., ROT180_ACTION_INDICES[entity]]
+        entity: torch.rot90(values, 2, dims=(-3, -2))[..., ROT180_ACTION_INDICES[entity.replace("pre_prior_", "")]]
         for entity, values in policy.items()
     }
 

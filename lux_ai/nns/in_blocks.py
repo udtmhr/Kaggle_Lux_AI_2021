@@ -47,11 +47,12 @@ class DictInputLayer(nn.Module):
     @staticmethod
     def forward(
             x: Dict[str, Union[Dict, torch.Tensor]]
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         return (x["obs"],
                 x["info"]["input_mask"],
                 x["info"]["available_actions_mask"],
-                x["info"].get("subtask_embeddings", None))
+                x["info"].get("subtask_embeddings", None),
+                x["info"].get("rule_prior", None))
 
 
 class ConvEmbeddingInputLayer(nn.Module):

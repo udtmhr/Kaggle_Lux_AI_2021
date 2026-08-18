@@ -29,7 +29,7 @@ reward_space_kwargs:
   research_scale: 200.0
 
 total_steps: 100000
-num_actors: 4
+num_actors: 2
 n_actor_envs: 16
 unroll_length: 16
 batch_size: 4
@@ -60,17 +60,19 @@ value_hl_gauss_sigma_ratio: 0.75
 # --- オプティマイザ（学習率 2e-4 固定） ---
 optimizer_class: Adam
 optimizer_kwargs:
-  lr: 0.0002
+  lr: 0.00005
   eps: 0.0003
 min_lr_mod: 1.0
 lr_schedule: cosine
 
 # --- 損失設定（Teacher / 蒸留ロスは無効化） ---
-entropy_cost: 0.0002
+entropy_cost: 0.003
 baseline_cost: 1.0
 teacher_kl_cost: 0.0
 teacher_baseline_cost: 0.0
 use_teacher: false
+
+rule_prior_alpha: 0.0
 teacher_load_dir: null
 teacher_checkpoint_file: null
 
@@ -107,7 +109,7 @@ disable_wandb: true
 model_log_freq: 100
 sharing_strategy: file_descriptor
 seed: 2021
-num_buffers: 8
+num_buffers: 4
 use_mixed_precision: true
 actor_mixed_precision: false
 clip_grads: 10.0

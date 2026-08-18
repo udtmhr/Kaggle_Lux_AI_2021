@@ -171,4 +171,6 @@ def _create_model(
         value_support_min=float(getattr(flags, "value_support_min", -2.0)),
         value_support_max=float(getattr(flags, "value_support_max", 2.0)),
     )
+    rule_prior_alpha = float(getattr(flags, "rule_prior_alpha", 0.0))
+    model.actor.rule_prior_alpha.copy_(torch.tensor(rule_prior_alpha))
     return model.to(device=device)

@@ -131,7 +131,7 @@ def main(flags: DictConfig):
     OmegaConf.save(flags, "config.yaml")
     if not flags.disable_wandb:
         wandb.init(
-            config=vars(flags),
+            config=OmegaConf.to_container(flags, resolve=True),
             project=flags.project,
             entity=flags.entity,
             group=flags.group,

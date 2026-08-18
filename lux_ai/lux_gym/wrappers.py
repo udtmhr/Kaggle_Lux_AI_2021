@@ -11,6 +11,39 @@ from .reward_spaces import BaseRewardSpace
 from ..utility_constants import MAX_BOARD_SIZE
 
 
+class RulePriorWrapper(gym.Wrapper):
+    def __init__(self, env: LuxEnv):
+        super(RulePriorWrapper, self).__init__(env)
+        from .rule_prior import RulePriorEngine
+        self.rule_prior_engine = RulePriorEngine()
+
+    def info(self, info: Dict[str, Union[Dict, np.ndarray]]) -> Dict[str, np.ndarray]:
+        info = copy.copy(info)
+        game_state = self.env.unwrapped.game_state
+        board_dims = self.env.unwrapped.board_dims
+        pos_to_unit_dict = self.env.unwrapped.pos_to_unit_dict
+        pos_to_city_tile_dict = self.env.unwrapped.pos_to_city_tile_dict
+        available_actions_mask = info["available_actions_mask"]
+
+        rule_prior = self.rule_prior_engine.compute(
+            game_state,
+            board_dims,
+            pos_to_unit_dict,
+            pos_to_city_tile_dict,
+            available_actions_mask,
+        )
+        info["rule_prior"] = rule_prior
+        return info
+
+    def reset(self, **kwargs):
+        obs, reward, done, info = super(RulePriorWrapper, self).reset(**kwargs)
+        return obs, reward, done, self.info(info)
+
+    def step(self, action):
+        obs, reward, done, info = super(RulePriorWrapper, self).step(action)
+        return obs, reward, done, self.info(info)
+
+
 class PadFixedShapeEnv(gym.Wrapper):
     def __init__(self, env: gym.Env, max_board_size: Tuple[int, int] = MAX_BOARD_SIZE):
         super(PadFixedShapeEnv, self).__init__(env)

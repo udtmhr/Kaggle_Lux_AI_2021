@@ -46,12 +46,14 @@ class DictActor(nn.Module):
                 (1, 1)
             ) for key, n_act in self.n_actions.items()
         })
+        self.register_buffer('rule_prior_alpha', torch.tensor(0.0))
 
     def forward(
             self,
             x: torch.Tensor,
             available_actions_mask: Dict[str, torch.Tensor],
             sample: bool,
+            rule_prior: Optional[Dict[str, torch.Tensor]] = None,
             actions_per_square: Optional[int] = MAX_OVERLAPPING_ACTIONS
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
@@ -67,8 +69,8 @@ class DictActor(nn.Module):
             logits = actor(x).view(b // 2, 2, n_actions, *action_plane_shape, h, w)
             # Move the logits dimension to the end and swap the player and channel dimensions
             logits = logits.permute(0, 3, 1, 4, 5, 2).contiguous()
-            # In case all actions are masked, unmask all actions
-            # We first have to cast it to an int tensor to avoid errors in kaggle environment
+
+            # First, compute mask adder for invalid actions
             aam = available_actions_mask[key]
             orig_dtype = aam.dtype
             aam_new_type = aam.to(dtype=torch.int64)
@@ -77,12 +79,20 @@ class DictActor(nn.Module):
                 torch.ones_like(aam_new_type),
                 aam_new_type.to(dtype=torch.int64)
             ).to(orig_dtype)
-            assert logits.shape == aam_filled.shape
-            logits = logits + torch.where(
+            mask_adder = torch.where(
                 aam_filled,
                 torch.zeros_like(logits),
                 torch.zeros_like(logits) + float("-inf")
             )
+
+            # Store pre-prior logits with the mask applied
+            policy_logits_out[f"pre_prior_{key}"] = logits + mask_adder
+
+            if rule_prior is not None and key in rule_prior:
+                logits = logits + self.rule_prior_alpha * rule_prior[key]
+
+            logits = logits + mask_adder
+            
             actions = DictActor.logits_to_actions(logits.view(-1, n_actions), sample, actions_per_square)
             policy_logits_out[key] = logits
             actions_out[key] = actions.view(*logits.shape[:-1], -1)
@@ -294,7 +304,7 @@ class BasicActorCriticNetwork(nn.Module):
             sample: bool = True,
             **actor_kwargs
     ) -> Dict[str, Any]:
-        x, input_mask, available_actions_mask, subtask_embeddings = self.dict_input_layer(x)
+        x, input_mask, available_actions_mask, subtask_embeddings, rule_prior = self.dict_input_layer(x)
         base_out, input_mask = self.base_model((x, input_mask))
         if subtask_embeddings is not None:
             subtask_embeddings = torch.repeat_interleave(subtask_embeddings, 2, dim=0)
@@ -302,6 +312,7 @@ class BasicActorCriticNetwork(nn.Module):
             self.actor_base(base_out),
             available_actions_mask=available_actions_mask,
             sample=sample,
+            rule_prior=rule_prior,
             **actor_kwargs
         )
         baseline_output = self.baseline(self.baseline_base(base_out), input_mask, subtask_embeddings)

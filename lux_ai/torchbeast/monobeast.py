@@ -230,8 +230,11 @@ def compute_policy_gradient_loss(
     advantages: torch.Tensor,
     reduction: str,
     trajectory_weights: Optional[torch.Tensor] = None,
+    action_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     cross_entropy = -action_log_probs.view_as(advantages)
+    if action_counts is not None:
+        cross_entropy = cross_entropy / action_counts.clamp_min(1.0)
     losses = cross_entropy * advantages.detach()
     if trajectory_weights is not None:
         return trajectory_weighted_mean(losses, trajectory_weights)
@@ -346,6 +349,10 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
         if not getattr(flags, "actor_policy_tta_rot180", False):
             output = actor_model(env_output)
             output.pop("baseline_logits", None)
+            if "policy_logits" in output:
+                for k in list(output["policy_logits"].keys()):
+                    if k.startswith("pre_prior_"):
+                        del output["policy_logits"][k]
             return output
         output = rot180_ensemble_outputs(actor_model, env_output)
     output["actions"] = {
@@ -355,8 +362,13 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
             actions_per_square=MAX_OVERLAPPING_ACTIONS,
         ).view(*logits.shape[:-1], -1)
         for entity, logits in output["policy_logits"].items()
+        if not entity.startswith("pre_prior_")
     }
     output.pop("baseline_logits", None)
+    if "policy_logits" in output:
+        for k in list(output["policy_logits"].keys()):
+            if k.startswith("pre_prior_"):
+                del output["policy_logits"][k]
     return output
 
 
@@ -854,6 +866,7 @@ def learn(
             combined_forward_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
             combined_reverse_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
             behavior_kl_counts = torch.zeros_like(combined_behavior_action_log_probs)
+            stats = {}
             for act_space in batch["actions"].keys():
                 actions = batch["actions"][act_space]
                 actions_taken_mask = batch["info"]["actions_taken"][act_space]
@@ -865,6 +878,8 @@ def learn(
                 combined_behavior_action_log_probs = combined_behavior_action_log_probs + behavior_action_log_probs
 
                 learner_policy_logits = learner_outputs["policy_logits"][act_space]
+                pre_prior_logits = learner_outputs["policy_logits"].get(f"pre_prior_{act_space}", learner_policy_logits)
+                
                 learner_action_log_probs = combine_policy_logits_to_log_probs(
                     learner_policy_logits, actions, actions_taken_mask
                 )
@@ -906,6 +921,15 @@ def learn(
                     (normalized_entropy_sum / active_count.clamp_min(1)).detach().cpu().item()
                 )
                 active_entity_counts[act_space] = int(active_count.detach().cpu().item())
+                
+                # pre_prior entropy
+                pre_prior_entropy_sum, _ = masked_normalized_entropy(
+                    pre_prior_logits, any_actions_taken
+                )
+                stats.setdefault("Entropy_PrePrior", {})[act_space] = float(
+                    (pre_prior_entropy_sum / active_count.clamp_min(1)).detach().cpu().item()
+                )
+
                 forward_kl, kl_counts = masked_policy_kl(
                     learner_policy_logits, behavior_policy_logits, any_actions_taken, reverse=False
                 )
@@ -915,6 +939,35 @@ def learn(
                 combined_forward_behavior_kl += forward_kl
                 combined_reverse_behavior_kl += reverse_kl
                 behavior_kl_counts += kl_counts
+                
+                # Top1 Prob and Margins
+                if int(active_count) > 0:
+                    probs = F.softmax(learner_policy_logits, dim=-1)
+                    top2_probs, _ = torch.topk(probs, 2, dim=-1)
+                    top1_prob = top2_probs[..., 0]
+                    top2_prob = top2_probs[..., 1]
+                    margin = top1_prob - top2_prob
+                    
+                    active_top1 = top1_prob[any_actions_taken]
+                    active_margin = margin[any_actions_taken]
+                    
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_mean"] = float(active_top1.mean().cpu().item())
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_p95"] = float(torch.quantile(active_top1, 0.95).cpu().item())
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_top2_margin"] = float(active_margin.mean().cpu().item())
+                    stats.setdefault("Policy", {})[f"{act_space}_logits_abs_max"] = float(learner_policy_logits[any_actions_taken].abs().max().cpu().item())
+                    
+                    # Rule Prior explicit stats
+                    if "rule_prior" in batch and act_space in batch["rule_prior"]:
+                        prior = batch["rule_prior"][act_space]
+                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_mean"] = float(prior[any_actions_taken].abs().mean().cpu().item())
+                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_max"] = float(prior[any_actions_taken].abs().max().cpu().item())
+                
+                # Delta logp per entity
+                if int(active_count) > 0:
+                    delta_logp = learner_action_log_probs - behavior_action_log_probs
+                    active_delta = delta_logp[delta_logp != 0]
+                    if active_delta.numel() > 0:
+                        stats.setdefault("Behavior_Policy", {})[f"{act_space}_delta_logp_p05"] = float(torch.quantile(active_delta, 0.05).cpu().item())
 
             discounts = (~batch["done"]).float() * flags.discounting
             discounts = discounts.unsqueeze(-1).expand_as(combined_behavior_action_log_probs)
@@ -965,6 +1018,7 @@ def learn(
                 vtrace_advantages,
                 reduction=flags.reduction,
                 trajectory_weights=action_counts if trajectory_normalize else None,
+                action_counts=action_counts,
             )
             upgo_clipped_importance = torch.minimum(
                 vtrace_returns.log_rhos.exp(), torch.ones_like(vtrace_returns.log_rhos)
@@ -974,6 +1028,7 @@ def learn(
                 upgo_clipped_importance * upgo_advantages,
                 reduction=flags.reduction,
                 trajectory_weights=action_counts if trajectory_normalize else None,
+                action_counts=action_counts,
             )
             if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss":
                 baseline_loss = compute_categorical_baseline_loss(
@@ -1120,7 +1175,79 @@ def learn(
                     }
 
             total_games_played += batch["done"].sum().item()
-            stats = {
+            
+            _log_rhos = vtrace_returns.log_rhos.detach().float()
+            _N_t = action_counts.detach().float()
+            _N_t_clamp = _N_t.clamp_min(1)
+            _geomean_log_rhos = _log_rhos / _N_t_clamp
+            
+            _N_t_flat = _N_t.flatten()
+            _abs_log_rhos_flat = _log_rhos.abs().flatten()
+            _N_t_mean = _N_t_flat.mean()
+            _abs_log_rhos_mean = _abs_log_rhos_flat.mean()
+            _corr_num = torch.sum((_N_t_flat - _N_t_mean) * (_abs_log_rhos_flat - _abs_log_rhos_mean))
+            _corr_den = torch.sqrt(torch.sum((_N_t_flat - _N_t_mean)**2) * torch.sum((_abs_log_rhos_flat - _abs_log_rhos_mean)**2)) + 1e-8
+            _corr_N_abs_log_rho = float((_corr_num / _corr_den).cpu().item())
+            
+            # --- Reward Analysis ---
+            _done_mask = batch["done"].unsqueeze(-1).expand_as(batch["reward"])
+            _terminal_rewards = torch.where(
+                _done_mask,
+                torch.round(batch["reward"]),
+                torch.zeros_like(batch["reward"])
+            )
+            _shaping_rewards = batch["reward"] - _terminal_rewards
+            
+            _num_dones = max(1, int(batch["done"].sum().item()))
+            _shaping_sum_all_abs = float(_shaping_rewards.abs().sum().item())
+            _shaping_episode_sum = _shaping_sum_all_abs / (_num_dones * 2)
+            _terminal_abs_mean = float(_terminal_rewards[_done_mask].abs().mean().item()) if batch["done"].any() else 0.0
+            _shaping_to_terminal_ratio = abs(_shaping_episode_sum) / 1.0
+
+            _shaping_active = _shaping_rewards[_shaping_rewards != 0]
+            _potential_mean = float(_shaping_active.mean().item() / 0.05) if _shaping_active.numel() > 0 else 0.0
+            _potential_std = float(_shaping_active.std().item() / 0.05) if _shaping_active.numel() > 1 else 0.0
+            _potential_delta_p95 = float(torch.quantile(_shaping_active.abs(), 0.95).item() / 0.05) if _shaping_active.numel() > 0 else 0.0
+            
+            # --- Advantage Analysis ---
+            _active_adv = vtrace_advantages[action_counts > 0]
+            _adv_std = float(_active_adv.std().item()) if _active_adv.numel() > 1 else 0.0
+            _adv_p01 = float(torch.quantile(_active_adv, 0.01).item()) if _active_adv.numel() > 0 else 0.0
+            _adv_p05 = float(torch.quantile(_active_adv, 0.05).item()) if _active_adv.numel() > 0 else 0.0
+            _adv_p50 = float(torch.quantile(_active_adv, 0.50).item()) if _active_adv.numel() > 0 else 0.0
+            _adv_p95 = float(torch.quantile(_active_adv.abs(), 0.95).item()) if _active_adv.numel() > 0 else 0.0
+            _adv_p99 = float(torch.quantile(_active_adv.abs(), 0.99).item()) if _active_adv.numel() > 0 else 0.0
+            _adv_max_abs = float(_active_adv.abs().max().item()) if _active_adv.numel() > 0 else 0.0
+            _adv_clipped_fraction = float((_active_adv.abs() >= 4.9).float().mean().item()) if _active_adv.numel() > 0 else 0.0
+
+            # --- Policy Gradient ---
+            _N_t_active = action_counts[action_counts > 0]
+            _effective_action_count = float(_N_t_active.mean().item()) if _N_t_active.numel() > 0 else 0.0
+            _abs_adv_times_N = float((_active_adv.abs() * _N_t_active).mean().item()) if _N_t_active.numel() > 0 else 0.0
+
+            stats.update({
+                "Reward": {
+                    "shaping_episode_sum": _shaping_episode_sum,
+                    "terminal": _terminal_abs_mean,
+                    "shaping_to_terminal_ratio": _shaping_to_terminal_ratio,
+                    "potential_mean": _potential_mean,
+                    "potential_std": _potential_std,
+                    "potential_delta_p95": _potential_delta_p95,
+                },
+                "Advantage": {
+                    "std": _adv_std,
+                    "p01": _adv_p01,
+                    "p05": _adv_p05,
+                    "p50": _adv_p50,
+                    "p95": _adv_p95,
+                    "p99": _adv_p99,
+                    "max_abs": _adv_max_abs,
+                    "clipped_fraction": _adv_clipped_fraction,
+                },
+                "PolicyGradient": {
+                    "effective_action_count": _effective_action_count,
+                    "abs_advantage_times_decision_count": _abs_adv_times_N,
+                },
                 "Env": {
                     key[8:]: val[batch["done"]][~val[batch["done"]].isnan()].mean().item()
                     for key, val in batch["info"].items()
@@ -1148,10 +1275,22 @@ def learn(
                     "beta": behavior_kl_controller.beta if behavior_kl_controller is not None else 0.0,
                     "target": behavior_kl_controller.target if behavior_kl_controller is not None else None,
                     "ema_kl": behavior_kl_controller.ema_kl if behavior_kl_controller is not None else None,
-                    "log_rho_mean": float(vtrace_returns.log_rhos.mean().detach().cpu().item()),
-                    "log_rho_p95": float(torch.quantile(vtrace_returns.log_rhos.detach().float(), 0.95).cpu().item()),
-                    "log_rho_max": float(vtrace_returns.log_rhos.max().detach().cpu().item()),
-                    "vtrace_rho_clipped_fraction": float((vtrace_returns.log_rhos > 0).float().mean().cpu().item()),
+                    "log_rho_mean": float(_log_rhos.mean().cpu().item()),
+                    "log_rho_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
+                    "log_rho_max": float(_log_rhos.max().cpu().item()),
+                    "vtrace_rho_clipped_fraction": float((_log_rhos > 0).float().mean().cpu().item()),
+                    "decision_count_mean": float(_N_t.mean().cpu().item()),
+                    "decision_count_p95": float(torch.quantile(_N_t, 0.95).cpu().item()),
+                    "abs_log_rho_per_action": float(_geomean_log_rhos.abs().mean().cpu().item()),
+                    "geomean_log_rho_mean": float(_geomean_log_rhos.mean().cpu().item()),
+                    "geomean_log_rho_p05": float(torch.quantile(_geomean_log_rhos, 0.05).cpu().item()),
+                    "geomean_log_rho_p50": float(torch.quantile(_geomean_log_rhos, 0.50).cpu().item()),
+                    "geomean_log_rho_p95": float(torch.quantile(_geomean_log_rhos, 0.95).cpu().item()),
+                    "delta_logp_p01": float(torch.quantile(_log_rhos, 0.01).cpu().item()),
+                    "delta_logp_p05": float(torch.quantile(_log_rhos, 0.05).cpu().item()),
+                    "delta_logp_p50": float(torch.quantile(_log_rhos, 0.50).cpu().item()),
+                    "delta_logp_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
+                    "corr_N_abs_log_rho": _corr_N_abs_log_rho,
                     "learner_version": int(learner_step),
                     "actor_version_min": int(batch["policy_version"].min().cpu().item()),
                     "actor_version_max": int(batch["policy_version"].max().cpu().item()),
@@ -1192,7 +1331,7 @@ def learn(
                         for opponent_index, opponent in enumerate(flags.league_opponents)
                     },
                 },
-            }
+            })
 
             optimizer.zero_grad()
             if flags.use_mixed_precision:
