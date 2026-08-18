@@ -9,6 +9,7 @@ from .lux_gym import ACT_SPACES_DICT, OBS_SPACES_DICT, REWARD_SPACES_DICT
 from .strategic_rl.obs import SurvivalStrategicObs
 from .strategic_rl.reward import (
     RelativeCountPotentialReward,
+    RelativeDifferencePotentialReward,
     StrategicPotentialRewardV2,
     StrategicPotentialRewardV3,
     SurvivalPotentialReward,
@@ -22,6 +23,7 @@ def flags_to_namespace(flags: Dict) -> SimpleNamespace:
     OBS_SPACES_DICT.setdefault("SurvivalStrategicObs", SurvivalStrategicObs)
     REWARD_SPACES_DICT.setdefault("SurvivalPotentialReward", SurvivalPotentialReward)
     REWARD_SPACES_DICT.setdefault("RelativeCountPotentialReward", RelativeCountPotentialReward)
+    REWARD_SPACES_DICT.setdefault("RelativeDifferencePotentialReward", RelativeDifferencePotentialReward)
     REWARD_SPACES_DICT.setdefault("StrategicPotentialRewardV2", StrategicPotentialRewardV2)
     REWARD_SPACES_DICT.setdefault("StrategicPotentialRewardV3", StrategicPotentialRewardV3)
 

@@ -1,0 +1,124 @@
+defaults:
+- override hydra/job_logging: colorlog
+- override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: ./outputs/survival_strategic_pbrs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+name: survival_strategic_relative_difference_scratch
+project: Lux_AI_2021_strategic
+entity: null
+group: pbrs_scratch_impala
+
+# --- 環境・報酬設定 ---
+act_space: BasicActionSpace
+obs_space: SurvivalStrategicObs
+obs_space_kwargs: {}
+
+reward_space: RelativeDifferencePotentialReward
+reward_space_kwargs:
+  city_weight: 1.0
+  unit_weight: 0.2
+  research_weight: 0.05
+  fuel_weight: 0.1
+  shaping_weight: 0.05
+  discounting: 0.999
+  city_scale: 10.0
+  unit_scale: 10.0
+  research_scale: 200.0
+
+total_steps: 100000
+num_actors: 4
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+
+# --- モデルアーキテクチャ（v10と同一） ---
+model_arch: survival_strategic
+n_blocks: 12
+attention_blocks: 4
+n_heads: 6
+hidden_dim: 96
+embedding_dim: 16
+n_merge_layers: 1
+normalize: false
+sum_player_embeddings: false
+use_index_select: false
+rescale_value_input: true
+rescale_se_input: true
+kernel_size: 5
+
+# --- 価値関数（Categorical HL-Gauss / v10と同一） ---
+value_critic: categorical_hl_gauss
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75
+
+# --- オプティマイザ（学習率 2e-4 固定） ---
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 0.0002
+  eps: 0.0003
+min_lr_mod: 1.0
+lr_schedule: cosine
+
+# --- 損失設定（Teacher / 蒸留ロスは無効化） ---
+entropy_cost: 0.0002
+baseline_cost: 1.0
+teacher_kl_cost: 0.0
+teacher_baseline_cost: 0.0
+use_teacher: false
+teacher_load_dir: null
+teacher_checkpoint_file: null
+
+# 補助ロス・追加ロス無効
+rule_aux_enabled: false
+intent_aux_enabled: false
+intent_head_only_finetune: false
+
+# 重みロードなし（スクラッチ初期化）
+load_dir: null
+checkpoint_file: null
+
+# --- Selfplay / League設定（Teacherなし、自己対戦＋スナップショット対戦） ---
+league_enabled: true
+league_config_version: 1
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.6
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.2
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.2
+learner_snapshot_interval_steps: 500000
+
+# --- その他共通設定 ---
+actor_device: cuda
+learner_device: cuda
+disable_wandb: true
+model_log_freq: 100
+sharing_strategy: file_descriptor
+seed: 2021
+num_buffers: 8
+use_mixed_precision: true
+actor_mixed_precision: false
+clip_grads: 10.0
+checkpoint_freq: 120.0
+num_learner_threads: 1
+debug: false
+weights_only: true
+n_value_warmup_batches: 0
+actor_policy_tta_rot180: true
+lmb: 0.9
+reduction: sum
+loss_normalization: trajectory
+normalize_advantages: true
+advantage_clip: 5.0
