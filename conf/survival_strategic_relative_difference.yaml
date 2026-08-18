@@ -28,7 +28,7 @@ reward_space_kwargs:
   unit_scale: 10.0
   research_scale: 200.0
 
-total_steps: 100000
+total_steps: 1000000
 num_actors: 2
 n_actor_envs: 16
 unroll_length: 16
@@ -60,10 +60,12 @@ value_hl_gauss_sigma_ratio: 0.75
 # --- オプティマイザ（学習率 2e-4 固定） ---
 optimizer_class: Adam
 optimizer_kwargs:
-  lr: 0.00005
+  lr: 1e-4
   eps: 0.0003
-min_lr_mod: 1.0
+
 lr_schedule: cosine
+min_lr_mod: 0.2
+n_value_warmup_batches: 1500
 
 # --- 損失設定（Teacher / 蒸留ロスは無効化） ---
 entropy_cost: 0.001
@@ -117,7 +119,6 @@ checkpoint_freq: 120.0
 num_learner_threads: 1
 debug: false
 weights_only: true
-n_value_warmup_batches: 0
 actor_policy_tta_rot180: false
 lmb: 0.9
 reduction: sum

@@ -1239,23 +1239,33 @@ def learn(
             for act_space in batch["actions"].keys():
                 _actions = batch["actions"][act_space][..., 0]
                 _mask = batch["info"]["actions_taken"][act_space].any(dim=-1)
-                _legal_mask = batch["info"]["actions_taken"][act_space]
+                _legal_mask = batch["info"]["available_actions_mask"][act_space]
                 
+                _can_act_mask = _mask & _legal_mask[..., 1:].any(dim=-1)
                 total_taken = _mask.sum().float().item()
+                total_can_act = _can_act_mask.sum().float().item()
+
                 if total_taken > 0:
                     for action_idx, action_name in enumerate(ACTION_MEANINGS[act_space]):
                         _this_action_mask = _mask & (_actions == action_idx)
                         _count = _this_action_mask.sum().float().item()
                         _rate = _count / total_taken
                         
-                        _this_legal_mask = _legal_mask[..., action_idx]
+                        _this_legal_mask = _mask & _legal_mask[..., action_idx]
                         _legal_count = _this_legal_mask.sum().float().item()
                         _rate_legal = _count / _legal_count if _legal_count > 0 else 0.0
+                        
+                        _this_action_can_act_mask = _can_act_mask & (_actions == action_idx)
+                        _count_can_act = _this_action_can_act_mask.sum().float().item()
+                        _rate_can_act = _count_can_act / total_can_act if total_can_act > 0 else 0.0
                         
                         stats.setdefault("ActionRate", {})[f"{act_space}_{action_name}"] = stats.get("ActionRate", {}).get(f"{act_space}_{action_name}", 0.0) + _rate
                         
                         if _legal_count > 0:
                             stats.setdefault("ActionRateLegal", {})[f"{act_space}_{action_name}"] = stats.get("ActionRateLegal", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_legal
+                            
+                        if total_can_act > 0:
+                            stats.setdefault("ActionRateCanAct", {})[f"{act_space}_{action_name}"] = stats.get("ActionRateCanAct", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_can_act
                         
                         if _count > 0:
                             _adv_for_action = _adv_expanded.expand_as(_this_action_mask)[_this_action_mask]
