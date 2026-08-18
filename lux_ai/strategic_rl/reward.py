@@ -377,3 +377,328 @@ class StrategicPotentialRewardV3(StrategicPotentialRewardV2):
             rewards = tuple(np.clip(rewards_list, -1.0, 1.0))
             
         return rewards, done
+
+import numpy as np
+from scipy.stats import rankdata
+
+
+class RelativeDifferencePotentialReward(BaseRewardSpace):
+    """
+    相対状態に基づく Potential-Based Reward Shaping (PBRS)
+
+    Φ(s) =
+        w_city     * D_city
+      + w_unit     * D_unit
+      + w_research * D_research
+      + w_fuel     * D_fuel_safety
+
+    shaping:
+        F_t = gamma * Φ(s_{t+1}) - Φ(s_t)
+
+    final reward:
+        r_t = r_original + shaping_weight * F_t
+
+    ※ gamma は IMPALA の discount と必ず一致させる。
+    """
+
+    DAY_LENGTH = 30
+    NIGHT_LENGTH = 10
+    CYCLE_LENGTH = 40
+    MAX_TURNS = 360
+
+    def __init__(
+        self,
+        city_weight: float = 1.0,
+        unit_weight: float = 0.2,
+        research_weight: float = 0.05,
+        fuel_weight: float = 0.1,
+        shaping_weight: float = 0.05,
+        discounting: float = 0.999,
+
+        # 各特徴量を概ね同程度のスケールにする
+        city_scale: float = 10.0,
+        unit_scale: float = 10.0,
+        research_scale: float = 200.0,
+
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.city_weight = float(city_weight)
+        self.unit_weight = float(unit_weight)
+        self.research_weight = float(research_weight)
+        self.fuel_weight = float(fuel_weight)
+
+        self.shaping_weight = float(shaping_weight)
+        self.discounting = float(discounting)
+
+        self.city_scale = float(city_scale)
+        self.unit_scale = float(unit_scale)
+        self.research_scale = float(research_scale)
+
+        self.previous_potential = np.zeros(2, dtype=np.float64)
+        self.initialized = False
+
+    @staticmethod
+    def get_reward_spec() -> RewardSpec:
+        # clipしないので ±1 より少し広くする
+        return RewardSpec(-2.0, 2.0, True, False)
+
+    # ---------------------------------------------------------
+    # Fuel safety
+    # ---------------------------------------------------------
+
+    def _night_turns_to_survive(self, turn: int) -> int:
+        """
+        現在の状態から、次に考慮すべき夜の残りターン数。
+
+        昼:
+            次の夜10ターンを生き残れるか評価
+
+        夜:
+            現在の夜の残りターンを評価
+        """
+
+        cycle_turn = turn % self.CYCLE_LENGTH
+
+        if cycle_turn < self.DAY_LENGTH:
+            # 昼 → 次の夜全体を考える
+            night_turns = self.NIGHT_LENGTH
+        else:
+            # 夜 → 現在の夜の残り
+            night_turns = self.CYCLE_LENGTH - cycle_turn
+
+        # ゲーム終了を超えない
+        remaining_game_turns = max(0, self.MAX_TURNS - turn)
+
+        return min(night_turns, remaining_game_turns)
+
+    def _fuel_safety(self, player, turn: int) -> float:
+        """
+        Player全体のCity Fuel Safetyを 0〜1 で返す。
+
+        各Cityについて
+
+            safety = min(
+                fuel / (upkeep * night_turns),
+                1.0
+            )
+
+        とし、City Tile数で重み付き平均する。
+
+        0.0:
+            次の夜をほぼ生き残れない
+
+        1.0:
+            全Cityが次の夜を生存可能
+
+        fuelを必要以上に貯めても1.0以上にはしない。
+        """
+
+        if len(player.cities) == 0:
+            return 0.0
+
+        night_turns = self._night_turns_to_survive(turn)
+
+        if night_turns <= 0:
+            return 1.0
+
+        weighted_safety = 0.0
+        total_city_tiles = 0
+
+        for city in player.cities.values():
+
+            # LuxのCity adjacencyを考慮した実際のupkeep
+            upkeep = float(city.get_light_upkeep())
+
+            # Frameworkにより citytiles / city_tiles の可能性があるので
+            # 実装に合わせてここは調整
+            if hasattr(city, "citytiles"):
+                tile_count = len(city.citytiles)
+            elif hasattr(city, "city_tiles"):
+                tile_count = len(city.city_tiles)
+            else:
+                tile_count = 1
+
+            required_fuel = upkeep * night_turns
+
+            if required_fuel <= 0:
+                safety = 1.0
+            else:
+                safety = np.clip(
+                    float(city.fuel) / required_fuel,
+                    0.0,
+                    1.0,
+                )
+
+            weighted_safety += safety * tile_count
+            total_city_tiles += tile_count
+
+        if total_city_tiles == 0:
+            return 0.0
+
+        return weighted_safety / total_city_tiles
+
+    # ---------------------------------------------------------
+    # Potential
+    # ---------------------------------------------------------
+
+    def _potential(self, game_state) -> np.ndarray:
+
+        players = game_state.players
+
+        cities = np.array(
+            [p.city_tile_count for p in players],
+            dtype=np.float64,
+        )
+
+        units = np.array(
+            [len(p.units) for p in players],
+            dtype=np.float64,
+        )
+
+        research = np.array(
+            [p.research_points for p in players],
+            dtype=np.float64,
+        )
+
+        fuel_safety = np.array(
+            [
+                self._fuel_safety(p, game_state.turn)
+                for p in players
+            ],
+            dtype=np.float64,
+        )
+
+        # -----------------------------------------------------
+        # 正規化
+        # -----------------------------------------------------
+
+        cities /= self.city_scale
+        units /= self.unit_scale
+        research /= self.research_scale
+
+        # fuel_safety は既に 0〜1
+        # -----------------------------------------------------
+
+        # 2人対戦なので
+        # player0: self0 - enemy1
+        # player1: self1 - enemy0
+
+        d_city = cities - cities[::-1]
+        d_unit = units - units[::-1]
+        d_research = research - research[::-1]
+        d_fuel = fuel_safety - fuel_safety[::-1]
+
+        phi = (
+            self.city_weight * d_city
+            + self.unit_weight * d_unit
+            + self.research_weight * d_research
+            + self.fuel_weight * d_fuel
+        )
+
+        return phi
+
+    # ---------------------------------------------------------
+    # Episode reset
+    # ---------------------------------------------------------
+
+    def reset(self, initial_game_state=None):
+        """
+        可能なら環境reset直後、最初のactionを実行する前に
+
+            reward_space.reset(game_state)
+
+        と呼ぶ。
+
+        これにより s0 -> s1 のPBRSも失わない。
+        """
+
+        self.previous_potential[:] = 0.0
+        self.initialized = False
+
+        if initial_game_state is not None:
+            self.previous_potential = self._potential(initial_game_state)
+            self.initialized = True
+
+    # ---------------------------------------------------------
+    # Reward
+    # ---------------------------------------------------------
+
+    def compute_rewards_and_done(self, game_state, done):
+
+        potential = self._potential(game_state)
+
+        # -----------------------------------------------------
+        # 初期状態
+        # -----------------------------------------------------
+
+        if not self.initialized:
+
+            # 本来は reset(initial_state) で初期化するのが望ましい。
+            # それができない場合のfallback。
+            self.previous_potential = potential.copy()
+            self.initialized = True
+
+            shaping = np.zeros(2, dtype=np.float64)
+
+        # -----------------------------------------------------
+        # Terminal
+        # -----------------------------------------------------
+
+        elif done:
+
+            # Φ(terminal) = 0 と定義
+            #
+            # F_t =
+            # gamma * Φ(terminal) - Φ(previous)
+            # = -Φ(previous)
+
+            shaping = -self.previous_potential
+
+        # -----------------------------------------------------
+        # Normal transition
+        # -----------------------------------------------------
+
+        else:
+
+            shaping = (
+                self.discounting * potential
+                - self.previous_potential
+            )
+
+        rewards = self.shaping_weight * shaping
+
+        # -----------------------------------------------------
+        # 勝敗報酬
+        # -----------------------------------------------------
+
+        if done:
+
+            terminal = np.array(
+                [
+                    int(GameResultReward.compute_player_reward(p))
+                    for p in game_state.players
+                ],
+                dtype=np.float64,
+            )
+
+            # win  -> +1
+            # lose -> -1
+            # draw -> 0
+
+            terminal_reward = (
+                (rankdata(terminal) - 1.0) * 2.0 - 1.0
+            )
+
+            rewards += terminal_reward
+
+            # 次episode用
+            self.previous_potential[:] = 0.0
+            self.initialized = False
+
+        else:
+            self.previous_potential = potential.copy()
+
+        # PBRSの理論的性質を維持するためclipしない
+        return tuple(rewards), done
