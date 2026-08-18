@@ -1,9 +1,0 @@
-=== Agent Install Log ===
-=== Agent Compile Log ===
-=== Agent Error Log ===
-Traceback (most recent call last):
-  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/public_agents/working_title_bot_tong_hui_kang/main.py", line 3, in <module>
-    from agent import agent
-  File "/home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/internal_testing/public_agents/working_title_bot_tong_hui_kang/agent.py", line 5, in <module>
-    import numpy as np
-ModuleNotFoundError: No module named 'numpy'

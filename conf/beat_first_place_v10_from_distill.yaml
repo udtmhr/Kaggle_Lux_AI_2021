@@ -1,0 +1,44 @@
+defaults:
+- survival_strategic_strength_v10_curriculum_1gpu
+- _self_
+
+name: beat_first_place_v10_from_distill
+group: scratch_distill_impala
+
+# Start from the distilled checkpoint
+load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/distill_v10_firstplace
+checkpoint_file: best.pt
+weights_only: true
+checkpoint_freq: 5.0
+total_steps: 2500000
+
+# Warm up the value function because it is broken after distillation
+n_value_warmup_batches: 1500
+
+# Focus explicitly on the 1st place opponent
+league_sampling: fixed
+league_config_version: 100
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.20
+- name: first_place
+  kind: teacher
+  weight: 0.80
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+
+# Use the 11-24 (1st place) model as the KL teacher to match the league opponent's observation space
+use_teacher: true
+teacher_load_dir: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+teacher_checkpoint_file: 062179520_weights.pt
+teacher_kl_cost: 0.005
+teacher_kl_cost_start: 0.005
+teacher_kl_cost_end: 0.005
+teacher_kl_cost_floor: 0.005
+teacher_kl_decay_steps: 1000000
+
+# Disable collision penalty to prevent agent from learning to not move
+collision_penalty_cost: 0.0
+collision_penalty_ramp_start: 0.0
+collision_penalty_ramp_end: 0.0

@@ -19,3 +19,10 @@ league_opponents:
   weight: 0.80
   config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
   checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+
+# Prevent policy collapse by enforcing KL divergence penalty against the original v10 policy
+use_teacher: true
+teacher_load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/survival_strategic/2026-08-15/23-58-20
+teacher_checkpoint_file: 1500160_weights.pt
+teacher_kl_cost: 0.005
+

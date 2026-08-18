@@ -1,7 +1,0 @@
-=== Agent Install Log ===
-=== Agent Compile Log ===
-=== Agent Error Log ===
-Traceback (most recent call last):
-  File "/tmp/lux_candidate_0019776/main.py", line 5, in <module>
-    import kaggle_environments
-ModuleNotFoundError: No module named 'kaggle_environments'

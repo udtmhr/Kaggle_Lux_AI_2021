@@ -1,8 +1,11 @@
 from contextlib import redirect_stdout
 import io
 # Silence "Loading environment football failed: No module named 'gfootball'" message
-with redirect_stdout(io.StringIO()):
-    import kaggle_environments
+try:
+    with redirect_stdout(io.StringIO()):
+        import kaggle_environments
+except ImportError:
+    pass
 from typing import Dict
 from lux_ai.rl_agent.rl_agent import agent
 # from lux_ai.handcrafted_agents.needs_name_v0 import agent

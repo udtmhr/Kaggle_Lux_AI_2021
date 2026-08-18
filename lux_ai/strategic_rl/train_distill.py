@@ -170,6 +170,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=2021)
+    parser.add_argument("--load-weights", type=Path, default=None, help="Path to checkpoint weights to start from")
     return parser.parse_args()
 
 
@@ -183,8 +184,14 @@ def main():
     device = torch.device(args.device)
     flags, config_values = _load_flags(args.config, args.device)
     model = create_model(flags, device)
-    # Deliberately no checkpoint load: the student always starts from this seeded random initialization.
-    initial_digest = hashlib_state_dict(model.state_dict())
+    if args.load_weights:
+        print(f"Loading weights from {args.load_weights}")
+        checkpoint = torch.load(args.load_weights, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        initial_digest = hashlib_state_dict(model.state_dict())
+    else:
+        # Deliberately no checkpoint load: the student always starts from this seeded random initialization.
+        initial_digest = hashlib_state_dict(model.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     train_data = ShardDataset(args.dataset_dir, "train")
     validation_data = ShardDataset(args.dataset_dir, "validation")
