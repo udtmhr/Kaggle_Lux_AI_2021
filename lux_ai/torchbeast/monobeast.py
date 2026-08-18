@@ -233,8 +233,8 @@ def compute_policy_gradient_loss(
     action_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     cross_entropy = -action_log_probs.view_as(advantages)
-    if action_counts is not None:
-        cross_entropy = cross_entropy / action_counts.clamp_min(1.0)
+    # if action_counts is not None:
+    #     cross_entropy = cross_entropy / action_counts.clamp_min(1.0)
     losses = cross_entropy * advantages.detach()
     if trajectory_weights is not None:
         return trajectory_weighted_mean(losses, trajectory_weights)
