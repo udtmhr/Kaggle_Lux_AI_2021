@@ -943,13 +943,21 @@ def learn(
                 # Top1 Prob and Margins
                 if int(active_count) > 0:
                     probs = F.softmax(learner_policy_logits, dim=-1)
-                    top2_probs, _ = torch.topk(probs, 2, dim=-1)
+                    top2_probs, top2_indices = torch.topk(probs, 2, dim=-1)
                     top1_prob = top2_probs[..., 0]
                     top2_prob = top2_probs[..., 1]
+                    top1_idx = top2_indices[..., 0]
                     margin = top1_prob - top2_prob
                     
                     active_top1 = top1_prob[any_actions_taken]
                     active_margin = margin[any_actions_taken]
+                    active_top1_idx = top1_idx[any_actions_taken]
+                    
+                    total_active = active_top1_idx.numel()
+                    for action_idx, action_name in enumerate(ACTION_MEANINGS[act_space]):
+                        count = (active_top1_idx == action_idx).sum().float().item()
+                        if count > 0:
+                            stats.setdefault("Policy", {})[f"{act_space}_top1_action_{action_name}_fraction"] = count / total_active
                     
                     stats.setdefault("Policy", {})[f"{act_space}_top1_prob_mean"] = float(active_top1.mean().cpu().item())
                     stats.setdefault("Policy", {})[f"{act_space}_top1_prob_p95"] = float(torch.quantile(active_top1, 0.95).cpu().item())
@@ -1224,6 +1232,46 @@ def learn(
             _N_t_active = action_counts[action_counts > 0]
             _effective_action_count = float(_N_t_active.mean().item()) if _N_t_active.numel() > 0 else 0.0
             _abs_adv_times_N = float((_active_adv.abs() * _N_t_active).mean().item()) if _N_t_active.numel() > 0 else 0.0
+
+            # --- Advantage Analysis Given Action ---
+            T, B, _ = vtrace_advantages.shape
+            _adv_expanded = vtrace_advantages.view(T, B, 1, 2, 1, 1)
+            for act_space in batch["actions"].keys():
+                _actions = batch["actions"][act_space][..., 0]
+                _mask = batch["info"]["actions_taken"][act_space].any(dim=-1)
+                _legal_mask = batch["info"]["actions_taken"][act_space]
+                
+                total_taken = _mask.sum().float().item()
+                if total_taken > 0:
+                    for action_idx, action_name in enumerate(ACTION_MEANINGS[act_space]):
+                        _this_action_mask = _mask & (_actions == action_idx)
+                        _count = _this_action_mask.sum().float().item()
+                        _rate = _count / total_taken
+                        
+                        _this_legal_mask = _legal_mask[..., action_idx]
+                        _legal_count = _this_legal_mask.sum().float().item()
+                        _rate_legal = _count / _legal_count if _legal_count > 0 else 0.0
+                        
+                        stats.setdefault("ActionRate", {})[f"{act_space}_{action_name}"] = stats.get("ActionRate", {}).get(f"{act_space}_{action_name}", 0.0) + _rate
+                        
+                        if _legal_count > 0:
+                            stats.setdefault("ActionRateLegal", {})[f"{act_space}_{action_name}"] = stats.get("ActionRateLegal", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_legal
+                        
+                        if _count > 0:
+                            _adv_for_action = _adv_expanded.expand_as(_this_action_mask)[_this_action_mask]
+                            _mean_adv = float(_adv_for_action.mean().item())
+                            
+                            _current_mean = stats.setdefault("AdvantageGivenAction", {}).get(f"{act_space}_{action_name}", 0.0)
+                            _current_weight = stats.setdefault("_AdvantageGivenActionWeight", {}).get(f"{act_space}_{action_name}", 0.0)
+                            
+                            _new_weight = _current_weight + _count
+                            _new_mean = (_current_mean * _current_weight + _mean_adv * _count) / _new_weight
+                            
+                            stats["AdvantageGivenAction"][f"{act_space}_{action_name}"] = _new_mean
+                            stats["_AdvantageGivenActionWeight"][f"{act_space}_{action_name}"] = _new_weight
+            
+            if "_AdvantageGivenActionWeight" in stats:
+                del stats["_AdvantageGivenActionWeight"]
 
             stats.update({
                 "Reward": {

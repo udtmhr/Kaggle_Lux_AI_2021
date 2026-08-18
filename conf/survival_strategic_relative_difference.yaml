@@ -66,7 +66,7 @@ min_lr_mod: 1.0
 lr_schedule: cosine
 
 # --- 損失設定（Teacher / 蒸留ロスは無効化） ---
-entropy_cost: 0.003
+entropy_cost: 0.001
 baseline_cost: 1.0
 teacher_kl_cost: 0.0
 teacher_baseline_cost: 0.0
@@ -118,7 +118,7 @@ num_learner_threads: 1
 debug: false
 weights_only: true
 n_value_warmup_batches: 0
-actor_policy_tta_rot180: true
+actor_policy_tta_rot180: false
 lmb: 0.9
 reduction: sum
 loss_normalization: trajectory
