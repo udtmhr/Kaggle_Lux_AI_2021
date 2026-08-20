@@ -129,6 +129,14 @@ class RulePriorEngine:
             
         proposals = []
         
+        # Count available acting city tiles
+        acting_city_tiles = 0
+        for ct in player.city_tiles:
+            if not ct.can_act(): continue
+            x, y = ct.pos.x, ct.pos.y
+            if 0 <= x < city_action_mask.shape[0] and 0 <= y < city_action_mask.shape[1]:
+                acting_city_tiles += 1
+
         for ct in player.city_tiles:
             if not ct.can_act():
                 continue
@@ -160,19 +168,34 @@ class RulePriorEngine:
             
             # Research Score
             if can_research:
+                worker_ratio = worker_count / max(1, len(player.city_tiles))
                 if rp < 50:
                     proximity = rp / 50.0
+                    research_score = (
+                        0.20
+                        + 0.25 * proximity
+                        + 0.20 * min(1.0, worker_ratio)
+                    )
                 elif rp < 200:
                     proximity = (rp - 50) / 150.0
+                    research_score = (
+                        0.15
+                        + 0.25 * proximity
+                        + 0.15 * min(1.0, worker_ratio)
+                    )
                 else:
                     proximity = 0.0
-                research_score = 0.1 + 0.4 * proximity
-                research_score = research_score * (1.0 - min(1.0, spawn_quality))
+                    research_score = 0.0
+                
+                spawn_quality = np.clip(spawn_quality, 0.0, 1.0)
+                research_score = research_score * (
+                    1.0 - 0.5 * spawn_quality
+                )
                 proposals.append((f"{ct.pos.x},{ct.pos.y}", "research", research_score))
             
             # Cart Score
             if can_build_cart:
-                cart_score = 0.2
+                cart_score = 0.05
                 proposals.append((f"{ct.pos.x},{ct.pos.y}", "cart", cart_score))
             
         # Tie-break deterministic sort
@@ -183,6 +206,15 @@ class RulePriorEngine:
         allocated_workers = 0
         allocated_carts = 0
         existing_cart_count = sum(1 for u in player.units if u.is_cart())
+        
+        # Force at least 1 research intent if RP < 50 and acting_city_tiles >= 4
+        if rp < 50 and acting_city_tiles >= 4:
+            for p in proposals:
+                pos_str, action, score = p
+                if action == "research" and score > 0:
+                    assigned[pos_str] = action
+                    allocated_research += 1
+                    break
         
         for pos_str, action, score in proposals:
             if pos_str in assigned:

@@ -47,6 +47,9 @@ class DictActor(nn.Module):
             ) for key, n_act in self.n_actions.items()
         })
         self.register_buffer('rule_prior_alpha', torch.tensor(0.0))
+        self.register_buffer('rule_prior_alpha_worker', torch.tensor(0.1))
+        self.register_buffer('rule_prior_alpha_cart', torch.tensor(0.0))
+        self.register_buffer('rule_prior_alpha_city_tile', torch.tensor(0.3))
 
     def forward(
             self,
@@ -89,7 +92,8 @@ class DictActor(nn.Module):
             policy_logits_out[f"pre_prior_{key}"] = logits + mask_adder
 
             if rule_prior is not None and key in rule_prior:
-                logits = logits + self.rule_prior_alpha * rule_prior[key]
+                alpha = getattr(self, f"rule_prior_alpha_{key}", self.rule_prior_alpha)
+                logits = logits + alpha * rule_prior[key]
 
             logits = logits + mask_adder
             

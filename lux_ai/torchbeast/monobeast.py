@@ -243,9 +243,6 @@ def compute_policy_gradient_loss(
 
 def _load_model_state(model: nn.Module, state_dict: Mapping, allow_new_intent_head: bool) -> None:
     allow_value_migration = getattr(model, "value_critic", "scalar") == "categorical_hl_gauss"
-    if not allow_new_intent_head and not allow_value_migration:
-        model.load_state_dict(state_dict)
-        return
     if allow_value_migration:
         current = model.state_dict()
         invalid = [
@@ -265,11 +262,12 @@ def _load_model_state(model: nn.Module, state_dict: Mapping, allow_new_intent_he
         key for key in incompatible.missing_keys
         if not (allow_new_intent_head and key.startswith("intent_head."))
         and not (allow_value_migration and key.startswith("baseline."))
+        and not key.startswith("actor.rule_prior_alpha")
     ]
     if unexpected or missing:
         raise RuntimeError(f"Incompatible checkpoint: missing={missing}, unexpected={unexpected}")
     if incompatible.missing_keys:
-        logging.info("Initialized new intent head while loading legacy policy weights")
+        logging.info("Initialized new components (e.g. intent head, rule priors) while loading legacy policy weights")
 
 
 def configure_trainable_parameters(model: nn.Module, intent_head_only: bool) -> tuple[list[nn.Parameter], list[str]]:

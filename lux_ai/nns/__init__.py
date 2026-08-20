@@ -173,4 +173,14 @@ def _create_model(
     )
     rule_prior_alpha = float(getattr(flags, "rule_prior_alpha", 0.0))
     model.actor.rule_prior_alpha.copy_(torch.tensor(rule_prior_alpha))
+    
+    rule_prior_alpha_worker = float(getattr(flags, "rule_prior_alpha_worker", 0.1))
+    model.actor.rule_prior_alpha_worker.copy_(torch.tensor(rule_prior_alpha_worker))
+    
+    rule_prior_alpha_cart = float(getattr(flags, "rule_prior_alpha_cart", rule_prior_alpha))
+    model.actor.rule_prior_alpha_cart.copy_(torch.tensor(rule_prior_alpha_cart))
+    
+    rule_prior_alpha_city_tile = float(getattr(flags, "rule_prior_alpha_city_tile", 0.3))
+    model.actor.rule_prior_alpha_city_tile.copy_(torch.tensor(rule_prior_alpha_city_tile))
+    
     return model.to(device=device)

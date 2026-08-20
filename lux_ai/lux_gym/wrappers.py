@@ -134,6 +134,8 @@ class LoggingEnv(gym.Wrapper):
             for space, action_meanings in ACTION_MEANINGS.items()
             for meaning in action_meanings
         }
+        self.city_intent_research_count = 0.
+        self.city_intent_total_count = 0.
         # TODO: Resource mining % like in visualizer?
         # self.resource_count = {"wood", etc...}
         # TODO: Fuel metric?
@@ -148,6 +150,8 @@ class LoggingEnv(gym.Wrapper):
             "workers": [sum(u.is_worker() for u in p.units) for p in game_state.players],
             "carts": [sum(u.is_cart() for u in p.units) for p in game_state.players],
             "research_points": [p.research_points for p in game_state.players],
+            "coal_unlock": [1.0 if p.researched_coal() else 0.0 for p in game_state.players],
+            "uranium_unlock": [1.0 if p.researched_uranium() else 0.0 for p in game_state.players],
         }
         self.vals_peak = {
             key: np.maximum(val, logs[key]) for key, val in self.vals_peak.items()
@@ -170,6 +174,24 @@ class LoggingEnv(gym.Wrapper):
         }
         logs.update({f"ACTIONS_{key}": val for key, val in self.actions_distributions.items()})
 
+        if "rule_prior" in info and "city_tile" in info["rule_prior"]:
+            prior = info["rule_prior"]["city_tile"]
+            ct_research_idx = ACTION_MEANINGS["city_tile"].index("RESEARCH")
+            mask = info["available_actions_mask"]["city_tile"]
+            can_act = mask[..., 1:].any(axis=-1)
+            
+            if can_act.any():
+                max_prior_idx = prior.argmax(axis=-1)
+                is_research_intent = (max_prior_idx == ct_research_idx) & can_act
+                self.city_intent_research_count += float(is_research_intent.sum())
+                self.city_intent_total_count += float(can_act.sum())
+
+        logs["city_intent_research_rate"] = [self.city_intent_research_count / max(1.0, self.city_intent_total_count)]
+        
+        ct_research_actions = self.actions_distributions["city_tile.RESEARCH"]
+        ct_total_actions = sum(self.actions_distributions[f"city_tile.{act}"] for act in ACTION_MEANINGS["city_tile"] if act != "NO-OP")
+        logs["research_action_rate"] = [ct_research_actions / max(1.0, ct_total_actions)]
+
         info.update({f"LOGGING_{key}": np.array(val, dtype=np.float32) for key, val in logs.items()})
         # Add any additional info from the reward space
         info.update(self.reward_space.get_info())
@@ -182,6 +204,8 @@ class LoggingEnv(gym.Wrapper):
         self.actions_distributions = {
             key: 0. for key in self.actions_distributions.keys()
         }
+        self.city_intent_research_count = 0.
+        self.city_intent_total_count = 0.
         return obs, reward, done, self.info(info, reward)
 
     def step(self, action: Dict[str, np.ndarray]):
@@ -196,6 +220,7 @@ class LoggingEnv(gym.Wrapper):
                 "separate_cities",
                 "workers",
                 "carts",
+                "research_points",
             ]
         }
 
