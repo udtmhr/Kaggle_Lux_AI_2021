@@ -1,0 +1,83 @@
+defaults:
+- survival_strategic_relative_difference
+- _self_
+
+name: survival_strategic_rule_prior_bootstrap_v1
+group: rule_prior_bootstrap
+
+# Train a standalone initial policy without teacher checkpoints.  The rule
+# prior guides early rollouts, while the ranking loss copies unambiguous rule
+# preferences into the pre-prior policy before all guidance decays to zero.
+rule_prior_bootstrap_config_version: 1
+objective_config_version: 2
+reward_config_version: 1
+reward_space_kwargs:
+  research_milestone_weight: 0.10
+
+rule_prior_alpha: 0.0
+rule_prior_alpha_worker: 0.50
+rule_prior_alpha_cart: 0.0
+rule_prior_alpha_city_tile: 1.0
+rule_prior_alpha_end: 0.0
+rule_prior_alpha_worker_end: 0.0
+rule_prior_alpha_cart_end: 0.0
+rule_prior_alpha_city_tile_end: 0.0
+rule_prior_decay_delay_steps: 50000
+rule_prior_decay_steps: 200000
+# A checkpoint loaded for evaluation/deployment defaults to the fully annealed
+# policy. monobeast explicitly reapplies the step schedule during training.
+rule_prior_inference_use_end: true
+
+rule_prior_distill_enabled: true
+rule_prior_distill_entities: [worker, city_tile]
+rule_prior_distill_cost: 0.05
+rule_prior_distill_cost_end: 0.0
+rule_prior_distill_decay_delay_steps: 50000
+rule_prior_distill_decay_steps: 250000
+rule_prior_distill_min_score_gap: 0.05
+rule_prior_distill_margin: 1.0
+
+# The older rule_based_guidance CE targets a different policy and is disabled
+# here so this experiment measures raw rule-prior transfer only.
+rule_aux_enabled: false
+intent_aux_enabled: false
+n_value_warmup_batches: 0
+
+use_teacher: false
+teacher_kl_cost: 0.0
+teacher_baseline_cost: 0.0
+teacher_load_dir: null
+teacher_checkpoint_file: null
+
+load_dir: null
+checkpoint_file: null
+weights_only: true
+total_steps: 500000
+
+league_enabled: true
+league_config_version: 4
+league_opponents:
+- name: selfplay
+  kind: selfplay
+  weight: 0.40
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.10
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.10
+- name: rule_economy
+  kind: rule_based
+  strategy: economy
+  weight: 0.20
+- name: rule_survival
+  kind: rule_based
+  strategy: survival
+  weight: 0.10
+- name: rule_expansion
+  kind: rule_based
+  strategy: expansion
+  weight: 0.10
+learner_snapshot_interval_steps: 100000

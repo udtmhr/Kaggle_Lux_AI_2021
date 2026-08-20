@@ -22,7 +22,7 @@ reward_space_kwargs:
   max_step_shaping: 0.02
   tile_diff_scale: 8.0
   tile_diff_weight: 0.3
-reward_config_version: 5
+reward_config_version: 6
 
 # 学習率を微増 + cosineスケジューラ
 optimizer_kwargs:

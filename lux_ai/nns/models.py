@@ -46,10 +46,31 @@ class DictActor(nn.Module):
                 (1, 1)
             ) for key, n_act in self.n_actions.items()
         })
-        self.register_buffer('rule_prior_alpha', torch.tensor(0.0))
-        self.register_buffer('rule_prior_alpha_worker', torch.tensor(0.1))
-        self.register_buffer('rule_prior_alpha_cart', torch.tensor(0.0))
-        self.register_buffer('rule_prior_alpha_city_tile', torch.tensor(0.3))
+        # These are runtime configuration, not learned state.  Keeping them out
+        # of checkpoints preserves strict loading of policies created before
+        # rule priors were introduced and lets resume config remain authoritative.
+        self.register_buffer('rule_prior_alpha', torch.tensor(0.0), persistent=False)
+        self.register_buffer('rule_prior_alpha_worker', torch.tensor(0.0), persistent=False)
+        self.register_buffer('rule_prior_alpha_cart', torch.tensor(0.0), persistent=False)
+        self.register_buffer('rule_prior_alpha_city_tile', torch.tensor(0.0), persistent=False)
+
+    def _load_from_state_dict(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+    ):
+        # Checkpoints briefly produced while rule priors were persistent contain
+        # these keys.  Consume them without overriding the selected run config.
+        for name in (
+            "rule_prior_alpha",
+            "rule_prior_alpha_worker",
+            "rule_prior_alpha_cart",
+            "rule_prior_alpha_city_tile",
+        ):
+            state_dict.pop(prefix + name, None)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(
             self,
@@ -312,13 +333,23 @@ class BasicActorCriticNetwork(nn.Module):
         base_out, input_mask = self.base_model((x, input_mask))
         if subtask_embeddings is not None:
             subtask_embeddings = torch.repeat_interleave(subtask_embeddings, 2, dim=0)
-        policy_logits, actions = self.actor(
+        policy_logits_with_aux, actions = self.actor(
             self.actor_base(base_out),
             available_actions_mask=available_actions_mask,
             sample=sample,
             rule_prior=rule_prior,
             **actor_kwargs
         )
+        pre_prior_policy_logits = {
+            key[len("pre_prior_"):]: value
+            for key, value in policy_logits_with_aux.items()
+            if key.startswith("pre_prior_")
+        }
+        policy_logits = {
+            key: value
+            for key, value in policy_logits_with_aux.items()
+            if not key.startswith("pre_prior_")
+        }
         baseline_output = self.baseline(self.baseline_base(base_out), input_mask, subtask_embeddings)
         if self.value_critic == "categorical_hl_gauss":
             baseline, baseline_logits = baseline_output
@@ -327,6 +358,7 @@ class BasicActorCriticNetwork(nn.Module):
         output = dict(
             actions=actions,
             policy_logits=policy_logits,
+            pre_prior_policy_logits=pre_prior_policy_logits,
             baseline=baseline
         )
         if baseline_logits is not None:

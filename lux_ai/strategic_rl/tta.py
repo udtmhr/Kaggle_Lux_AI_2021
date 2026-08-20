@@ -46,6 +46,8 @@ def rotate_model_input_180(model_input: Mapping) -> dict:
     info = dict(model_input["info"])
     info["input_mask"] = torch.rot90(model_input["info"]["input_mask"], 2, dims=(-2, -1))
     info["available_actions_mask"] = rotate_policy_180(model_input["info"]["available_actions_mask"])
+    if "rule_prior" in model_input["info"]:
+        info["rule_prior"] = rotate_policy_180(model_input["info"]["rule_prior"])
     rotated["info"] = info
     return rotated
 
@@ -71,6 +73,11 @@ def rot180_ensemble_outputs(model, model_input: Mapping) -> dict[str, object]:
         batched_input["info"]["subtask_embeddings"] = torch.cat(
             (model_input["info"]["subtask_embeddings"], rotated_input["info"]["subtask_embeddings"]), dim=0
         )
+    if "rule_prior" in model_input["info"]:
+        batched_input["info"]["rule_prior"] = {
+            key: torch.cat((value, rotated_input["info"]["rule_prior"][key]), dim=0)
+            for key, value in model_input["info"]["rule_prior"].items()
+        }
     batch_size = model_input["info"]["input_mask"].shape[0]
     combined = model(batched_input, sample=False, actions_per_square=1)
     original = {
@@ -84,6 +91,13 @@ def rot180_ensemble_outputs(model, model_input: Mapping) -> dict[str, object]:
     if "intent_logits" in combined:
         original["intent_logits"] = combined["intent_logits"][:batch_size]
         rotated["intent_logits"] = combined["intent_logits"][batch_size:]
+    if "pre_prior_policy_logits" in combined:
+        original["pre_prior_policy_logits"] = {
+            key: value[:batch_size] for key, value in combined["pre_prior_policy_logits"].items()
+        }
+        rotated["pre_prior_policy_logits"] = {
+            key: value[batch_size:] for key, value in combined["pre_prior_policy_logits"].items()
+        }
     rotated_policy = rotate_policy_180(rotated["policy_logits"])
     output = {
         "policy_logits": {
@@ -95,6 +109,12 @@ def rot180_ensemble_outputs(model, model_input: Mapping) -> dict[str, object]:
     if "intent_logits" in original:
         rotated_intent = torch.rot90(rotated["intent_logits"], 2, dims=(-3, -2))
         output["intent_logits"] = (original["intent_logits"] + rotated_intent) / 2
+    if "pre_prior_policy_logits" in original:
+        rotated_pre_prior = rotate_policy_180(rotated["pre_prior_policy_logits"])
+        output["pre_prior_policy_logits"] = {
+            entity: (original["pre_prior_policy_logits"][entity] + rotated_pre_prior[entity]) / 2
+            for entity in original["pre_prior_policy_logits"]
+        }
     return output
 
 

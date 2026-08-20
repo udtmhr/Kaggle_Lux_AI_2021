@@ -3,7 +3,7 @@ from typing import Optional
 
 from . import act_spaces, obs_spaces, reward_spaces, multi_subtask
 from .lux_env import LuxEnv
-from .wrappers import RewardSpaceWrapper, PadFixedShapeEnv, LoggingEnv, VecEnv, PytorchEnv, DictEnv
+from .wrappers import DictEnv, LoggingEnv, PadFixedShapeEnv, PytorchEnv, RewardSpaceWrapper, RulePriorWrapper, VecEnv
 
 ACT_SPACES_DICT = {
     key: val for key, val in act_spaces.__dict__.items()
@@ -42,6 +42,15 @@ def create_flexible_obs_space(flags, teacher_flags: Optional) -> obs_spaces.Base
         return flags.obs_space(**flags.obs_space_kwargs)
 
 
+def rule_prior_enabled(flags) -> bool:
+    """Return whether any action head has a non-zero configured rule prior."""
+    default_alpha = float(getattr(flags, "rule_prior_alpha", 0.0))
+    return any(
+        float(getattr(flags, f"rule_prior_alpha_{entity}", default_alpha)) != 0.0
+        for entity in ("worker", "cart", "city_tile")
+    )
+
+
 def create_env(
     flags,
     device: torch.device,
@@ -61,8 +70,8 @@ def create_env(
         reward_space = create_reward_space(flags, reward_game_counter=reward_game_counter)
         env = RewardSpaceWrapper(env, reward_space)
         env = env.obs_space.wrap_env(env)
-        from .wrappers import RulePriorWrapper
-        env = RulePriorWrapper(env)
+        if rule_prior_enabled(flags):
+            env = RulePriorWrapper(env)
         env = PadFixedShapeEnv(env)
         env = LoggingEnv(env, reward_space)
         envs.append(env)
@@ -98,4 +107,3 @@ def create_reward_space(flags, reward_game_counter=None) -> reward_spaces.BaseRe
             reward_space.set_global_game_counter(reward_game_counter)
 
     return reward_space
-

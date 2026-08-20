@@ -171,16 +171,27 @@ def _create_model(
         value_support_min=float(getattr(flags, "value_support_min", -2.0)),
         value_support_max=float(getattr(flags, "value_support_max", 2.0)),
     )
-    rule_prior_alpha = float(getattr(flags, "rule_prior_alpha", 0.0))
+    use_rule_prior_end = bool(getattr(flags, "rule_prior_inference_use_end", False))
+    configured_rule_prior_alpha = float(getattr(flags, "rule_prior_alpha", 0.0))
+    rule_prior_alpha = float(
+        getattr(flags, "rule_prior_alpha_end", configured_rule_prior_alpha)
+        if use_rule_prior_end else configured_rule_prior_alpha
+    )
     model.actor.rule_prior_alpha.copy_(torch.tensor(rule_prior_alpha))
-    
-    rule_prior_alpha_worker = float(getattr(flags, "rule_prior_alpha_worker", 0.1))
+
+    def configured_head_alpha(entity: str) -> float:
+        start = float(getattr(flags, f"rule_prior_alpha_{entity}", configured_rule_prior_alpha))
+        if use_rule_prior_end:
+            return float(getattr(flags, f"rule_prior_alpha_{entity}_end", rule_prior_alpha))
+        return start
+
+    rule_prior_alpha_worker = configured_head_alpha("worker")
     model.actor.rule_prior_alpha_worker.copy_(torch.tensor(rule_prior_alpha_worker))
-    
-    rule_prior_alpha_cart = float(getattr(flags, "rule_prior_alpha_cart", rule_prior_alpha))
+
+    rule_prior_alpha_cart = configured_head_alpha("cart")
     model.actor.rule_prior_alpha_cart.copy_(torch.tensor(rule_prior_alpha_cart))
-    
-    rule_prior_alpha_city_tile = float(getattr(flags, "rule_prior_alpha_city_tile", 0.3))
+
+    rule_prior_alpha_city_tile = configured_head_alpha("city_tile")
     model.actor.rule_prior_alpha_city_tile.copy_(torch.tensor(rule_prior_alpha_city_tile))
     
     return model.to(device=device)

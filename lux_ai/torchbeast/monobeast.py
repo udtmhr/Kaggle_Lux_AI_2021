@@ -56,7 +56,11 @@ from ..strategic_rl.league import (
     opponents_from_config,
     rule_based_guidance,
 )
-from ..strategic_rl.schedules import teacher_kl_coefficient
+from ..strategic_rl.schedules import (
+    rule_prior_alpha,
+    rule_prior_distill_coefficient,
+    teacher_kl_coefficient,
+)
 from ..strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
 from ..strategic_rl.categorical_value import hl_gauss_loss, support_outside_fraction
 from ..strategic_rl.curriculum import SnapshotPool
@@ -340,6 +344,64 @@ def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: b
         logging.info("Verified learner-to-actor model synchronization: max_abs_diff=0")
 
 
+@torch.no_grad()
+def apply_rule_prior_schedule(model: nn.Module, flags, step: int) -> Dict[str, float]:
+    """Apply the configured per-head alpha schedule to a live model."""
+    alphas = {
+        entity: rule_prior_alpha(flags, entity, step)
+        for entity in ("worker", "cart", "city_tile")
+    }
+    for entity, alpha in alphas.items():
+        getattr(model.actor, f"rule_prior_alpha_{entity}").fill_(alpha)
+    return alphas
+
+
+def compute_rule_prior_ranking_loss(
+    pre_prior_logits: torch.Tensor,
+    prior: torch.Tensor,
+    legal_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+    *,
+    minimum_score_gap: float,
+    margin: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Teach pre-prior logits the strongest unambiguous rule preference.
+
+    The rule engine is a partial ranking, not a calibrated probability model.
+    For each active entity we therefore compare its best rule action only with
+    legal actions whose score is lower by a configured minimum gap.
+    """
+    legal_mask = legal_mask.bool()
+    active_mask = active_mask.bool()
+    masked_prior = prior.masked_fill(~legal_mask, float("-inf"))
+    best_score = masked_prior.max(dim=-1).values
+    top_actions = legal_mask & torch.isclose(
+        prior, best_score.unsqueeze(-1), rtol=0.0, atol=1e-6
+    )
+    finite_logits = torch.isfinite(pre_prior_logits)
+    safe_logits = torch.where(finite_logits, pre_prior_logits, torch.zeros_like(pre_prior_logits))
+    top_count = top_actions.sum(dim=-1, keepdim=True).clamp_min(1)
+    # All tied top-rule actions receive the same gradient.  Selecting one with
+    # argmax would compile action-order accidents into the prior-free policy.
+    best_logit = (safe_logits * top_actions).sum(dim=-1, keepdim=True) / top_count
+    score_gap = best_score.unsqueeze(-1) - prior
+    comparisons = (
+        legal_mask
+        & active_mask.unsqueeze(-1)
+        & finite_logits
+        & ~top_actions
+        & (score_gap >= float(minimum_score_gap))
+    )
+    logit_margin = best_logit - safe_logits
+    pair_losses = torch.where(
+        comparisons,
+        F.softplus(float(margin) - logit_margin),
+        torch.zeros_like(logit_margin),
+    )
+    # Rollout tensors are [time, batch, stacked-agent, player, x, y, action].
+    return pair_losses.sum(dim=(2, 4, 5, 6)), comparisons.sum(dim=(2, 4, 5, 6))
+
+
 @torch.inference_mode()
 def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_output: Dict) -> Dict:
     mixed_precision = getattr(flags, "actor_mixed_precision", flags.use_mixed_precision)
@@ -347,10 +409,7 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
         if not getattr(flags, "actor_policy_tta_rot180", False):
             output = actor_model(env_output)
             output.pop("baseline_logits", None)
-            if "policy_logits" in output:
-                for k in list(output["policy_logits"].keys()):
-                    if k.startswith("pre_prior_"):
-                        del output["policy_logits"][k]
+            output.pop("pre_prior_policy_logits", None)
             return output
         output = rot180_ensemble_outputs(actor_model, env_output)
     output["actions"] = {
@@ -360,13 +419,9 @@ def actor_model_output(flags: SimpleNamespace, actor_model: nn.Module, env_outpu
             actions_per_square=MAX_OVERLAPPING_ACTIONS,
         ).view(*logits.shape[:-1], -1)
         for entity, logits in output["policy_logits"].items()
-        if not entity.startswith("pre_prior_")
     }
     output.pop("baseline_logits", None)
-    if "policy_logits" in output:
-        for k in list(output["policy_logits"].keys()):
-            if k.startswith("pre_prior_"):
-                del output["policy_logits"][k]
+    output.pop("pre_prior_policy_logits", None)
     return output
 
 
@@ -823,6 +878,7 @@ def learn(
 ) -> Tuple[Dict, int]:
     """Performs a learning (optimization) step."""
     with lock:
+        current_rule_prior_alphas = apply_rule_prior_schedule(learner_model, flags, learner_step)
         with amp.autocast("cuda", enabled=flags.use_mixed_precision and flags.learner_device.type == "cuda"):
             flattened_batch = buffers_apply(batch, lambda x: torch.flatten(x, start_dim=0, end_dim=1))
             learner_outputs = learner_model(flattened_batch)
@@ -840,6 +896,18 @@ def learn(
                     )
             else:
                 teacher_outputs = None
+
+            # These are the exact masks/priors consumed by learner_outputs at
+            # obs[t].  The batch itself is shifted below to align action[t]
+            # with its resulting obs[t+1], so retain the model-input slice.
+            learner_input_legal_masks = {
+                key: value[:-1]
+                for key, value in batch["info"]["available_actions_mask"].items()
+            }
+            learner_input_rule_priors = {
+                key: value[:-1]
+                for key, value in batch["info"].get("rule_prior", {}).items()
+            }
 
             # Take final value function slice for bootstrapping.
             bootstrap_value = learner_outputs["baseline"][-1]
@@ -864,6 +932,8 @@ def learn(
             combined_forward_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
             combined_reverse_behavior_kl = torch.zeros_like(combined_behavior_action_log_probs)
             behavior_kl_counts = torch.zeros_like(combined_behavior_action_log_probs)
+            combined_rule_prior_distill = torch.zeros_like(combined_behavior_action_log_probs)
+            rule_prior_distill_counts = torch.zeros_like(combined_behavior_action_log_probs)
             stats = {}
             for act_space in batch["actions"].keys():
                 actions = batch["actions"][act_space]
@@ -876,8 +946,10 @@ def learn(
                 combined_behavior_action_log_probs = combined_behavior_action_log_probs + behavior_action_log_probs
 
                 learner_policy_logits = learner_outputs["policy_logits"][act_space]
-                pre_prior_logits = learner_outputs["policy_logits"].get(f"pre_prior_{act_space}", learner_policy_logits)
-                
+                pre_prior_logits = learner_outputs.get("pre_prior_policy_logits", {}).get(
+                    act_space, learner_policy_logits
+                )
+
                 learner_action_log_probs = combine_policy_logits_to_log_probs(
                     learner_policy_logits, actions, actions_taken_mask
                 )
@@ -919,6 +991,27 @@ def learn(
                     (normalized_entropy_sum / active_count.clamp_min(1)).detach().cpu().item()
                 )
                 active_entity_counts[act_space] = int(active_count.detach().cpu().item())
+
+                prior = learner_input_rule_priors.get(act_space)
+                legal_mask = learner_input_legal_masks[act_space]
+                distill_entities = set(
+                    getattr(flags, "rule_prior_distill_entities", ("worker", "city_tile"))
+                )
+                if (
+                    getattr(flags, "rule_prior_distill_enabled", False)
+                    and act_space in distill_entities
+                    and prior is not None
+                ):
+                    ranking_loss, ranking_count = compute_rule_prior_ranking_loss(
+                        pre_prior_logits,
+                        prior,
+                        legal_mask,
+                        any_actions_taken,
+                        minimum_score_gap=float(getattr(flags, "rule_prior_distill_min_score_gap", 0.05)),
+                        margin=float(getattr(flags, "rule_prior_distill_margin", 1.0)),
+                    )
+                    combined_rule_prior_distill += ranking_loss
+                    rule_prior_distill_counts += ranking_count
                 
                 # pre_prior entropy
                 pre_prior_entropy_sum, _ = masked_normalized_entropy(
@@ -960,14 +1053,58 @@ def learn(
                     stats.setdefault("Policy", {})[f"{act_space}_top1_prob_mean"] = float(active_top1.mean().cpu().item())
                     stats.setdefault("Policy", {})[f"{act_space}_top1_prob_p95"] = float(torch.quantile(active_top1, 0.95).cpu().item())
                     stats.setdefault("Policy", {})[f"{act_space}_top1_top2_margin"] = float(active_margin.mean().cpu().item())
-                    stats.setdefault("Policy", {})[f"{act_space}_logits_abs_max"] = float(learner_policy_logits[any_actions_taken].abs().max().cpu().item())
-                    
+                    active_logits = learner_policy_logits[any_actions_taken]
+                    finite_active_logits = active_logits[torch.isfinite(active_logits)]
+                    stats.setdefault("Policy", {})[f"{act_space}_logits_abs_max"] = (
+                        float(finite_active_logits.abs().max().cpu().item())
+                        if finite_active_logits.numel() else float("nan")
+                    )
+
                     # Rule Prior explicit stats
-                    if "rule_prior" in batch and act_space in batch["rule_prior"]:
-                        prior = batch["rule_prior"][act_space]
+                    if prior is not None:
                         stats.setdefault("RulePrior", {})[f"{act_space}_abs_mean"] = float(prior[any_actions_taken].abs().mean().cpu().item())
                         stats.setdefault("RulePrior", {})[f"{act_space}_abs_max"] = float(prior[any_actions_taken].abs().max().cpu().item())
-                
+                        delta = learner_policy_logits - pre_prior_logits
+                        finite_delta = delta[any_actions_taken.unsqueeze(-1) & torch.isfinite(delta)]
+                        stats["RulePrior"][f"{act_space}_scaled_delta_abs_mean"] = (
+                            float(finite_delta.abs().mean().cpu().item())
+                            if finite_delta.numel() else 0.0
+                        )
+                        prior_masked = prior.masked_fill(~legal_mask.bool(), float("-inf"))
+                        prior_best_score = prior_masked.max(dim=-1).values
+                        prior_top_actions = legal_mask.bool() & torch.isclose(
+                            prior, prior_best_score.unsqueeze(-1), rtol=0.0, atol=1e-6
+                        )
+                        prior_worst_score = prior.masked_fill(~legal_mask.bool(), float("inf")).min(dim=-1).values
+                        confident = any_actions_taken & (
+                            prior_best_score - prior_worst_score
+                            >= float(getattr(flags, "rule_prior_distill_min_score_gap", 0.05))
+                        )
+                        confident_count = confident.sum()
+                        stats["RulePrior"][f"{act_space}_coverage"] = float(
+                            (confident_count / active_count.clamp_min(1)).cpu().item()
+                        )
+                        pre_top = pre_prior_logits.argmax(dim=-1, keepdim=True)
+                        post_top = learner_policy_logits.argmax(dim=-1, keepdim=True)
+                        pre_agrees = prior_top_actions.gather(-1, pre_top).squeeze(-1)
+                        post_agrees = prior_top_actions.gather(-1, post_top).squeeze(-1)
+                        stats["RulePrior"][f"{act_space}_pre_prior_agreement"] = float(
+                            (pre_agrees & confident).sum().div(confident_count.clamp_min(1)).cpu().item()
+                        )
+                        stats["RulePrior"][f"{act_space}_post_prior_agreement"] = float(
+                            (post_agrees & confident).sum().div(confident_count.clamp_min(1)).cpu().item()
+                        )
+                        stats["RulePrior"][f"{act_space}_top1_flip_rate"] = float(
+                            ((pre_prior_logits.argmax(dim=-1) != learner_policy_logits.argmax(dim=-1))
+                             & any_actions_taken).sum().div(active_count.clamp_min(1)).cpu().item()
+                        )
+                        prior_kl, prior_kl_count = masked_policy_kl(
+                            learner_policy_logits, pre_prior_logits, any_actions_taken, reverse=False
+                        )
+                        stats["RulePrior"][f"{act_space}_pre_post_kl"] = float(
+                            trajectory_weighted_mean(prior_kl, prior_kl_count).detach().cpu().item()
+                        )
+
                 # Delta logp per entity
                 if int(active_count) > 0:
                     delta_logp = learner_action_log_probs - behavior_action_log_probs
@@ -1057,6 +1194,10 @@ def learn(
                 else reduce(combined_teacher_kl_loss, reduction=flags.reduction)
             )
             teacher_kl_loss = teacher_kl_cost * reduced_teacher_kl
+            rule_prior_distill_cost = rule_prior_distill_coefficient(flags, learner_step)
+            rule_prior_distill_loss = rule_prior_distill_cost * trajectory_weighted_mean(
+                combined_rule_prior_distill, rule_prior_distill_counts
+            )
             if flags.use_teacher:
                 teacher_baseline_loss = flags.teacher_baseline_cost * compute_baseline_loss(
                     values,
@@ -1132,6 +1273,7 @@ def learn(
                 total_loss = baseline_loss + teacher_baseline_loss
                 vtrace_pg_loss, upgo_pg_loss, teacher_kl_loss, entropy_loss = torch.zeros(4) + float("nan")
                 rule_aux_loss = intent_aux_loss = torch.zeros_like(baseline_loss)
+                rule_prior_distill_loss = torch.zeros_like(baseline_loss)
             else:
                 total_loss = (
                     vtrace_pg_loss
@@ -1141,6 +1283,7 @@ def learn(
                     + teacher_baseline_loss
                     + entropy_loss
                     + behavior_kl_loss
+                    + rule_prior_distill_loss
                     + rule_aux_loss
                     + intent_aux_loss
                 )
@@ -1318,6 +1461,7 @@ def learn(
                     "teacher_baseline_loss": teacher_baseline_loss.detach().item(),
                     "entropy_loss": entropy_loss.detach().item(),
                     "behavior_kl_loss": behavior_kl_loss.detach().item(),
+                    "rule_prior_distill_loss": rule_prior_distill_loss.detach().item(),
                     "rule_aux_loss": rule_aux_loss.detach().item(),
                     "intent_aux_loss": intent_aux_loss.detach().item(),
                     "total_loss": total_loss.detach().item(),
@@ -1376,6 +1520,8 @@ def learn(
                 "Misc": {
                     "learning_rate": last_lr,
                     "teacher_kl_cost": teacher_kl_cost,
+                    "rule_prior_distill_cost": rule_prior_distill_cost,
+                    **{f"rule_prior_alpha_{key}": value for key, value in current_rule_prior_alphas.items()},
                     "actor_policy_tta_rot180": float(getattr(flags, "actor_policy_tta_rot180", False)),
                     "teacher_policy_tta_rot180": float(getattr(flags, "teacher_policy_tta_rot180", False)),
                     "total_games_played": total_games_played,
@@ -1434,6 +1580,7 @@ def learn(
 
         # noinspection PyTypeChecker
         sync_actor_model(actor_model, learner_model, verify=verify_actor_sync)
+        apply_rule_prior_schedule(actor_model, flags, learner_step)
         return stats, total_games_played
 
 
@@ -1484,6 +1631,11 @@ def train(flags):
         checkpoint_state = torch.load(Path(flags.load_dir) / flags.checkpoint_file, map_location=torch.device("cpu"))
     else:
         checkpoint_state = None
+    schedule_start_step = (
+        int(checkpoint_state.get("step", 0))
+        if checkpoint_state is not None and not flags.weights_only
+        else 0
+    )
     restored_outcomes = checkpoint_state.get("league_outcomes", {}) if checkpoint_state is not None else {}
     restored_wins = [float(restored_outcomes.get(opponent.name, {}).get("wins", 0.0)) for opponent in league_opponents]
     restored_games_by_opponent = [
@@ -1517,6 +1669,7 @@ def train(flags):
             checkpoint_state["model_state_dict"],
             allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
         )
+    apply_rule_prior_schedule(actor_model, flags, schedule_start_step)
     configure_trainable_parameters(
         actor_model, intent_head_only=getattr(flags, "intent_head_only_finetune", False)
     )
@@ -1574,6 +1727,7 @@ def train(flags):
             checkpoint_state["model_state_dict"],
             allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
         )
+    apply_rule_prior_schedule(learner_model, flags, schedule_start_step)
     learner_model.train()
     intent_head_only = getattr(flags, "intent_head_only_finetune", False)
     trainable_parameters, trainable_parameter_names = configure_trainable_parameters(

@@ -8,6 +8,9 @@ from ..lux.game_map import Cell, Position
 from .act_spaces import ACTION_MEANINGS
 
 class RulePriorEngine:
+    COAL_RESEARCH_TARGET_TURN = 80
+    URANIUM_RESEARCH_TARGET_TURN = 260
+
     def __init__(self):
         self.w_actions = ACTION_MEANINGS["worker"]
         self.c_actions = ACTION_MEANINGS["cart"]
@@ -128,6 +131,7 @@ class RulePriorEngine:
             research_needed = 0
             
         proposals = []
+        is_night, remaining_night, turns_until_night = self._get_night_info(game_state)
         
         # Count available acting city tiles
         acting_city_tiles = 0
@@ -148,9 +152,14 @@ class RulePriorEngine:
             can_build_worker = city_action_mask[x, y, self.ct_build_worker]
             can_research = city_action_mask[x, y, self.ct_research]
             can_build_cart = city_action_mask[x, y, self.ct_build_cart]
+            city = player.cities[ct.cityid]
+            city_at_risk = (
+                city.fuel < city.get_light_upkeep() * remaining_night
+                and (is_night or turns_until_night <= 10)
+            )
                 
             # Worker Score
-            if can_build_worker:
+            if can_build_worker and not city_at_risk:
                 spawn_quality = 0.0
                 for cluster in clusters:
                     dist = min(self._dist(ct.pos, c.pos) for c in cluster["cells"])
@@ -194,7 +203,7 @@ class RulePriorEngine:
                 proposals.append((f"{ct.pos.x},{ct.pos.y}", "research", research_score))
             
             # Cart Score
-            if can_build_cart:
+            if can_build_cart and not city_at_risk:
                 cart_score = 0.05
                 proposals.append((f"{ct.pos.x},{ct.pos.y}", "cart", cart_score))
             
@@ -207,14 +216,24 @@ class RulePriorEngine:
         allocated_carts = 0
         existing_cart_count = sum(1 for u in player.units if u.is_cart())
         
-        # Force at least 1 research intent if RP < 50 and acting_city_tiles >= 4
-        if rp < 50 and acting_city_tiles >= 4:
-            for p in proposals:
-                pos_str, action, score = p
-                if action == "research" and score > 0:
+        # Reserve enough research capacity to reach both unlocks on schedule.
+        # If every worker is gone, rebuilding the economy takes precedence.
+        if research_needed > 0 and worker_count > 0:
+            deadline = (
+                self.COAL_RESEARCH_TARGET_TURN
+                if rp < 50 else self.URANIUM_RESEARCH_TARGET_TURN
+            )
+            turns_left = max(1, deadline - game_state.turn)
+            research_quota = min(
+                research_needed,
+                max(1, math.ceil(research_needed / turns_left)),
+            )
+            for pos_str, action, score in proposals:
+                if allocated_research >= research_quota:
+                    break
+                if action == "research" and score > 0 and pos_str not in assigned:
                     assigned[pos_str] = action
                     allocated_research += 1
-                    break
         
         for pos_str, action, score in proposals:
             if pos_str in assigned:
@@ -297,13 +316,12 @@ class RulePriorEngine:
                 if need <= 0:
                     continue
                     
-                closest_cell = min(cluster["cells"], key=lambda c: self._dist(unit.pos, c.pos))
-                current_dist = self._dist(unit.pos, closest_cell.pos)
+                current_dist = min(self._dist(unit.pos, cell.pos) for cell in cluster["cells"])
                 
-                can_approach = False
+                approach_actions = []
                 if current_dist == 0:
                     if mask[self.w_noop]:
-                        can_approach = True
+                        approach_actions.append((self.w_noop, unit.pos.x, unit.pos.y))
                 else:
                     for d_str, d_idx in self.w_move.items():
                         if not mask[d_idx]:
@@ -311,32 +329,48 @@ class RulePriorEngine:
                         dx, dy = self.dir_delta[d_str]
                         nx, ny = unit.pos.x + dx, unit.pos.y + dy
                         if 0 <= nx < game_state.map.width and 0 <= ny < game_state.map.height:
-                            ndist = abs(nx - closest_cell.pos.x) + abs(ny - closest_cell.pos.y)
-                            if ndist < current_dist:
-                                can_approach = True
-                                break
+                            approaches_cluster = any(
+                                abs(nx - cell.pos.x) + abs(ny - cell.pos.y)
+                                < self._dist(unit.pos, cell.pos)
+                                for cell in cluster["cells"]
+                            )
+                            if approaches_cluster:
+                                approach_actions.append((d_idx, nx, ny))
                 
-                if not can_approach:
+                if not approach_actions:
                     continue
                     
                 score = need / (current_dist + 1.0)
-                proposals.append((unit.id, cluster, score, unit))
+                proposals.append((unit.id, cluster, score, unit, approach_actions))
                 
         proposals.sort(key=lambda x: (x[2], x[0]), reverse=True)
         
-        for uid, cluster, score, unit in proposals:
+        reserved_destinations = set()
+        for uid, cluster, score, unit, approach_actions in proposals:
             if uid in assigned:
                 continue
                 
             desired_workers = max(1, math.ceil(len(cluster["cells"]) * 0.5))
             need = max(0.0, desired_workers - cluster["workers_assigned"])
             if need > 0:
-                assigned[uid] = cluster
+                available_approaches = [
+                    action for action in approach_actions
+                    if (action[1], action[2]) not in reserved_destinations
+                ]
+                if not available_approaches:
+                    continue
+                action_idx, next_x, next_y = min(available_approaches, key=lambda action: action[0])
+                assigned[uid] = {
+                    "cluster": cluster,
+                    "action_idx": action_idx,
+                    "next_position": (next_x, next_y),
+                }
+                reserved_destinations.add((next_x, next_y))
                 cluster["workers_assigned"] += 1
                 
         return assigned
 
-    def _compute_worker_prior(self, unit: Unit, player: Player, game_state: Game, mineable: List[Cell], target_cluster: Optional[Dict], is_night: bool, remaining_night: int, turns_until_night: int) -> np.ndarray:
+    def _compute_worker_prior(self, unit: Unit, player: Player, game_state: Game, mineable: List[Cell], target_assignment: Optional[Dict], is_night: bool, remaining_night: int, turns_until_night: int) -> np.ndarray:
         prior = np.zeros(len(self.w_actions), dtype=np.float32)
         
         # 4. NO-OP penalty (Base)
@@ -405,6 +439,31 @@ class RulePriorEngine:
                                 prior[d_idx] -= rescue_bias
                                 
         cargo_space = unit.get_cargo_space_left()
+
+        target_cluster = target_assignment["cluster"] if target_assignment is not None else None
+        reserved_action = target_assignment["action_idx"] if target_assignment is not None else None
+
+        # A full worker should make an explicit deliver-or-build decision rather
+        # than falling back to a nearly uniform non-NOOP preference.  Prefer a
+        # fuel-safe city, with distance as a secondary cost.
+        if cargo_space == 0 and player.city_tiles and closest_city_dist > 0:
+            def delivery_score(city_tile):
+                city = player.cities[city_tile.cityid]
+                required = max(city.get_light_upkeep() * remaining_night, 1.0)
+                safety = min(float(city.fuel) / required, 1.0)
+                return safety - 0.03 * self._dist(unit.pos, city_tile.pos)
+
+            delivery_target = max(player.city_tiles, key=delivery_score)
+            delivery_dist = self._dist(unit.pos, delivery_target.pos)
+            for d_str, d_idx in self.w_move.items():
+                dx, dy = self.dir_delta[d_str]
+                nx, ny = unit.pos.x + dx, unit.pos.y + dy
+                if 0 <= nx < game_state.map.width and 0 <= ny < game_state.map.height:
+                    next_dist = abs(nx - delivery_target.pos.x) + abs(ny - delivery_target.pos.y)
+                    if next_dist < delivery_dist:
+                        prior[d_idx] += 0.30
+                    elif next_dist > delivery_dist:
+                        prior[d_idx] -= 0.15
         
         # Determine effective mineable resources
         if target_cluster is not None:
@@ -419,7 +478,9 @@ class RulePriorEngine:
         if cargo_space > 0 and attraction_scale > 0 and len(resource_candidates) > 0:
             closest_res = min(resource_candidates, key=lambda c: self._dist(unit.pos, c.pos))
             res_dist = self._dist(unit.pos, closest_res.pos)
-            if res_dist == 0:
+            if reserved_action is not None:
+                prior[reserved_action] += attraction_scale
+            elif res_dist == 0:
                 prior[self.w_noop] += attraction_scale
             else:
                 for d_str, d_idx in self.w_move.items():
@@ -479,7 +540,9 @@ class RulePriorEngine:
             
             best_cell = min(target_cluster["cells"], key=lambda c: self._dist(unit.pos, c.pos))
             target_dist = self._dist(unit.pos, best_cell.pos)
-            if target_dist == 0:
+            if reserved_action is not None:
+                prior[reserved_action] += dispersion_bias
+            elif target_dist == 0:
                 prior[self.w_noop] += dispersion_bias
             else:
                 for d_str, d_idx in self.w_move.items():
@@ -512,7 +575,11 @@ class RulePriorEngine:
         city = player.cities[ct.cityid]
         city_upkeep = city.get_light_upkeep()
         city_deficit = max(0, city_upkeep * remaining_night - city.fuel)
-        if city_deficit > 0:
+        city_at_risk = city_deficit > 0 and (is_night or turns_until_night <= 10)
+        if city_at_risk:
+            prior[self.ct_build_worker] -= 1.0
+            prior[self.ct_build_cart] -= 1.0
+        elif city_deficit > 0:
             prior[self.ct_build_worker] -= 0.2 * fuel_urgency
             
         return prior
@@ -571,8 +638,8 @@ class RulePriorEngine:
                         if unit.is_worker():
                             x, y = unit.pos.x, unit.pos.y
                             if 0 <= x < prior.shape[2] and 0 <= y < prior.shape[3]:
-                                target_cluster = pdata["worker_assignments"].get(unit.id)
-                                p_bias = self._compute_worker_prior(unit, player, game_state, mineable, target_cluster, is_night, remaining_night, turns_until_night)
+                                target_assignment = pdata["worker_assignments"].get(unit.id)
+                                p_bias = self._compute_worker_prior(unit, player, game_state, mineable, target_assignment, is_night, remaining_night, turns_until_night)
                                 prior[0, p_idx, x, y, :] += p_bias
                             
                 elif entity == "cart":

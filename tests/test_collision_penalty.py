@@ -1,6 +1,5 @@
 """衝突ペナルティラッパーのユニットテスト。"""
 
-import numpy as np
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -106,6 +105,30 @@ class TestCollisionPenaltyWrapper:
         rewards, done = wrapper.compute_rewards_and_done(gs1, False)
         assert rewards[0] == pytest.approx(-0.1, abs=1e-6)
 
+    def test_successful_city_build_is_not_penalized(self):
+        inner = FakeRewardSpace(reward=(0.0, 0.0))
+        wrapper = CollisionPenaltyWrapper(
+            inner=inner, penalty_start=0.1, penalty_end=0.1, ramp_steps=100
+        )
+        worker = SimpleNamespace(
+            id="builder",
+            pos=SimpleNamespace(x=2, y=3),
+            is_worker=lambda: True,
+        )
+        player0 = SimpleNamespace(units=[worker], city_tiles=[])
+        player1 = SimpleNamespace(units=[], city_tiles=[])
+        wrapper.compute_rewards_and_done(
+            SimpleNamespace(turn=0, players=[player0, player1]), False
+        )
+
+        new_tile = SimpleNamespace(pos=SimpleNamespace(x=2, y=3))
+        player0_after = SimpleNamespace(units=[], city_tiles=[new_tile])
+        rewards, _ = wrapper.compute_rewards_and_done(
+            SimpleNamespace(turn=1, players=[player0_after, player1]), False
+        )
+
+        assert rewards == (0.0, 0.0)
+
     def test_penalty_clipped_to_reward_bounds(self):
         """ペナルティ加算後のリワードが[-1, 1]にクリップされること。"""
         inner = FakeRewardSpace(reward=(-0.95, 0.0))
@@ -176,6 +199,7 @@ class TestCollisionPenaltyWrapper:
         )
         info = wrapper.get_info()
         assert "LOGGING_collision_penalty" in info
+        assert "LOGGING_unit_loss_penalty" in info
         assert info["LOGGING_collision_penalty"][0] == pytest.approx(0.01, abs=1e-6)
 
     def test_global_game_counter_passthrough(self):

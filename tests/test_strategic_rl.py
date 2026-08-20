@@ -9,9 +9,13 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from lux_ai.lux_gym import create_env
+from lux_ai.lux_gym import create_env, rule_prior_enabled
 from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
+from lux_ai.lux_gym.rule_prior import RulePriorEngine
 from lux_ai.lux_gym.wrappers import VecEnv
+from lux_ai.lux.constants import Constants
+from lux_ai.lux.game_map import GameMap
+from lux_ai.lux.game_objects import City, Player, Unit
 from lux_ai.nns import create_model
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
@@ -35,9 +39,20 @@ from lux_ai.strategic_rl.obs import night_turns_between
 from lux_ai.strategic_rl.prepare_data import _discover_replays
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
-from lux_ai.strategic_rl.reward import RelativeCountPotentialReward, StrategicPotentialRewardV2, SurvivalPotentialReward
+from lux_ai.strategic_rl.reward import (
+    RelativeCountPotentialReward,
+    RelativeDifferencePotentialReward,
+    StrategicPotentialRewardV2,
+    StrategicPotentialRewardV3,
+    SurvivalPotentialReward,
+)
 from lux_ai.strategic_rl.run_matches import candidate_last_response_turn, replay_metrics, run_matched_matches
-from lux_ai.strategic_rl.schedules import LinearSchedule, teacher_kl_coefficient
+from lux_ai.strategic_rl.schedules import (
+    LinearSchedule,
+    rule_prior_alpha,
+    rule_prior_distill_coefficient,
+    teacher_kl_coefficient,
+)
 from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
 from lux_ai.strategic_rl.train_eval import (
     checkpoint_model_max_abs_diff,
@@ -55,8 +70,11 @@ from lux_ai.strategic_rl.tta import (
     rotate_policy_180,
 )
 from lux_ai.torchbeast.monobeast import (
+    apply_rule_prior_schedule,
+    actor_model_output,
     compute_baseline_loss,
     compute_teacher_kl_loss,
+    compute_rule_prior_ranking_loss,
     configure_trainable_parameters,
     model_state_dict_cpu,
     state_dict_max_abs_diff,
@@ -385,6 +403,173 @@ def test_linear_schedule_and_teacher_floor():
     assert teacher_kl_coefficient(anchored, 100) == 0.005
 
 
+def test_rule_prior_bootstrap_schedules_decay_per_head():
+    flags = SimpleNamespace(
+        rule_prior_alpha=0.0,
+        rule_prior_alpha_worker=0.5,
+        rule_prior_alpha_city_tile=1.0,
+        rule_prior_decay_delay_steps=50,
+        rule_prior_decay_steps=200,
+        rule_prior_distill_enabled=True,
+        rule_prior_distill_cost=0.05,
+        rule_prior_distill_cost_end=0.0,
+        rule_prior_distill_decay_delay_steps=50,
+        rule_prior_distill_decay_steps=250,
+    )
+    assert rule_prior_alpha(flags, "worker", 0) == 0.5
+    assert rule_prior_alpha(flags, "worker", 150) == 0.25
+    assert rule_prior_alpha(flags, "worker", 250) == 0.0
+    assert rule_prior_alpha(flags, "city_tile", 150) == 0.5
+    assert rule_prior_distill_coefficient(flags, 50) == 0.05
+    assert rule_prior_distill_coefficient(flags, 300) == 0.0
+
+
+def test_rule_prior_ranking_loss_updates_pre_prior_preference():
+    logits = torch.tensor([[[[[[[0.0, 0.0, 0.0, float("-inf")]]]]]]], requires_grad=True)
+    prior = torch.tensor([[[[[[[0.0, 0.8, 0.2, 0.0]]]]]]])
+    legal = torch.tensor([[[[[[[True, True, True, False]]]]]]])
+    active = torch.ones(prior.shape[:-1], dtype=torch.bool)
+    losses, counts = compute_rule_prior_ranking_loss(
+        logits,
+        prior,
+        legal,
+        active,
+        minimum_score_gap=0.05,
+        margin=1.0,
+    )
+    assert counts.item() == 2
+    losses.sum().backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[..., 1].item() < 0.0
+    assert logits.grad[..., 0].item() > 0.0
+    assert logits.grad[..., 2].item() > 0.0
+
+
+def test_rule_prior_ranking_loss_preserves_tied_top_actions():
+    logits = torch.zeros((1, 1, 1, 1, 1, 1, 4), requires_grad=True)
+    prior = torch.tensor([[[[[[[0.0, 0.5, 0.5, -0.1]]]]]]])
+    legal = torch.ones_like(prior, dtype=torch.bool)
+    active = torch.ones(prior.shape[:-1], dtype=torch.bool)
+    losses, counts = compute_rule_prior_ranking_loss(
+        logits, prior, legal, active, minimum_score_gap=0.05, margin=1.0
+    )
+    assert counts.item() == 2
+    losses.sum().backward()
+    assert logits.grad[..., 1].item() == pytest.approx(logits.grad[..., 2].item())
+    assert logits.grad[..., 1].item() < 0.0
+    assert logits.grad[..., 0].item() > 0.0
+    assert logits.grad[..., 3].item() > 0.0
+
+
+def _rule_player_with_city(*, fuel=230.0, city_tiles=((0, 0),), research_points=0):
+    player = Player(0)
+    player.research_points = research_points
+    city = City(0, "c0", fuel, 23)
+    for x, y in city_tiles:
+        city._add_city_tile(x, y, cooldown=0)
+    player.cities[city.cityid] = city
+    player.city_tile_count = len(city.citytiles)
+    return player, city
+
+
+def test_rule_prior_reserves_research_for_both_unlocks_but_recovers_worker_first():
+    engine = RulePriorEngine()
+    city_mask = np.ones((4, 4, len(ACTION_MEANINGS["city_tile"])), dtype=bool)
+    for research_points in (0, 50, 199):
+        player, _ = _rule_player_with_city(research_points=research_points)
+        player.units.append(Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 1, 1, 0, 0, 0, 0))
+        game = SimpleNamespace(turn=0, players=[player, Player(1)])
+        assigned = engine._global_city_scheduler(game, player, [], city_mask)
+        assert assigned["0,0"] == "research"
+
+    player, _ = _rule_player_with_city(research_points=0)
+    game = SimpleNamespace(turn=0, players=[player, Player(1)])
+    assigned = engine._global_city_scheduler(game, player, [], city_mask)
+    assert assigned["0,0"] == "worker"
+
+
+def test_rule_prior_blocks_unit_spawn_from_city_at_risk():
+    engine = RulePriorEngine()
+    player, city = _rule_player_with_city(fuel=0.0, research_points=0)
+    player.units.append(Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 1, 1, 0, 0, 0, 0))
+    game = SimpleNamespace(turn=30, players=[player, Player(1)])
+    city_mask = np.ones((4, 4, len(ACTION_MEANINGS["city_tile"])), dtype=bool)
+    assigned = engine._global_city_scheduler(game, player, [], city_mask)
+    assert assigned["0,0"] == "research"
+    prior = engine._compute_city_tile_prior(city.citytiles[0], player, game, "worker", True, 10, 0)
+    assert prior[engine.ct_build_worker] < prior[engine.ct_research]
+    assert prior[engine.ct_build_cart] < prior[engine.ct_research]
+
+
+def test_rule_prior_reserves_distinct_resource_destinations():
+    engine = RulePriorEngine()
+    player, _ = _rule_player_with_city(city_tiles=((0, 0),))
+    player.units.extend([
+        Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 1, 2, 0, 0, 0, 0),
+        Unit(0, Constants.UNIT_TYPES.WORKER, "u1", 2, 1, 0, 0, 0, 0),
+    ])
+    game_map = GameMap(5, 5)
+    cells = [game_map.get_cell(x, y) for x, y in ((2, 2), (2, 3), (3, 2), (3, 3))]
+    cluster = {"cells": cells, "amount": 400, "workers_assigned": 0, "incoming_workers": 0}
+    game = SimpleNamespace(turn=0, players=[player, Player(1)], map=game_map)
+    worker_mask = np.ones((5, 5, len(ACTION_MEANINGS["worker"])), dtype=bool)
+    assigned = engine._global_worker_scheduler(game, player, [cluster], worker_mask, False, 10, 30)
+    destinations = [assignment["next_position"] for assignment in assigned.values()]
+    assert len(destinations) == 2
+    assert len(set(destinations)) == len(destinations)
+
+
+def test_rule_prior_full_worker_prefers_safe_city_delivery():
+    engine = RulePriorEngine()
+    player, _ = _rule_player_with_city(fuel=230.0, city_tiles=((0, 2),))
+    worker = Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 3, 2, 0, 100, 0, 0)
+    player.units.append(worker)
+    game = SimpleNamespace(turn=0, players=[player, Player(1)], map=GameMap(5, 5))
+    prior = engine._compute_worker_prior(worker, player, game, [], None, False, 10, 30)
+    assert prior[engine.w_move["w"]] > prior[engine.w_move["e"]]
+    assert prior[engine.w_move["w"]] > prior[engine.w_build_city]
+
+
+def test_relative_difference_reward_adds_coal_and_uranium_milestones():
+    reward = RelativeDifferencePotentialReward(
+        city_weight=0.0,
+        unit_weight=0.0,
+        research_weight=0.0,
+        research_milestone_weight=1.0,
+        fuel_weight=0.0,
+    )
+    players = [Player(0), Player(1)]
+    game = SimpleNamespace(turn=0, players=players)
+    players[0].research_points = 49
+    assert np.allclose(reward._potential(game), [0.0, 0.0])
+    players[0].research_points = 50
+    assert np.allclose(reward._potential(game), [1.0, 0.0])
+    players[0].research_points = 199
+    assert np.allclose(reward._potential(game), [1.0, 0.0])
+    players[0].research_points = 200
+    assert np.allclose(reward._potential(game), [2.0, 0.0])
+    players[1].research_points = 200
+    assert np.allclose(reward._potential(game), [2.0, 2.0])
+
+
+def test_rule_prior_bootstrap_config_composes_and_reaches_prior_free_policy():
+    root = Path(__file__).parents[1]
+    flags = OmegaConf.merge(
+        OmegaConf.load(root / "conf" / "survival_strategic_relative_difference.yaml"),
+        OmegaConf.load(root / "conf" / "survival_strategic_rule_prior_bootstrap.yaml"),
+    )
+    namespace = flags_to_namespace(OmegaConf.to_container(flags, resolve=False))
+    namespace.actor_device = torch.device("cpu")
+    namespace.learner_device = torch.device("cpu")
+    model = create_model(namespace, torch.device("cpu"))
+    assert model.actor.rule_prior_alpha_worker.item() == 0.0
+    assert model.actor.rule_prior_alpha_city_tile.item() == 0.0
+    initial = apply_rule_prior_schedule(model, namespace, 0)
+    final = apply_rule_prior_schedule(model, namespace, 300000)
+    assert initial == {"worker": 0.5, "cart": 0.0, "city_tile": 1.0}
+    assert final == {"worker": 0.0, "cart": 0.0, "city_tile": 0.0}
+
+
 def test_league_config_sampling_and_player_action_merge():
     opponents = opponents_from_config(
         [
@@ -456,6 +641,11 @@ def test_rot180_ensemble_batches_both_views_in_one_forward():
             "available_actions_mask": {
                 "worker": torch.ones(2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"]), dtype=torch.bool)
             },
+            "rule_prior": {
+                "worker": torch.arange(
+                    2 * 1 * 2 * 3 * 3 * len(ACTION_MEANINGS["worker"]), dtype=torch.float32
+                ).view(2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"]))
+            },
         },
     }
     reference_model = DummyModel()
@@ -470,6 +660,8 @@ def test_rot180_ensemble_batches_both_views_in_one_forward():
     assert fused_model.batch_sizes == [4]
     assert torch.equal(actual["policy_logits"]["worker"], expected_policy)
     assert torch.equal(actual["baseline"], expected_baseline)
+    rotated_twice = rotate_model_input_180(rotate_model_input_180(model_input))
+    assert torch.equal(rotated_twice["info"]["rule_prior"]["worker"], model_input["info"]["rule_prior"]["worker"])
 
 
 def test_player_perspective_stack_matches_original_indexing():
@@ -857,8 +1049,82 @@ def test_categorical_critic_forward_is_zero_sum_and_keeps_policy_schema():
         assert output["baseline_logits"].shape == (1, 2, 101)
         assert torch.allclose(output["baseline"].sum(dim=-1), torch.zeros(1), atol=1e-6)
         assert output["policy_logits"].keys() == model_input["info"]["available_actions_mask"].keys()
+        assert output["pre_prior_policy_logits"].keys() == output["policy_logits"].keys()
     finally:
         env.close()
+
+
+def test_zero_global_rule_prior_disables_all_heads_and_env_computation():
+    flags = _cpu_strength_flags(False)
+    flags.rule_prior_alpha = 0.0
+    for entity in ("worker", "cart", "city_tile"):
+        if hasattr(flags, f"rule_prior_alpha_{entity}"):
+            delattr(flags, f"rule_prior_alpha_{entity}")
+    assert rule_prior_enabled(flags) is False
+    env = create_env(flags, torch.device("cpu"))
+    try:
+        model_input = env.reset(force=True)
+        assert "rule_prior" not in model_input["info"]
+        model = create_model(flags, torch.device("cpu"))
+        assert model.actor.rule_prior_alpha_worker.item() == 0.0
+        assert model.actor.rule_prior_alpha_cart.item() == 0.0
+        assert model.actor.rule_prior_alpha_city_tile.item() == 0.0
+    finally:
+        env.close()
+
+
+def test_actor_tta_keeps_rule_prior_and_rollout_schema_compatible():
+    flags = _cpu_strength_flags(False)
+    flags.actor_policy_tta_rot180 = True
+    env = create_env(flags, torch.device("cpu"))
+    try:
+        model_input = env.reset(force=True)
+        assert "rule_prior" in model_input["info"]
+        output = actor_model_output(flags, create_model(flags, torch.device("cpu")), model_input)
+        assert output["policy_logits"].keys() == model_input["info"]["available_actions_mask"].keys()
+        assert "pre_prior_policy_logits" not in output
+    finally:
+        env.close()
+
+
+def test_rule_prior_runtime_config_is_strict_checkpoint_compatible():
+    flags = _cpu_strength_flags(False)
+    model = create_model(flags, torch.device("cpu"))
+    legacy_state = model.state_dict()
+    legacy_state["actor.rule_prior_alpha"] = torch.tensor(0.9)
+    legacy_state["actor.rule_prior_alpha_worker"] = torch.tensor(0.8)
+    legacy_state["actor.rule_prior_alpha_cart"] = torch.tensor(0.7)
+    legacy_state["actor.rule_prior_alpha_city_tile"] = torch.tensor(0.6)
+
+    configured_alpha = model.actor.rule_prior_alpha_worker.item()
+    model.load_state_dict(legacy_state, strict=True)
+
+    assert model.actor.rule_prior_alpha_worker.item() == configured_alpha
+    assert not any("rule_prior_alpha" in key for key in model.state_dict())
+
+
+def test_v3_terminal_tile_score_is_not_lost_to_clipping():
+    reward = StrategicPotentialRewardV3(
+        shaping_weight=0.0,
+        shaping_floor=0.0,
+        tile_diff_scale=8.0,
+        tile_diff_weight=0.3,
+    )
+    game_state = SimpleNamespace(
+        turn=360,
+        players=[
+            SimpleNamespace(city_tile_count=3, units=[]),
+            SimpleNamespace(city_tile_count=1, units=[]),
+        ],
+    )
+
+    rewards, done = reward.compute_rewards_and_done(game_state, True)
+
+    expected = 0.7 + 0.3 * np.tanh(2.0 / 8.0)
+    assert done is True
+    assert rewards[0] == pytest.approx(expected)
+    assert rewards[1] == pytest.approx(-expected)
+    assert rewards[0] < 1.0
 
 
 def test_engine_snapshot_replay_round_trip_transition_matches():

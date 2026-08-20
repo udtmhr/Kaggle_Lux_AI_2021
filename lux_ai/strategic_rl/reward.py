@@ -361,25 +361,48 @@ class StrategicPotentialRewardV3(StrategicPotentialRewardV2):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        if tile_diff_scale <= 0.0:
+            raise ValueError("tile_diff_scale must be positive")
+        if not 0.0 <= tile_diff_weight <= 1.0:
+            raise ValueError("tile_diff_weight must be between zero and one")
         self.tile_diff_scale = float(tile_diff_scale)
         self.tile_diff_weight = float(tile_diff_weight)
 
     def compute_rewards_and_done(self, game_state, done):
-        rewards, done = super().compute_rewards_and_done(game_state, done)
-        if done:
-            player_tiles = [p.city_tile_count for p in game_state.players]
-            tile_diff = player_tiles[0] - player_tiles[1]
-            tile_bonus = np.tanh(tile_diff / self.tile_diff_scale) * self.tile_diff_weight
-            
-            rewards_list = list(rewards)
-            rewards_list[0] += tile_bonus
-            rewards_list[1] -= tile_bonus
-            rewards = tuple(np.clip(rewards_list, -1.0, 1.0))
-            
-        return rewards, done
+        if not done:
+            return super().compute_rewards_and_done(game_state, done)
 
-import numpy as np
-from scipy.stats import rankdata
+        # Build the terminal reward before clipping.  Adding a tile bonus to an
+        # already clipped +/-1 game result made the bonus a no-op whenever it
+        # agreed with the winner (the usual case).
+        self.current_alpha = self.shaping_alpha()
+        if not self.initialized or game_state.turn == 0:
+            shaping = np.zeros(2, dtype=np.float64)
+        else:
+            delta = -self.previous
+            delta -= delta.mean()
+            shaping = np.clip(
+                self.current_alpha * delta,
+                -self.max_step_shaping,
+                self.max_step_shaping,
+            )
+
+        terminal = np.asarray(
+            [int(GameResultReward.compute_player_reward(player)) for player in game_state.players],
+            dtype=np.float64,
+        )
+        game_result = (rankdata(terminal) - 1.0) * 2.0 - 1.0
+        tile_diff = float(game_state.players[0].city_tile_count - game_state.players[1].city_tile_count)
+        tile_score = np.tanh(tile_diff / self.tile_diff_scale) * np.asarray([1.0, -1.0])
+        terminal_reward = (
+            (1.0 - self.tile_diff_weight) * game_result
+            + self.tile_diff_weight * tile_score
+        )
+
+        self._increment_game_count()
+        self.previous[:] = 0.0
+        self.initialized = False
+        return tuple(np.clip(shaping + terminal_reward, -1.0, 1.0)), done
 
 
 class RelativeDifferencePotentialReward(BaseRewardSpace):
@@ -390,6 +413,7 @@ class RelativeDifferencePotentialReward(BaseRewardSpace):
         w_city     * D_city
       + w_unit     * D_unit
       + w_research * D_research
+      + w_milestone* M_research_milestone
       + w_fuel     * D_fuel_safety
 
     shaping:
@@ -411,6 +435,7 @@ class RelativeDifferencePotentialReward(BaseRewardSpace):
         city_weight: float = 1.0,
         unit_weight: float = 0.2,
         research_weight: float = 0.05,
+        research_milestone_weight: float = 0.0,
         fuel_weight: float = 0.1,
         shaping_weight: float = 0.05,
         discounting: float = 0.999,
@@ -427,6 +452,7 @@ class RelativeDifferencePotentialReward(BaseRewardSpace):
         self.city_weight = float(city_weight)
         self.unit_weight = float(unit_weight)
         self.research_weight = float(research_weight)
+        self.research_milestone_weight = float(research_milestone_weight)
         self.fuel_weight = float(fuel_weight)
 
         self.shaping_weight = float(shaping_weight)
@@ -562,6 +588,14 @@ class RelativeDifferencePotentialReward(BaseRewardSpace):
             dtype=np.float64,
         )
 
+        # Monotonic PBRS milestones. Each unlock contributes one unit of
+        # potential, so reaching 50/200 RP yields a one-time positive delta
+        # even when both self-play agents unlock on the same turn.
+        research_milestones = (
+            (research >= 50.0).astype(np.float64)
+            + (research >= 200.0).astype(np.float64)
+        )
+
         fuel_safety = np.array(
             [
                 self._fuel_safety(p, game_state.turn)
@@ -594,6 +628,7 @@ class RelativeDifferencePotentialReward(BaseRewardSpace):
             self.city_weight * d_city
             + self.unit_weight * d_unit
             + self.research_weight * d_research
+            + self.research_milestone_weight * research_milestones
             + self.fuel_weight * d_fuel
         )
 

@@ -54,4 +54,30 @@ def merge_resume_config(saved_flags: DictConfig, selected_flags: DictConfig, cli
             "intent_head_only_finetune",
         )
         migrations.update({key: selected_flags[key] for key in objective_keys if key in selected_flags})
+    saved_prior_version = int(saved_flags.get("rule_prior_bootstrap_config_version", 0))
+    selected_prior_version = int(selected_flags.get("rule_prior_bootstrap_config_version", 0))
+    if selected_prior_version > saved_prior_version:
+        prior_keys = (
+            "rule_prior_bootstrap_config_version",
+            "rule_prior_alpha",
+            "rule_prior_alpha_worker",
+            "rule_prior_alpha_cart",
+            "rule_prior_alpha_city_tile",
+            "rule_prior_alpha_end",
+            "rule_prior_alpha_worker_end",
+            "rule_prior_alpha_cart_end",
+            "rule_prior_alpha_city_tile_end",
+            "rule_prior_decay_steps",
+            "rule_prior_decay_delay_steps",
+            "rule_prior_inference_use_end",
+            "rule_prior_distill_enabled",
+            "rule_prior_distill_entities",
+            "rule_prior_distill_cost",
+            "rule_prior_distill_cost_end",
+            "rule_prior_distill_decay_steps",
+            "rule_prior_distill_decay_delay_steps",
+            "rule_prior_distill_min_score_gap",
+            "rule_prior_distill_margin",
+        )
+        migrations.update({key: selected_flags[key] for key in prior_keys if key in selected_flags})
     return OmegaConf.merge(saved_flags, OmegaConf.create(migrations), cli_conf)

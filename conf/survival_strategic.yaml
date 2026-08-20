@@ -58,6 +58,9 @@ lmb: 0.9
 reduction: sum
 
 rule_prior_alpha: 0.10
+rule_prior_alpha_worker: 0.10
+rule_prior_alpha_cart: 0.0
+rule_prior_alpha_city_tile: 0.30
 
 # Enable after setting teacher_load_dir/checkpoint to the frozen policy used only for logits.
 use_teacher: false

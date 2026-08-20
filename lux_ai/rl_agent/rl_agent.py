@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import *
+from typing import Dict, List, NoReturn, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -10,7 +10,7 @@ import yaml
 from ..lux import annotate
 from ..lux.game import Game
 from ..lux.game_objects import CityTile, Unit
-from ..lux_gym import LuxEnv, create_reward_space, wrappers
+from ..lux_gym import LuxEnv, create_reward_space, rule_prior_enabled, wrappers
 from ..nns import create_model, models
 from ..utility_constants import MAX_BOARD_SIZE
 from ..utils import DEBUG_MESSAGE, LOCAL_EVAL, Stopwatch, flags_to_namespace
@@ -79,6 +79,8 @@ class RLAgent:
         reward_space = create_reward_space(self.model_flags)
         env = wrappers.RewardSpaceWrapper(env, reward_space)
         env = env.obs_space.wrap_env(env)
+        if rule_prior_enabled(self.model_flags):
+            env = wrappers.RulePriorWrapper(env)
         env = wrappers.PadFixedShapeEnv(env)
         env = wrappers.VecEnv([env])
         # We'll move the data onto the target device if necessary after preprocessing
@@ -123,14 +125,17 @@ class RLAgent:
         self.stopwatch.start("Observation processing")
         self.preprocess(obs, conf)
         env_output = self.get_env_output()
+        model_info = {
+            "input_mask": self.augment_data(env_output["info"]["input_mask"].unsqueeze(1),
+                                            is_policy=False).squeeze(1),
+            "available_actions_mask": self.augment_data(env_output["info"]["available_actions_mask"],
+                                                        is_policy=True),
+        }
+        if "rule_prior" in env_output["info"]:
+            model_info["rule_prior"] = self.augment_data(env_output["info"]["rule_prior"], is_policy=True)
         relevant_env_output_augmented = {
             "obs": self.augment_data(env_output["obs"], is_policy=False),
-            "info": {
-                "input_mask": self.augment_data(env_output["info"]["input_mask"].unsqueeze(1),
-                                                is_policy=False).squeeze(1),
-                "available_actions_mask": self.augment_data(env_output["info"]["available_actions_mask"],
-                                                            is_policy=True),
-            },
+            "info": model_info,
         }
 
         self.stopwatch.stop().start("Model inference")
