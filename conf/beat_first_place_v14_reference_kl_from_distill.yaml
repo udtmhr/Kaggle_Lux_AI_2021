@@ -1,0 +1,26 @@
+defaults:
+- beat_first_place_v12_safe_from_distill
+- _self_
+
+name: beat_first_place_v14_reference_kl_from_distill
+group: reference_kl_distill_impala
+
+# Preserve the v12 conservative RL contract: StrategicPotentialRewardV2,
+# LR 5e-7 with cosine decay, value-head-only warmup, no rule prior, and no
+# train-time TTA. Only the online KL reference is changed here.
+total_steps: 100000
+
+# Anchor policy updates to the evaluated v10 policy itself. The first-place
+# league opponent needs a different observation space, so this reference model
+# explicitly consumes the learner's student observation branch.
+use_teacher: true
+teacher_input_source: student
+teacher_load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/distill_v10_firstplace
+teacher_checkpoint_file: best.pt
+teacher_kl_cost: 0.005
+teacher_kl_cost_start: 0.005
+teacher_kl_cost_end: 0.005
+teacher_kl_cost_floor: 0.005
+teacher_kl_decay_steps: 100000
+teacher_kl_delay_steps: 0
+teacher_baseline_cost: 0.0

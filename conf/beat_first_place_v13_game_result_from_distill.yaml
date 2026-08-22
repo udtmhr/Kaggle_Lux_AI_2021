@@ -1,0 +1,16 @@
+defaults:
+- beat_first_place_v12_safe_from_distill
+- _self_
+
+name: beat_first_place_v13_game_result_from_distill
+group: game_result_ablation
+
+# Controlled reward ablation: preserve the evaluated distilled start,
+# head-only critic warmup, LR, KL, league, and train-time TTA contract from
+# v12. Change only the environment reward used by the 25k pilot.
+total_steps: 25000
+reward_config_version: 9
+reward_space: GameResultReward
+# A null scalar replaces (rather than deep-merges) v12's shaping mapping.
+# run_monobeast normalizes it to an empty mapping before saving/launching.
+reward_space_kwargs: null

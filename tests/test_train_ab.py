@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from lux_ai.strategic_rl.evaluate import summarize
+from lux_ai.strategic_rl.screen_checkpoints import (
+    extract_baseline_schedule,
+    rank_screen_results,
+    screen_decision,
+)
 from lux_ai.strategic_rl.train_ab import (
     final_promotion_decision,
     map_score_rate,
@@ -91,6 +96,40 @@ def test_map_score_and_paired_difference_lcb(tmp_path: Path):
     _write_games(mismatched, {(2, 12): (0, 1)})
     with pytest.raises(ValueError, match="schedules differ"):
         paired_score_difference_lcb(baseline, mismatched, bootstrap_samples=10)
+
+
+def test_checkpoint_screen_extracts_exact_baseline_and_ranks_safe_finalists(tmp_path: Path):
+    baseline = tmp_path / "baseline.jsonl"
+    _write_games(baseline, {(2021, 12): (0, 1), (2022, 12): (1, 0)})
+    selected = extract_baseline_schedule(
+        baseline,
+        seed_start=2021,
+        seeds=2,
+        map_sizes=(12,),
+        opponent_name="first_place",
+    )
+    assert len(selected) == 4
+    decision = screen_decision(
+        _summary("first_place", 0.25, survival=0.75, extinction=0.10),
+        _summary("first_place", 0.30, survival=0.74, extinction=0.10),
+        opponent_name="first_place",
+        min_score_delta=-0.025,
+        min_city_survival_delta=-0.025,
+        max_city_extinction_delta=0.05,
+    )
+    assert decision["passed"] is True
+    finalists = rank_screen_results(
+        [
+            {"checkpoint": "safe.pt", "screen_gate": decision, "paired_score_delta_lcb95": -0.01},
+            {
+                "checkpoint": "unsafe.pt",
+                "screen_gate": {**decision, "passed": False},
+                "paired_score_delta_lcb95": 0.10,
+            },
+        ],
+        top_k=1,
+    )
+    assert [result["checkpoint"] for result in finalists] == ["safe.pt"]
 
 
 def test_final_promotion_requires_all_absolute_and_nonregression_gates():

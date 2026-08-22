@@ -35,6 +35,10 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("num_buffers", max(2 * flags["num_actors"], flags["batch_size"] // flags["n_actor_envs"]))
     flags.setdefault("obs_space_kwargs", {})
     flags.setdefault("reward_space_kwargs", {})
+    # Hydra deep-merges mappings inherited through defaults. Allow a child
+    # config to use null as an explicit request to clear inherited kwargs.
+    if flags["reward_space_kwargs"] is None:
+        flags["reward_space_kwargs"] = {}
 
     # Training params
     flags.setdefault("use_mixed_precision", True)
@@ -47,6 +51,7 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("checkpoint_freq", 10.0)
     flags.setdefault("num_learner_threads", 1)
     flags.setdefault("use_teacher", False)
+    flags.setdefault("teacher_input_source", "teacher")
     flags.setdefault("teacher_baseline_cost", flags.get("teacher_kl_cost", 0.0) / 2.0)
     flags.setdefault("teacher_kl_cost_floor", 0.0)
     flags.setdefault("actor_policy_tta_rot180", False)
@@ -56,6 +61,19 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("league_config_version", 0)
     flags.setdefault("reward_config_version", 0)
     flags.setdefault("objective_config_version", 0)
+    flags.setdefault("intrinsic_reward_enabled", False)
+    flags.setdefault("intrinsic_mode", "e3b_controllable")
+    flags.setdefault("intrinsic_embedding_dim", 32)
+    flags.setdefault("intrinsic_inverse_cost", 0.1)
+    flags.setdefault("intrinsic_optimizer_lr", 1.0e-4)
+    flags.setdefault("intrinsic_discounting", 0.99)
+    flags.setdefault("intrinsic_reward_clip", 5.0)
+    flags.setdefault("intrinsic_beta_max", 0.10)
+    flags.setdefault("intrinsic_pretrain_steps", 16000)
+    flags.setdefault("intrinsic_ramp_end_step", 25000)
+    flags.setdefault("intrinsic_decay_start_step", 40000)
+    flags.setdefault("intrinsic_decay_end_step", 50000)
+    flags.setdefault("intrinsic_gate_enforced", True)
     flags.setdefault("league_sampling", "fixed")
     flags.setdefault("pfsp_power", 2.0)
     flags.setdefault("pfsp_teacher_floor", 0.15)
@@ -113,7 +131,9 @@ def main(flags: DictConfig):
         # Preserve every saved setting and apply only explicitly supplied task
         # overrides. Merging the selected base config here can silently reset
         flags = merge_resume_config(new_flags, selected_flags, cli_conf)
-        logging.info(f"After merge_resume_config: total_steps={flags.get('total_steps')}, weights_only={flags.get('weights_only')}")
+        logging.info(
+            f"After merge_resume_config: total_steps={flags.get('total_steps')}, weights_only={flags.get('weights_only')}"
+        )
 
     flags = get_default_flags(flags)
     original_cwd = Path(get_original_cwd())

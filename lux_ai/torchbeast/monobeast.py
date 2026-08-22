@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from contextlib import contextmanager
 import logging
 import math
 import numpy as np
@@ -64,6 +65,13 @@ from ..strategic_rl.schedules import (
 from ..strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
 from ..strategic_rl.categorical_value import hl_gauss_loss, support_outside_fraction
 from ..strategic_rl.curriculum import SnapshotPool
+from ..strategic_rl.intrinsic import (
+    ControllableEpisodicCuriosity,
+    EllipticalEpisodicMemory,
+    RunningMoments,
+    controllable_change_masks,
+    intrinsic_beta,
+)
 from ..strategic_rl.tta import rot180_ensemble_outputs
 
 
@@ -209,9 +217,7 @@ def compute_categorical_baseline_loss(
     value_max: float,
     sigma_ratio: float,
 ) -> torch.Tensor:
-    loss = hl_gauss_loss(
-        logits, value_targets, value_min=value_min, value_max=value_max, sigma_ratio=sigma_ratio
-    )
+    loss = hl_gauss_loss(logits, value_targets, value_min=value_min, value_max=value_max, sigma_ratio=sigma_ratio)
     if player_mask is not None:
         loss = loss * player_mask
     if trajectory_normalize:
@@ -250,20 +256,20 @@ def _load_model_state(model: nn.Module, state_dict: Mapping, allow_new_intent_he
     if allow_value_migration:
         current = model.state_dict()
         invalid = [
-            key for key, value in state_dict.items()
-            if (key not in current or current[key].shape != value.shape)
-            and not key.startswith("baseline.")
+            key
+            for key, value in state_dict.items()
+            if (key not in current or current[key].shape != value.shape) and not key.startswith("baseline.")
         ]
         if invalid:
             raise RuntimeError(f"Incompatible checkpoint tensors outside value head: {invalid}")
         state_dict = {
-            key: value for key, value in state_dict.items()
-            if key in current and current[key].shape == value.shape
+            key: value for key, value in state_dict.items() if key in current and current[key].shape == value.shape
         }
     incompatible = model.load_state_dict(state_dict, strict=False)
     unexpected = list(incompatible.unexpected_keys)
     missing = [
-        key for key in incompatible.missing_keys
+        key
+        for key in incompatible.missing_keys
         if not (allow_new_intent_head and key.startswith("intent_head."))
         and not (allow_value_migration and key.startswith("baseline."))
         and not key.startswith("actor.rule_prior_alpha")
@@ -318,6 +324,41 @@ def state_dict_max_abs_diff(left: Mapping[str, torch.Tensor], right: Mapping[str
     return max_abs_diff
 
 
+VALUE_HEAD_PREFIXES = ("baseline_base.", "baseline.")
+
+
+def retain_value_head_gradients(model: nn.Module) -> None:
+    """Discard warmup gradients outside the dedicated value head."""
+    for name, parameter in model.named_parameters():
+        if not name.startswith(VALUE_HEAD_PREFIXES):
+            parameter.grad = None
+
+
+@contextmanager
+def value_head_only_warmup_mode(model: nn.Module, enabled: bool):
+    """Keep frozen policy/backbone buffers fixed during a value-only forward.
+
+    Gradient filtering alone does not protect spectral-normalisation buffers,
+    which update on every training-mode forward. Put the complete model in
+    evaluation mode, then opt only the two value-head modules back into train
+    mode for the duration of the warmup forward.
+    """
+    if not enabled:
+        yield
+        return
+    if not hasattr(model, "baseline_base") or not hasattr(model, "baseline"):
+        raise ValueError("value_head_only_warmup requires baseline_base and baseline modules")
+    training_modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    model.baseline_base.train()
+    model.baseline.train()
+    try:
+        yield
+    finally:
+        for module, training in training_modes:
+            module.training = training
+
+
 def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: bool = False) -> None:
     """Synchronize the rollout model through owned CPU tensors.
 
@@ -327,11 +368,7 @@ def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: b
     """
     learner_state = model_state_dict_cpu(learner_model)
     actor_model.load_state_dict(learner_state)
-    actor_cuda_devices = {
-        tensor.device
-        for tensor in actor_model.state_dict().values()
-        if tensor.device.type == "cuda"
-    }
+    actor_cuda_devices = {tensor.device for tensor in actor_model.state_dict().values() if tensor.device.type == "cuda"}
     for device in actor_cuda_devices:
         torch.cuda.synchronize(device)
     if verify:
@@ -347,13 +384,44 @@ def sync_actor_model(actor_model: nn.Module, learner_model: nn.Module, verify: b
 @torch.no_grad()
 def apply_rule_prior_schedule(model: nn.Module, flags, step: int) -> Dict[str, float]:
     """Apply the configured per-head alpha schedule to a live model."""
-    alphas = {
-        entity: rule_prior_alpha(flags, entity, step)
-        for entity in ("worker", "cart", "city_tile")
-    }
+    alphas = {entity: rule_prior_alpha(flags, entity, step) for entity in ("worker", "cart", "city_tile")}
     for entity, alpha in alphas.items():
         getattr(model.actor, f"rule_prior_alpha_{entity}").fill_(alpha)
     return alphas
+
+
+def validate_training_tta_contract(flags) -> None:
+    """Reject accidental train-time TTA for explicitly single-view runs."""
+    if not getattr(flags, "require_training_tta_disabled", False):
+        return
+    enabled = [
+        name
+        for name in (
+            "actor_policy_tta_rot180",
+            "learner_policy_tta_rot180",
+            "teacher_policy_tta_rot180",
+        )
+        if bool(getattr(flags, name, False))
+    ]
+    if enabled:
+        raise ValueError(f"Training-time Rot180 TTA must remain disabled for this run; enabled={enabled}")
+
+
+def online_teacher_uses_student_observation(flags, teacher_flags) -> bool:
+    """Validate and resolve which observation branch feeds the online KL teacher."""
+    source = str(getattr(flags, "teacher_input_source", "teacher"))
+    if source not in {"teacher", "student"}:
+        raise ValueError("teacher_input_source must be 'teacher' or 'student'")
+    if source == "student":
+        if teacher_flags.obs_space != flags.obs_space or dict(getattr(teacher_flags, "obs_space_kwargs", {})) != dict(
+            getattr(flags, "obs_space_kwargs", {})
+        ):
+            raise ValueError(
+                "teacher_input_source=student requires the online KL teacher and learner "
+                "to use the same observation space"
+            )
+        return True
+    return False
 
 
 def compute_rule_prior_ranking_loss(
@@ -375,9 +443,7 @@ def compute_rule_prior_ranking_loss(
     active_mask = active_mask.bool()
     masked_prior = prior.masked_fill(~legal_mask, float("-inf"))
     best_score = masked_prior.max(dim=-1).values
-    top_actions = legal_mask & torch.isclose(
-        prior, best_score.unsqueeze(-1), rtol=0.0, atol=1e-6
-    )
+    top_actions = legal_mask & torch.isclose(prior, best_score.unsqueeze(-1), rtol=0.0, atol=1e-6)
     finite_logits = torch.isfinite(pre_prior_logits)
     safe_logits = torch.where(finite_logits, pre_prior_logits, torch.zeros_like(pre_prior_logits))
     top_count = top_actions.sum(dim=-1, keepdim=True).clamp_min(1)
@@ -386,11 +452,7 @@ def compute_rule_prior_ranking_loss(
     best_logit = (safe_logits * top_actions).sum(dim=-1, keepdim=True) / top_count
     score_gap = best_score.unsqueeze(-1) - prior
     comparisons = (
-        legal_mask
-        & active_mask.unsqueeze(-1)
-        & finite_logits
-        & ~top_actions
-        & (score_gap >= float(minimum_score_gap))
+        legal_mask & active_mask.unsqueeze(-1) & finite_logits & ~top_actions & (score_gap >= float(minimum_score_gap))
     )
     logit_margin = best_logit - safe_logits
     pair_losses = torch.where(
@@ -518,9 +580,7 @@ def _league_actions(
 def _set_learner_player_info(env_output, opponents, selected_opponents, learner_players, device):
     mask = learner_player_mask(opponents, selected_opponents, learner_players, device)
     env_output["info"]["learner_player_mask"] = mask
-    env_output["info"]["league_opponent_id"] = torch.as_tensor(
-        selected_opponents, dtype=torch.int64, device=device
-    )
+    env_output["info"]["league_opponent_id"] = torch.as_tensor(selected_opponents, dtype=torch.int64, device=device)
     action_mask = mask[:, None, :, None, None, None]
     for entity in env_output["info"]["actions_taken"]:
         env_output["info"]["actions_taken"][entity] &= action_mask
@@ -581,9 +641,7 @@ def _refresh_learner_snapshot_models(
         if local_versions.get(opponent.slot) == version:
             continue
         with snapshot_lock:
-            state = torch.load(
-                snapshot_paths[opponent.slot], map_location=torch.device("cpu"), weights_only=False
-            )
+            state = torch.load(snapshot_paths[opponent.slot], map_location=torch.device("cpu"), weights_only=False)
         _load_model_state(
             opponent_models[opponent_index],
             state["model_state_dict"],
@@ -632,6 +690,8 @@ def act(
     snapshot_lock,
     reward_game_counter,
     actor_policy_version,
+    actor_curiosity_model,
+    intrinsic_gate_passed,
     buffers: Buffers,
 ):
     if flags.debug:
@@ -648,9 +708,7 @@ def act(
             teacher_flags=teacher_flags,
             reward_game_counter=reward_game_counter,
         )
-        opponent_models = _load_league_opponent_models(
-            flags, teacher_flags, league_opponents, snapshot_paths
-        )
+        opponent_models = _load_league_opponent_models(flags, teacher_flags, league_opponents, snapshot_paths)
         local_snapshot_versions = {
             opponent.slot: int(snapshot_versions[opponent.slot])
             for opponent in league_opponents
@@ -661,6 +719,25 @@ def act(
         else:
             env.seed()
         env_output = env.reset(force=True)
+        intrinsic_enabled = bool(getattr(flags, "intrinsic_reward_enabled", False))
+        if intrinsic_enabled:
+            if str(getattr(flags, "intrinsic_mode", "e3b_controllable")) != "e3b_controllable":
+                raise ValueError("Only intrinsic_mode=e3b_controllable is supported")
+            intrinsic_memory = EllipticalEpisodicMemory(
+                flags.n_actor_envs,
+                int(getattr(flags, "intrinsic_embedding_dim", 32)),
+                flags.actor_device,
+            )
+            intrinsic_frozen = int(actor_policy_version.value) >= int(
+                getattr(flags, "intrinsic_pretrain_steps", 16000)
+            )
+            intrinsic_model_version = int(actor_policy_version.value)
+            env_output["intrinsic_reward"] = torch.zeros(
+                (flags.n_actor_envs, 2), dtype=torch.float32, device=flags.actor_device
+            )
+            env_output["intrinsic_condition"] = torch.ones(
+                (flags.n_actor_envs, 2), dtype=torch.float32, device=flags.actor_device
+            )
         league_sampler = LeagueSampler(league_opponents)
         pfsp_sampler = PFSPSampler(
             league_opponents,
@@ -673,18 +750,16 @@ def act(
         snapshot_pool = SnapshotPool(capacity=int(getattr(flags, "snapshot_pool_capacity", 2048)))
         pending_snapshot_priorities = {}
         selected_opponents = [
-            _sample_league_index(
-                flags, league_opponents, league_sampler, pfsp_sampler, league_outcomes, league_rng
-            )
+            _sample_league_index(flags, league_opponents, league_sampler, pfsp_sampler, league_outcomes, league_rng)
             for _ in range(flags.n_actor_envs)
         ]
         learner_players = league_rng.integers(0, 2, size=flags.n_actor_envs).tolist()
-        _set_learner_player_info(
-            env_output, league_opponents, selected_opponents, learner_players, flags.actor_device
-        )
+        _set_learner_player_info(env_output, league_opponents, selected_opponents, learner_players, flags.actor_device)
         agent_output = actor_model_output(flags, actor_model, env_output)
         agent_output["policy_version"] = torch.full(
-            (flags.n_actor_envs,), int(actor_policy_version.value), dtype=torch.int64,
+            (flags.n_actor_envs,),
+            int(actor_policy_version.value),
+            dtype=torch.int64,
             device=flags.actor_device,
         )
         _attach_rule_guidance(
@@ -704,7 +779,9 @@ def act(
 
                 agent_output = actor_model_output(flags, actor_model, env_output)
                 agent_output["policy_version"] = torch.full(
-                    (flags.n_actor_envs,), int(actor_policy_version.value), dtype=torch.int64,
+                    (flags.n_actor_envs,),
+                    int(actor_policy_version.value),
+                    dtype=torch.int64,
                     device=flags.actor_device,
                 )
                 if curriculum_enabled and pending_snapshot_priorities:
@@ -742,10 +819,38 @@ def act(
                 )
                 agent_output["actions"] = actions
                 env_output = env.step(actions)
+                if intrinsic_enabled:
+                    frozen_now = int(actor_policy_version.value) >= int(
+                        getattr(flags, "intrinsic_pretrain_steps", 16000)
+                    )
+                    if frozen_now and not intrinsic_frozen:
+                        intrinsic_memory.reset()
+                    current_version = int(actor_policy_version.value)
+                    if not frozen_now and current_version != intrinsic_model_version:
+                        intrinsic_memory.reset()
+                    intrinsic_model_version = current_version
+                    intrinsic_frozen = frozen_now
+                    if not frozen_now or bool(intrinsic_gate_passed.value):
+                        with amp.autocast("cuda", enabled=False):
+                            embedding, _ = actor_curiosity_model.encode(env_output)
+                            env_output["intrinsic_reward"] = intrinsic_memory.bonus(
+                                embedding,
+                                env_output["done"],
+                                clip=float(getattr(flags, "intrinsic_reward_clip", 5.0)),
+                            )
+                            env_output["intrinsic_condition"] = intrinsic_memory.condition_proxy
+                    else:
+                        env_output["intrinsic_reward"] = torch.zeros(
+                            (flags.n_actor_envs, 2), dtype=torch.float32, device=flags.actor_device
+                        )
+                        env_output["intrinsic_condition"] = torch.ones(
+                            (flags.n_actor_envs, 2), dtype=torch.float32, device=flags.actor_device
+                        )
                 if curriculum_enabled:
                     snapshot_interval = max(int(getattr(flags, "snapshot_capture_interval", 16)), 1)
                     capture_indices = [
-                        index for index, game in enumerate(env.unwrapped)
+                        index
+                        for index, game in enumerate(env.unwrapped)
                         if not bool(env_output["done"][index]) and game.game_state.turn % snapshot_interval == 0
                     ]
                     if capture_indices:
@@ -768,6 +873,8 @@ def act(
                 if env_output["done"].any():
                     # Cache reward, done, and info["actions_taken"] from the terminal step
                     cached_reward = env_output["reward"]
+                    cached_intrinsic_reward = env_output.get("intrinsic_reward")
+                    cached_intrinsic_condition = env_output.get("intrinsic_condition")
                     cached_done = env_output["done"]
                     cached_info_actions_taken = env_output["info"]["actions_taken"]
                     cached_info_logging = {
@@ -788,11 +895,16 @@ def act(
                             if entry is not None:
                                 restored[env_index] = entry.payload
                                 restored_metadata[env_index] = (
-                                    entry.payload["opponent"], int(entry.payload.get("learner_player", 0))
+                                    entry.payload["opponent"],
+                                    int(entry.payload.get("learner_player", 0)),
                                 )
                         if restored:
                             env_output = env.restore_snapshots(restored)
                     env_output["reward"] = cached_reward
+                    if cached_intrinsic_reward is not None:
+                        env_output["intrinsic_reward"] = cached_intrinsic_reward
+                    if cached_intrinsic_condition is not None:
+                        env_output["intrinsic_condition"] = cached_intrinsic_condition
                     env_output["done"] = cached_done
                     env_output["info"]["actions_taken"] = cached_info_actions_taken
                     env_output["info"].update(cached_info_logging)
@@ -800,12 +912,19 @@ def act(
                         learner_player = learner_players[env_index]
                         learner_reward = float(cached_reward[env_index, learner_player])
                         opponent_reward = float(cached_reward[env_index, 1 - learner_player])
-                        score = 1.0 if learner_reward > opponent_reward else 0.0 if learner_reward < opponent_reward else 0.5
+                        score = (
+                            1.0
+                            if learner_reward > opponent_reward
+                            else 0.0
+                            if learner_reward < opponent_reward
+                            else 0.5
+                        )
                         _record_league_outcome(league_outcomes, selected_opponents[env_index], score)
                         if env_index in restored_metadata:
                             opponent_name, learner_player = restored_metadata[env_index]
                             selected_opponents[env_index] = next(
-                                index for index, opponent in enumerate(league_opponents)
+                                index
+                                for index, opponent in enumerate(league_opponents)
                                 if opponent.name == opponent_name
                             )
                             learner_players[env_index] = learner_player
@@ -872,6 +991,12 @@ def learn(
     learner_step: int = 0,
     baseline_only: bool = False,
     behavior_kl_controller: Optional[BehaviorKLController] = None,
+    learner_curiosity_model: Optional[ControllableEpisodicCuriosity] = None,
+    actor_curiosity_model: Optional[ControllableEpisodicCuriosity] = None,
+    curiosity_optimizer: Optional[torch.optim.Optimizer] = None,
+    intrinsic_normalizer: Optional[RunningMoments] = None,
+    curiosity_frozen: bool = False,
+    intrinsic_gate_passed: bool = False,
     model_update_reference: Optional[Mapping[str, torch.Tensor]] = None,
     verify_actor_sync: bool = False,
     lock=threading.Lock(),
@@ -879,9 +1004,57 @@ def learn(
     """Performs a learning (optimization) step."""
     with lock:
         current_rule_prior_alphas = apply_rule_prior_schedule(learner_model, flags, learner_step)
+        head_only_value_warmup = baseline_only and bool(getattr(flags, "value_head_only_warmup", False))
+        intrinsic_enabled = bool(getattr(flags, "intrinsic_reward_enabled", False))
+        curiosity_outputs = None
+        curiosity_inverse_loss = torch.zeros((), device=flags.learner_device)
+        curiosity_inverse_stats = {}
+        if intrinsic_enabled:
+            with amp.autocast("cuda", enabled=False):
+                flattened_curiosity_batch = buffers_apply(
+                    batch, lambda x: torch.flatten(x, start_dim=0, end_dim=1)
+                )
+                flat_curiosity_outputs = learner_curiosity_model(flattened_curiosity_batch)
+                curiosity_outputs = {
+                    key: value.view(flags.unroll_length + 1, flags.batch_size, *value.shape[1:])
+                    for key, value in flat_curiosity_outputs.items()
+                }
+                if not curiosity_frozen:
+                    current_spatial = curiosity_outputs["spatial"][:-1].flatten(0, 1)
+                    following_spatial = curiosity_outputs["spatial"][1:].flatten(0, 1)
+                    inverse_actions = {
+                        key: value[1:].flatten(0, 1) for key, value in batch["actions"].items()
+                    }
+                    inverse_taken = {
+                        key: value[1:].flatten(0, 1)
+                        for key, value in batch["info"]["actions_taken"].items()
+                    }
+                    inverse_player_mask = batch["info"]["learner_player_mask"][1:].flatten(0, 1).bool()
+                    curiosity_inverse_loss, curiosity_inverse_stats = learner_curiosity_model.inverse_dynamics_loss(
+                        current_spatial,
+                        following_spatial,
+                        inverse_actions,
+                        inverse_taken,
+                        inverse_player_mask,
+                    )
+                own_change_mask, enemy_change_mask = controllable_change_masks(batch["obs"])
+                shadow_reward = batch["intrinsic_reward"][1:].float()
+                curiosity_inverse_stats["own_change_bonus_median"] = (
+                    float(shadow_reward[own_change_mask].median().detach().cpu().item())
+                    if bool(own_change_mask.any())
+                    else float("nan")
+                )
+                curiosity_inverse_stats["enemy_change_bonus_median"] = (
+                    float(shadow_reward[enemy_change_mask].median().detach().cpu().item())
+                    if bool(enemy_change_mask.any())
+                    else float("nan")
+                )
+                curiosity_inverse_stats["own_change_count"] = int(own_change_mask.sum().detach().cpu().item())
+                curiosity_inverse_stats["enemy_change_count"] = int(enemy_change_mask.sum().detach().cpu().item())
         with amp.autocast("cuda", enabled=flags.use_mixed_precision and flags.learner_device.type == "cuda"):
             flattened_batch = buffers_apply(batch, lambda x: torch.flatten(x, start_dim=0, end_dim=1))
-            learner_outputs = learner_model(flattened_batch)
+            with value_head_only_warmup_mode(learner_model, head_only_value_warmup):
+                learner_outputs = learner_model(flattened_batch)
             learner_outputs = buffers_apply(
                 learner_outputs, lambda x: x.view(flags.unroll_length + 1, flags.batch_size, *x.shape[1:])
             )
@@ -901,13 +1074,9 @@ def learn(
             # obs[t].  The batch itself is shifted below to align action[t]
             # with its resulting obs[t+1], so retain the model-input slice.
             learner_input_legal_masks = {
-                key: value[:-1]
-                for key, value in batch["info"]["available_actions_mask"].items()
+                key: value[:-1] for key, value in batch["info"]["available_actions_mask"].items()
             }
-            learner_input_rule_priors = {
-                key: value[:-1]
-                for key, value in batch["info"].get("rule_prior", {}).items()
-            }
+            learner_input_rule_priors = {key: value[:-1] for key, value in batch["info"].get("rule_prior", {}).items()}
 
             # Take final value function slice for bootstrapping.
             bootstrap_value = learner_outputs["baseline"][-1]
@@ -994,9 +1163,7 @@ def learn(
 
                 prior = learner_input_rule_priors.get(act_space)
                 legal_mask = learner_input_legal_masks[act_space]
-                distill_entities = set(
-                    getattr(flags, "rule_prior_distill_entities", ("worker", "city_tile"))
-                )
+                distill_entities = set(getattr(flags, "rule_prior_distill_entities", ("worker", "city_tile")))
                 if (
                     getattr(flags, "rule_prior_distill_enabled", False)
                     and act_space in distill_entities
@@ -1012,11 +1179,9 @@ def learn(
                     )
                     combined_rule_prior_distill += ranking_loss
                     rule_prior_distill_counts += ranking_count
-                
+
                 # pre_prior entropy
-                pre_prior_entropy_sum, _ = masked_normalized_entropy(
-                    pre_prior_logits, any_actions_taken
-                )
+                pre_prior_entropy_sum, _ = masked_normalized_entropy(pre_prior_logits, any_actions_taken)
                 stats.setdefault("Entropy_PrePrior", {})[act_space] = float(
                     (pre_prior_entropy_sum / active_count.clamp_min(1)).detach().cpu().item()
                 )
@@ -1030,7 +1195,7 @@ def learn(
                 combined_forward_behavior_kl += forward_kl
                 combined_reverse_behavior_kl += reverse_kl
                 behavior_kl_counts += kl_counts
-                
+
                 # Top1 Prob and Margins
                 if int(active_count) > 0:
                     probs = F.softmax(learner_policy_logits, dim=-1)
@@ -1039,36 +1204,48 @@ def learn(
                     top2_prob = top2_probs[..., 1]
                     top1_idx = top2_indices[..., 0]
                     margin = top1_prob - top2_prob
-                    
+
                     active_top1 = top1_prob[any_actions_taken]
                     active_margin = margin[any_actions_taken]
                     active_top1_idx = top1_idx[any_actions_taken]
-                    
+
                     total_active = active_top1_idx.numel()
                     for action_idx, action_name in enumerate(ACTION_MEANINGS[act_space]):
                         count = (active_top1_idx == action_idx).sum().float().item()
                         if count > 0:
-                            stats.setdefault("Policy", {})[f"{act_space}_top1_action_{action_name}_fraction"] = count / total_active
-                    
-                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_mean"] = float(active_top1.mean().cpu().item())
-                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_p95"] = float(torch.quantile(active_top1, 0.95).cpu().item())
-                    stats.setdefault("Policy", {})[f"{act_space}_top1_top2_margin"] = float(active_margin.mean().cpu().item())
+                            stats.setdefault("Policy", {})[f"{act_space}_top1_action_{action_name}_fraction"] = (
+                                count / total_active
+                            )
+
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_mean"] = float(
+                        active_top1.mean().cpu().item()
+                    )
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_prob_p95"] = float(
+                        torch.quantile(active_top1, 0.95).cpu().item()
+                    )
+                    stats.setdefault("Policy", {})[f"{act_space}_top1_top2_margin"] = float(
+                        active_margin.mean().cpu().item()
+                    )
                     active_logits = learner_policy_logits[any_actions_taken]
                     finite_active_logits = active_logits[torch.isfinite(active_logits)]
                     stats.setdefault("Policy", {})[f"{act_space}_logits_abs_max"] = (
                         float(finite_active_logits.abs().max().cpu().item())
-                        if finite_active_logits.numel() else float("nan")
+                        if finite_active_logits.numel()
+                        else float("nan")
                     )
 
                     # Rule Prior explicit stats
                     if prior is not None:
-                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_mean"] = float(prior[any_actions_taken].abs().mean().cpu().item())
-                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_max"] = float(prior[any_actions_taken].abs().max().cpu().item())
+                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_mean"] = float(
+                            prior[any_actions_taken].abs().mean().cpu().item()
+                        )
+                        stats.setdefault("RulePrior", {})[f"{act_space}_abs_max"] = float(
+                            prior[any_actions_taken].abs().max().cpu().item()
+                        )
                         delta = learner_policy_logits - pre_prior_logits
                         finite_delta = delta[any_actions_taken.unsqueeze(-1) & torch.isfinite(delta)]
                         stats["RulePrior"][f"{act_space}_scaled_delta_abs_mean"] = (
-                            float(finite_delta.abs().mean().cpu().item())
-                            if finite_delta.numel() else 0.0
+                            float(finite_delta.abs().mean().cpu().item()) if finite_delta.numel() else 0.0
                         )
                         prior_masked = prior.masked_fill(~legal_mask.bool(), float("-inf"))
                         prior_best_score = prior_masked.max(dim=-1).values
@@ -1095,8 +1272,14 @@ def learn(
                             (post_agrees & confident).sum().div(confident_count.clamp_min(1)).cpu().item()
                         )
                         stats["RulePrior"][f"{act_space}_top1_flip_rate"] = float(
-                            ((pre_prior_logits.argmax(dim=-1) != learner_policy_logits.argmax(dim=-1))
-                             & any_actions_taken).sum().div(active_count.clamp_min(1)).cpu().item()
+                            (
+                                (pre_prior_logits.argmax(dim=-1) != learner_policy_logits.argmax(dim=-1))
+                                & any_actions_taken
+                            )
+                            .sum()
+                            .div(active_count.clamp_min(1))
+                            .cpu()
+                            .item()
                         )
                         prior_kl, prior_kl_count = masked_policy_kl(
                             learner_policy_logits, pre_prior_logits, any_actions_taken, reverse=False
@@ -1110,7 +1293,9 @@ def learn(
                     delta_logp = learner_action_log_probs - behavior_action_log_probs
                     active_delta = delta_logp[delta_logp != 0]
                     if active_delta.numel() > 0:
-                        stats.setdefault("Behavior_Policy", {})[f"{act_space}_delta_logp_p05"] = float(torch.quantile(active_delta, 0.05).cpu().item())
+                        stats.setdefault("Behavior_Policy", {})[f"{act_space}_delta_logp_p05"] = float(
+                            torch.quantile(active_delta, 0.05).cpu().item()
+                        )
 
             discounts = (~batch["done"]).float() * flags.discounting
             discounts = discounts.unsqueeze(-1).expand_as(combined_behavior_action_log_probs)
@@ -1138,6 +1323,38 @@ def learn(
                 lmb=flags.lmb,
             )
 
+            intrinsic_vtrace_returns = None
+            intrinsic_values = None
+            intrinsic_baseline_loss = torch.zeros_like(values.mean())
+            intrinsic_pg_advantages = torch.zeros_like(vtrace_returns.pg_advantages)
+            beta = (
+                intrinsic_beta(flags, learner_step)
+                if intrinsic_enabled and curiosity_frozen and intrinsic_gate_passed
+                else 0.0
+            )
+            normalized_intrinsic_reward = None
+            if intrinsic_enabled and curiosity_frozen:
+                intrinsic_values_all = curiosity_outputs["intrinsic_value"]
+                intrinsic_bootstrap_value = intrinsic_values_all[-1]
+                intrinsic_values = intrinsic_values_all[:-1]
+                raw_intrinsic_reward = batch["intrinsic_reward"].float()
+                normalized_intrinsic_reward = intrinsic_normalizer.normalize(
+                    raw_intrinsic_reward,
+                    float(getattr(flags, "intrinsic_reward_clip", 5.0)),
+                )
+                intrinsic_discounts = (~batch["done"]).float().unsqueeze(-1).expand_as(
+                    combined_behavior_action_log_probs
+                ) * float(getattr(flags, "intrinsic_discounting", 0.99))
+                intrinsic_vtrace_returns = vtrace.from_action_log_probs(
+                    behavior_action_log_probs=combined_behavior_action_log_probs,
+                    target_action_log_probs=combined_learner_action_log_probs,
+                    discounts=intrinsic_discounts,
+                    rewards=normalized_intrinsic_reward,
+                    values=intrinsic_values,
+                    bootstrap_value=intrinsic_bootstrap_value,
+                )
+                intrinsic_pg_advantages = intrinsic_vtrace_returns.pg_advantages
+
             learner_player_mask_batch = batch["info"]["learner_player_mask"].to(values.dtype)
             trajectory_normalize = getattr(flags, "loss_normalization", "legacy") == "trajectory"
             vtrace_advantages = vtrace_returns.pg_advantages
@@ -1155,10 +1372,14 @@ def learn(
 
                 vtrace_advantages = normalize_advantage(vtrace_advantages)
                 upgo_advantages = normalize_advantage(upgo_advantages)
+                if intrinsic_vtrace_returns is not None:
+                    intrinsic_pg_advantages = normalize_advantage(intrinsic_pg_advantages)
+
+            combined_vtrace_advantages = vtrace_advantages + float(beta) * intrinsic_pg_advantages
 
             vtrace_pg_loss = compute_policy_gradient_loss(
                 combined_learner_action_log_probs,
-                vtrace_advantages,
+                combined_vtrace_advantages,
                 reduction=flags.reduction,
                 trajectory_weights=action_counts if trajectory_normalize else None,
                 action_counts=action_counts,
@@ -1175,8 +1396,10 @@ def learn(
             )
             if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss":
                 baseline_loss = compute_categorical_baseline_loss(
-                    learner_outputs["baseline_logits"], td_lambda_returns.vs,
-                    reduction=flags.reduction, player_mask=learner_player_mask_batch,
+                    learner_outputs["baseline_logits"],
+                    td_lambda_returns.vs,
+                    reduction=flags.reduction,
+                    player_mask=learner_player_mask_batch,
                     trajectory_normalize=trajectory_normalize,
                     value_min=float(getattr(flags, "value_support_min", -2.0)),
                     value_max=float(getattr(flags, "value_support_max", 2.0)),
@@ -1184,8 +1407,19 @@ def learn(
                 )
             else:
                 baseline_loss = compute_baseline_loss(
-                    values, td_lambda_returns.vs, reduction=flags.reduction,
-                    player_mask=learner_player_mask_batch, trajectory_normalize=trajectory_normalize,
+                    values,
+                    td_lambda_returns.vs,
+                    reduction=flags.reduction,
+                    player_mask=learner_player_mask_batch,
+                    trajectory_normalize=trajectory_normalize,
+                )
+            if intrinsic_vtrace_returns is not None:
+                intrinsic_baseline_loss = compute_baseline_loss(
+                    intrinsic_values,
+                    intrinsic_vtrace_returns.vs,
+                    reduction=flags.reduction,
+                    player_mask=learner_player_mask_batch,
+                    trajectory_normalize=trajectory_normalize,
                 )
             teacher_kl_cost = teacher_kl_coefficient(flags, learner_step)
             reduced_teacher_kl = (
@@ -1214,17 +1448,12 @@ def learn(
                 else reduce(combined_learner_entropy, reduction=flags.reduction)
             )
             entropy_loss = flags.entropy_cost * reduced_entropy
-            reduced_reverse_behavior_kl = trajectory_weighted_mean(
-                combined_reverse_behavior_kl, behavior_kl_counts
-            )
-            reduced_forward_behavior_kl = trajectory_weighted_mean(
-                combined_forward_behavior_kl, behavior_kl_counts
-            )
+            reduced_reverse_behavior_kl = trajectory_weighted_mean(combined_reverse_behavior_kl, behavior_kl_counts)
+            reduced_forward_behavior_kl = trajectory_weighted_mean(combined_forward_behavior_kl, behavior_kl_counts)
             behavior_kl_loss = torch.zeros_like(baseline_loss)
-            overall_normalized_entropy = (
-                sum(normalized_entropies[key] * active_entity_counts[key] for key in normalized_entropies)
-                / max(sum(active_entity_counts.values()), 1)
-            )
+            overall_normalized_entropy = sum(
+                normalized_entropies[key] * active_entity_counts[key] for key in normalized_entropies
+            ) / max(sum(active_entity_counts.values()), 1)
             if behavior_kl_controller is not None:
                 behavior_kl_controller.observe(
                     learner_step,
@@ -1240,9 +1469,7 @@ def learn(
                 for act_space, logits in learner_outputs["policy_logits"].items():
                     targets = batch["rule_actions"][act_space]
                     mask = batch["rule_confidence"][act_space]
-                    ce = F.cross_entropy(
-                        logits.flatten(0, -2), targets.flatten(), reduction="none"
-                    ).view_as(targets)
+                    ce = F.cross_entropy(logits.flatten(0, -2), targets.flatten(), reduction="none").view_as(targets)
                     masked_ce = torch.where(mask, ce, torch.zeros_like(ce))
                     rule_losses += masked_ce.sum(dim=(2, 4, 5))
                     rule_counts += mask.sum(dim=(2, 4, 5))
@@ -1258,9 +1485,7 @@ def learn(
                 ce = F.cross_entropy(logits.flatten(0, -2), targets.flatten(), reduction="none").view_as(targets)
                 intent_losses = torch.where(mask, ce, torch.zeros_like(ce)).sum(dim=(2, 4, 5))
                 intent_counts = mask.sum(dim=(2, 4, 5))
-                intent_aux_loss = float(flags.intent_aux_cost) * trajectory_weighted_mean(
-                    intent_losses, intent_counts
-                )
+                intent_aux_loss = float(flags.intent_aux_cost) * trajectory_weighted_mean(intent_losses, intent_counts)
                 if bool(mask.any()):
                     predictions = logits.argmax(dim=-1)
                     targets_for_logits = targets.view_as(predictions)
@@ -1324,40 +1549,59 @@ def learn(
                     }
 
             total_games_played += batch["done"].sum().item()
-            
+
             _log_rhos = vtrace_returns.log_rhos.detach().float()
             _N_t = action_counts.detach().float()
             _N_t_clamp = _N_t.clamp_min(1)
             _geomean_log_rhos = _log_rhos / _N_t_clamp
-            
+
             _N_t_flat = _N_t.flatten()
             _abs_log_rhos_flat = _log_rhos.abs().flatten()
             _N_t_mean = _N_t_flat.mean()
             _abs_log_rhos_mean = _abs_log_rhos_flat.mean()
             _corr_num = torch.sum((_N_t_flat - _N_t_mean) * (_abs_log_rhos_flat - _abs_log_rhos_mean))
-            _corr_den = torch.sqrt(torch.sum((_N_t_flat - _N_t_mean)**2) * torch.sum((_abs_log_rhos_flat - _abs_log_rhos_mean)**2)) + 1e-8
+            _corr_den = (
+                torch.sqrt(
+                    torch.sum((_N_t_flat - _N_t_mean) ** 2) * torch.sum((_abs_log_rhos_flat - _abs_log_rhos_mean) ** 2)
+                )
+                + 1e-8
+            )
             _corr_N_abs_log_rho = float((_corr_num / _corr_den).cpu().item())
-            
+
             # --- Reward Analysis ---
             _done_mask = batch["done"].unsqueeze(-1).expand_as(batch["reward"])
-            _terminal_rewards = torch.where(
-                _done_mask,
-                torch.round(batch["reward"]),
-                torch.zeros_like(batch["reward"])
-            )
+            _terminal_rewards = torch.where(_done_mask, torch.round(batch["reward"]), torch.zeros_like(batch["reward"]))
             _shaping_rewards = batch["reward"] - _terminal_rewards
-            
+
             _num_dones = max(1, int(batch["done"].sum().item()))
             _shaping_sum_all_abs = float(_shaping_rewards.abs().sum().item())
             _shaping_episode_sum = _shaping_sum_all_abs / (_num_dones * 2)
-            _terminal_abs_mean = float(_terminal_rewards[_done_mask].abs().mean().item()) if batch["done"].any() else 0.0
+            _terminal_abs_mean = (
+                float(_terminal_rewards[_done_mask].abs().mean().item()) if batch["done"].any() else 0.0
+            )
             _shaping_to_terminal_ratio = abs(_shaping_episode_sum) / 1.0
 
             _shaping_active = _shaping_rewards[_shaping_rewards != 0]
             _potential_mean = float(_shaping_active.mean().item() / 0.05) if _shaping_active.numel() > 0 else 0.0
             _potential_std = float(_shaping_active.std().item() / 0.05) if _shaping_active.numel() > 1 else 0.0
-            _potential_delta_p95 = float(torch.quantile(_shaping_active.abs(), 0.95).item() / 0.05) if _shaping_active.numel() > 0 else 0.0
-            
+            _potential_delta_p95 = (
+                float(torch.quantile(_shaping_active.abs(), 0.95).item() / 0.05) if _shaping_active.numel() > 0 else 0.0
+            )
+            if intrinsic_enabled:
+                _intrinsic_raw = batch["intrinsic_reward"].detach().float()
+                _intrinsic_mean = float(_intrinsic_raw.mean().cpu().item())
+                _intrinsic_p95 = float(torch.quantile(_intrinsic_raw.flatten(), 0.95).cpu().item())
+                _intrinsic_max = float(_intrinsic_raw.max().cpu().item())
+                _intrinsic_condition = batch["intrinsic_condition"].detach().float()
+                _intrinsic_condition_mean = float(_intrinsic_condition.mean().cpu().item())
+                _intrinsic_condition_max = float(_intrinsic_condition.max().cpu().item())
+                _intrinsic_adv_abs = float(intrinsic_pg_advantages.detach().abs().mean().cpu().item())
+                _external_adv_abs = float(vtrace_advantages.detach().abs().mean().cpu().item())
+            else:
+                _intrinsic_mean = _intrinsic_p95 = _intrinsic_max = _intrinsic_adv_abs = 0.0
+                _intrinsic_condition_mean = _intrinsic_condition_max = 1.0
+                _external_adv_abs = float(vtrace_advantages.detach().abs().mean().cpu().item())
+
             # --- Advantage Analysis ---
             _active_adv = vtrace_advantages[action_counts > 0]
             _adv_std = float(_active_adv.std().item()) if _active_adv.numel() > 1 else 0.0
@@ -1367,12 +1611,16 @@ def learn(
             _adv_p95 = float(torch.quantile(_active_adv.abs(), 0.95).item()) if _active_adv.numel() > 0 else 0.0
             _adv_p99 = float(torch.quantile(_active_adv.abs(), 0.99).item()) if _active_adv.numel() > 0 else 0.0
             _adv_max_abs = float(_active_adv.abs().max().item()) if _active_adv.numel() > 0 else 0.0
-            _adv_clipped_fraction = float((_active_adv.abs() >= 4.9).float().mean().item()) if _active_adv.numel() > 0 else 0.0
+            _adv_clipped_fraction = (
+                float((_active_adv.abs() >= 4.9).float().mean().item()) if _active_adv.numel() > 0 else 0.0
+            )
 
             # --- Policy Gradient ---
             _N_t_active = action_counts[action_counts > 0]
             _effective_action_count = float(_N_t_active.mean().item()) if _N_t_active.numel() > 0 else 0.0
-            _abs_adv_times_N = float((_active_adv.abs() * _N_t_active).mean().item()) if _N_t_active.numel() > 0 else 0.0
+            _abs_adv_times_N = (
+                float((_active_adv.abs() * _N_t_active).mean().item()) if _N_t_active.numel() > 0 else 0.0
+            )
 
             # --- Advantage Analysis Given Action ---
             T, B, _ = vtrace_advantages.shape
@@ -1381,7 +1629,7 @@ def learn(
                 _actions = batch["actions"][act_space][..., 0]
                 _mask = batch["info"]["actions_taken"][act_space].any(dim=-1)
                 _legal_mask = batch["info"]["available_actions_mask"][act_space]
-                
+
                 _can_act_mask = _mask & _legal_mask[..., 1:].any(dim=-1)
                 total_taken = _mask.sum().float().item()
                 total_can_act = _can_act_mask.sum().float().item()
@@ -1391,177 +1639,243 @@ def learn(
                         _this_action_mask = _mask & (_actions == action_idx)
                         _count = _this_action_mask.sum().float().item()
                         _rate = _count / total_taken
-                        
+
                         _this_legal_mask = _mask & _legal_mask[..., action_idx]
                         _legal_count = _this_legal_mask.sum().float().item()
                         _rate_legal = _count / _legal_count if _legal_count > 0 else 0.0
-                        
+
                         _this_action_can_act_mask = _can_act_mask & (_actions == action_idx)
                         _count_can_act = _this_action_can_act_mask.sum().float().item()
                         _rate_can_act = _count_can_act / total_can_act if total_can_act > 0 else 0.0
-                        
-                        stats.setdefault("ActionRate", {})[f"{act_space}_{action_name}"] = stats.get("ActionRate", {}).get(f"{act_space}_{action_name}", 0.0) + _rate
-                        
+
+                        stats.setdefault("ActionRate", {})[f"{act_space}_{action_name}"] = (
+                            stats.get("ActionRate", {}).get(f"{act_space}_{action_name}", 0.0) + _rate
+                        )
+
                         if _legal_count > 0:
-                            stats.setdefault("ActionRateLegal", {})[f"{act_space}_{action_name}"] = stats.get("ActionRateLegal", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_legal
-                            
+                            stats.setdefault("ActionRateLegal", {})[f"{act_space}_{action_name}"] = (
+                                stats.get("ActionRateLegal", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_legal
+                            )
+
                         if total_can_act > 0:
-                            stats.setdefault("ActionRateCanAct", {})[f"{act_space}_{action_name}"] = stats.get("ActionRateCanAct", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_can_act
-                        
+                            stats.setdefault("ActionRateCanAct", {})[f"{act_space}_{action_name}"] = (
+                                stats.get("ActionRateCanAct", {}).get(f"{act_space}_{action_name}", 0.0) + _rate_can_act
+                            )
+
                         if _count > 0:
                             _adv_for_action = _adv_expanded.expand_as(_this_action_mask)[_this_action_mask]
                             _mean_adv = float(_adv_for_action.mean().item())
-                            
-                            _current_mean = stats.setdefault("AdvantageGivenAction", {}).get(f"{act_space}_{action_name}", 0.0)
-                            _current_weight = stats.setdefault("_AdvantageGivenActionWeight", {}).get(f"{act_space}_{action_name}", 0.0)
-                            
+
+                            _current_mean = stats.setdefault("AdvantageGivenAction", {}).get(
+                                f"{act_space}_{action_name}", 0.0
+                            )
+                            _current_weight = stats.setdefault("_AdvantageGivenActionWeight", {}).get(
+                                f"{act_space}_{action_name}", 0.0
+                            )
+
                             _new_weight = _current_weight + _count
                             _new_mean = (_current_mean * _current_weight + _mean_adv * _count) / _new_weight
-                            
+
                             stats["AdvantageGivenAction"][f"{act_space}_{action_name}"] = _new_mean
                             stats["_AdvantageGivenActionWeight"][f"{act_space}_{action_name}"] = _new_weight
-            
+
             if "_AdvantageGivenActionWeight" in stats:
                 del stats["_AdvantageGivenActionWeight"]
 
-            stats.update({
-                "Reward": {
-                    "shaping_episode_sum": _shaping_episode_sum,
-                    "terminal": _terminal_abs_mean,
-                    "shaping_to_terminal_ratio": _shaping_to_terminal_ratio,
-                    "potential_mean": _potential_mean,
-                    "potential_std": _potential_std,
-                    "potential_delta_p95": _potential_delta_p95,
-                },
-                "Advantage": {
-                    "std": _adv_std,
-                    "p01": _adv_p01,
-                    "p05": _adv_p05,
-                    "p50": _adv_p50,
-                    "p95": _adv_p95,
-                    "p99": _adv_p99,
-                    "max_abs": _adv_max_abs,
-                    "clipped_fraction": _adv_clipped_fraction,
-                },
-                "PolicyGradient": {
-                    "effective_action_count": _effective_action_count,
-                    "abs_advantage_times_decision_count": _abs_adv_times_N,
-                },
-                "Env": {
-                    key[8:]: val[batch["done"]][~val[batch["done"]].isnan()].mean().item()
-                    for key, val in batch["info"].items()
-                    if key.startswith("LOGGING_") and "ACTIONS_" not in key
-                },
-                "Actions": action_distributions_aggregated,
-                "Loss": {
-                    "vtrace_pg_loss": vtrace_pg_loss.detach().item(),
-                    "upgo_pg_loss": upgo_pg_loss.detach().item(),
-                    "baseline_loss": baseline_loss.detach().item(),
-                    "teacher_kl_loss": teacher_kl_loss.detach().item(),
-                    "teacher_baseline_loss": teacher_baseline_loss.detach().item(),
-                    "entropy_loss": entropy_loss.detach().item(),
-                    "behavior_kl_loss": behavior_kl_loss.detach().item(),
-                    "rule_prior_distill_loss": rule_prior_distill_loss.detach().item(),
-                    "rule_aux_loss": rule_aux_loss.detach().item(),
-                    "intent_aux_loss": intent_aux_loss.detach().item(),
-                    "total_loss": total_loss.detach().item(),
-                },
-                "Entropy": {"overall": sum(e for e in entropies.values() if not math.isnan(e)), **entropies},
-                "Normalized_Entropy": {"overall": overall_normalized_entropy, **normalized_entropies},
-                "Active_Entities": active_entity_counts,
-                "Behavior_Policy": {
-                    "forward_kl": float(reduced_forward_behavior_kl.detach().cpu().item()),
-                    "reverse_kl": float(reduced_reverse_behavior_kl.detach().cpu().item()),
-                    "beta": behavior_kl_controller.beta if behavior_kl_controller is not None else 0.0,
-                    "target": behavior_kl_controller.target if behavior_kl_controller is not None else None,
-                    "ema_kl": behavior_kl_controller.ema_kl if behavior_kl_controller is not None else None,
-                    "log_rho_mean": float(_log_rhos.mean().cpu().item()),
-                    "log_rho_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
-                    "log_rho_max": float(_log_rhos.max().cpu().item()),
-                    "vtrace_rho_clipped_fraction": float((_log_rhos > 0).float().mean().cpu().item()),
-                    "decision_count_mean": float(_N_t.mean().cpu().item()),
-                    "decision_count_p95": float(torch.quantile(_N_t, 0.95).cpu().item()),
-                    "abs_log_rho_per_action": float(_geomean_log_rhos.abs().mean().cpu().item()),
-                    "geomean_log_rho_mean": float(_geomean_log_rhos.mean().cpu().item()),
-                    "geomean_log_rho_p05": float(torch.quantile(_geomean_log_rhos, 0.05).cpu().item()),
-                    "geomean_log_rho_p50": float(torch.quantile(_geomean_log_rhos, 0.50).cpu().item()),
-                    "geomean_log_rho_p95": float(torch.quantile(_geomean_log_rhos, 0.95).cpu().item()),
-                    "delta_logp_p01": float(torch.quantile(_log_rhos, 0.01).cpu().item()),
-                    "delta_logp_p05": float(torch.quantile(_log_rhos, 0.05).cpu().item()),
-                    "delta_logp_p50": float(torch.quantile(_log_rhos, 0.50).cpu().item()),
-                    "delta_logp_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
-                    "corr_N_abs_log_rho": _corr_N_abs_log_rho,
-                    "learner_version": int(learner_step),
-                    "actor_version_min": int(batch["policy_version"].min().cpu().item()),
-                    "actor_version_max": int(batch["policy_version"].max().cpu().item()),
-                    "buffer_lag_max": int(learner_step - batch["policy_version"].min().cpu().item()),
-                },
-                "Value": {
-                    "explained_variance": explained_variance(values, td_lambda_returns.vs),
-                    "target_std": float(td_lambda_returns.vs.detach().float().std(unbiased=False).cpu().item()),
-                    "bias": float((values.detach() - td_lambda_returns.vs.detach()).float().mean().cpu().item()),
-                    "support_outside_fraction": float(support_outside_fraction(
-                        td_lambda_returns.vs.detach(),
-                        float(getattr(flags, "value_support_min", -2.0)),
-                        float(getattr(flags, "value_support_max", 2.0)),
-                    ).cpu().item()) if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss" else 0.0,
-                },
-                "Teacher_KL_Divergence": {
-                    "overall": sum(tkld for tkld in teacher_kl_losses.values() if not math.isnan(tkld)),
-                    **teacher_kl_losses,
-                },
-                "Intent": {
-                    "accuracy": intent_accuracy,
-                    "target_mine": int(intent_target_counts[0]),
-                    "target_deliver": int(intent_target_counts[1]),
-                    "target_build": int(intent_target_counts[2]),
-                    "target_return": int(intent_target_counts[3]),
-                },
-                "Misc": {
-                    "learning_rate": last_lr,
-                    "teacher_kl_cost": teacher_kl_cost,
-                    "rule_prior_distill_cost": rule_prior_distill_cost,
-                    **{f"rule_prior_alpha_{key}": value for key, value in current_rule_prior_alphas.items()},
-                    "actor_policy_tta_rot180": float(getattr(flags, "actor_policy_tta_rot180", False)),
-                    "teacher_policy_tta_rot180": float(getattr(flags, "teacher_policy_tta_rot180", False)),
-                    "total_games_played": total_games_played,
-                    "league_opponents": {
-                        opponent["name"]: (batch["info"]["league_opponent_id"] == opponent_index)
-                        .float()
-                        .mean()
-                        .item()
-                        for opponent_index, opponent in enumerate(flags.league_opponents)
+            stats.update(
+                {
+                    "Reward": {
+                        "shaping_episode_sum": _shaping_episode_sum,
+                        "terminal": _terminal_abs_mean,
+                        "shaping_to_terminal_ratio": _shaping_to_terminal_ratio,
+                        "potential_mean": _potential_mean,
+                        "potential_std": _potential_std,
+                        "potential_delta_p95": _potential_delta_p95,
                     },
-                },
-            })
+                    "Advantage": {
+                        "std": _adv_std,
+                        "p01": _adv_p01,
+                        "p05": _adv_p05,
+                        "p50": _adv_p50,
+                        "p95": _adv_p95,
+                        "p99": _adv_p99,
+                        "max_abs": _adv_max_abs,
+                        "clipped_fraction": _adv_clipped_fraction,
+                    },
+                    "PolicyGradient": {
+                        "effective_action_count": _effective_action_count,
+                        "abs_advantage_times_decision_count": _abs_adv_times_N,
+                    },
+                    "Env": {
+                        key[8:]: val[batch["done"]][~val[batch["done"]].isnan()].mean().item()
+                        for key, val in batch["info"].items()
+                        if key.startswith("LOGGING_") and "ACTIONS_" not in key
+                    },
+                    "Actions": action_distributions_aggregated,
+                    "Loss": {
+                        "vtrace_pg_loss": vtrace_pg_loss.detach().item(),
+                        "upgo_pg_loss": upgo_pg_loss.detach().item(),
+                        "baseline_loss": baseline_loss.detach().item(),
+                        "teacher_kl_loss": teacher_kl_loss.detach().item(),
+                        "teacher_baseline_loss": teacher_baseline_loss.detach().item(),
+                        "entropy_loss": entropy_loss.detach().item(),
+                        "behavior_kl_loss": behavior_kl_loss.detach().item(),
+                        "rule_prior_distill_loss": rule_prior_distill_loss.detach().item(),
+                        "rule_aux_loss": rule_aux_loss.detach().item(),
+                        "intent_aux_loss": intent_aux_loss.detach().item(),
+                        "intrinsic_inverse_loss": curiosity_inverse_loss.detach().item(),
+                        "intrinsic_baseline_loss": intrinsic_baseline_loss.detach().item(),
+                        "total_loss": total_loss.detach().item(),
+                    },
+                    "Intrinsic": {
+                        "enabled": float(intrinsic_enabled),
+                        "frozen": float(curiosity_frozen),
+                        "beta": float(beta),
+                        "reward_mean": _intrinsic_mean,
+                        "reward_p95": _intrinsic_p95,
+                        "reward_max": _intrinsic_max,
+                        "condition_proxy_mean": _intrinsic_condition_mean,
+                        "condition_proxy_max": _intrinsic_condition_max,
+                        "advantage_abs_mean": _intrinsic_adv_abs,
+                        "external_advantage_abs_mean": _external_adv_abs,
+                        "advantage_ratio": _intrinsic_adv_abs / max(_external_adv_abs, 1e-8),
+                        "normalizer_count": intrinsic_normalizer.count if intrinsic_normalizer is not None else 0.0,
+                        "normalizer_std": intrinsic_normalizer.std if intrinsic_normalizer is not None else 1.0,
+                        **curiosity_inverse_stats,
+                    },
+                    "Entropy": {"overall": sum(e for e in entropies.values() if not math.isnan(e)), **entropies},
+                    "Normalized_Entropy": {"overall": overall_normalized_entropy, **normalized_entropies},
+                    "Active_Entities": active_entity_counts,
+                    "Behavior_Policy": {
+                        "forward_kl": float(reduced_forward_behavior_kl.detach().cpu().item()),
+                        "reverse_kl": float(reduced_reverse_behavior_kl.detach().cpu().item()),
+                        "beta": behavior_kl_controller.beta if behavior_kl_controller is not None else 0.0,
+                        "target": behavior_kl_controller.target if behavior_kl_controller is not None else None,
+                        "ema_kl": behavior_kl_controller.ema_kl if behavior_kl_controller is not None else None,
+                        "log_rho_mean": float(_log_rhos.mean().cpu().item()),
+                        "log_rho_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
+                        "log_rho_max": float(_log_rhos.max().cpu().item()),
+                        "vtrace_rho_clipped_fraction": float((_log_rhos > 0).float().mean().cpu().item()),
+                        "decision_count_mean": float(_N_t.mean().cpu().item()),
+                        "decision_count_p95": float(torch.quantile(_N_t, 0.95).cpu().item()),
+                        "abs_log_rho_per_action": float(_geomean_log_rhos.abs().mean().cpu().item()),
+                        "geomean_log_rho_mean": float(_geomean_log_rhos.mean().cpu().item()),
+                        "geomean_log_rho_p05": float(torch.quantile(_geomean_log_rhos, 0.05).cpu().item()),
+                        "geomean_log_rho_p50": float(torch.quantile(_geomean_log_rhos, 0.50).cpu().item()),
+                        "geomean_log_rho_p95": float(torch.quantile(_geomean_log_rhos, 0.95).cpu().item()),
+                        "delta_logp_p01": float(torch.quantile(_log_rhos, 0.01).cpu().item()),
+                        "delta_logp_p05": float(torch.quantile(_log_rhos, 0.05).cpu().item()),
+                        "delta_logp_p50": float(torch.quantile(_log_rhos, 0.50).cpu().item()),
+                        "delta_logp_p95": float(torch.quantile(_log_rhos, 0.95).cpu().item()),
+                        "corr_N_abs_log_rho": _corr_N_abs_log_rho,
+                        "learner_version": int(learner_step),
+                        "actor_version_min": int(batch["policy_version"].min().cpu().item()),
+                        "actor_version_max": int(batch["policy_version"].max().cpu().item()),
+                        "buffer_lag_max": int(learner_step - batch["policy_version"].min().cpu().item()),
+                    },
+                    "Value": {
+                        "explained_variance": explained_variance(values, td_lambda_returns.vs),
+                        "target_std": float(td_lambda_returns.vs.detach().float().std(unbiased=False).cpu().item()),
+                        "bias": float((values.detach() - td_lambda_returns.vs.detach()).float().mean().cpu().item()),
+                        "support_outside_fraction": float(
+                            support_outside_fraction(
+                                td_lambda_returns.vs.detach(),
+                                float(getattr(flags, "value_support_min", -2.0)),
+                                float(getattr(flags, "value_support_max", 2.0)),
+                            )
+                            .cpu()
+                            .item()
+                        )
+                        if getattr(flags, "value_critic", "scalar") == "categorical_hl_gauss"
+                        else 0.0,
+                    },
+                    "Teacher_KL_Divergence": {
+                        "overall": sum(tkld for tkld in teacher_kl_losses.values() if not math.isnan(tkld)),
+                        **teacher_kl_losses,
+                    },
+                    "Intent": {
+                        "accuracy": intent_accuracy,
+                        "target_mine": int(intent_target_counts[0]),
+                        "target_deliver": int(intent_target_counts[1]),
+                        "target_build": int(intent_target_counts[2]),
+                        "target_return": int(intent_target_counts[3]),
+                    },
+                    "Misc": {
+                        "learning_rate": last_lr,
+                        "teacher_kl_cost": teacher_kl_cost,
+                        "rule_prior_distill_cost": rule_prior_distill_cost,
+                        **{f"rule_prior_alpha_{key}": value for key, value in current_rule_prior_alphas.items()},
+                        "actor_policy_tta_rot180": float(getattr(flags, "actor_policy_tta_rot180", False)),
+                        "learner_policy_tta_rot180": float(getattr(flags, "learner_policy_tta_rot180", False)),
+                        "teacher_policy_tta_rot180": float(getattr(flags, "teacher_policy_tta_rot180", False)),
+                        "value_warmup_active": float(baseline_only),
+                        "value_head_only_warmup": float(head_only_value_warmup),
+                        "total_games_played": total_games_played,
+                        "league_opponents": {
+                            opponent["name"]: (batch["info"]["league_opponent_id"] == opponent_index)
+                            .float()
+                            .mean()
+                            .item()
+                            for opponent_index, opponent in enumerate(flags.league_opponents)
+                        },
+                    },
+                }
+            )
 
             optimizer.zero_grad()
             if flags.use_mixed_precision:
                 grad_scaler.scale(total_loss).backward()
+                if head_only_value_warmup:
+                    retain_value_head_gradients(learner_model)
                 grad_scaler.unscale_(optimizer)
                 if flags.clip_grads is not None:
                     gradient_norm = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
                 else:
-                    gradient_norm = torch.sqrt(sum(
-                        parameter.grad.detach().float().square().sum()
-                        for parameter in learner_model.parameters() if parameter.grad is not None
-                    ))
+                    gradient_norm = torch.sqrt(
+                        sum(
+                            parameter.grad.detach().float().square().sum()
+                            for parameter in learner_model.parameters()
+                            if parameter.grad is not None
+                        )
+                    )
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
             else:
                 total_loss.backward()
+                if head_only_value_warmup:
+                    retain_value_head_gradients(learner_model)
                 if flags.clip_grads is not None:
                     gradient_norm = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
                 else:
-                    gradient_norm = torch.sqrt(sum(
-                        parameter.grad.detach().float().square().sum()
-                        for parameter in learner_model.parameters() if parameter.grad is not None
-                    ))
+                    gradient_norm = torch.sqrt(
+                        sum(
+                            parameter.grad.detach().float().square().sum()
+                            for parameter in learner_model.parameters()
+                            if parameter.grad is not None
+                        )
+                    )
                 optimizer.step()
+            curiosity_gradient_norm = torch.zeros((), device=flags.learner_device)
+            if intrinsic_enabled:
+                curiosity_optimizer.zero_grad()
+                curiosity_loss = (
+                    float(getattr(flags, "intrinsic_inverse_cost", 0.1)) * curiosity_inverse_loss
+                    if not curiosity_frozen
+                    else intrinsic_baseline_loss
+                )
+                curiosity_loss.backward()
+                curiosity_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    learner_curiosity_model.parameters(),
+                    flags.clip_grads if flags.clip_grads is not None else float("inf"),
+                )
+                curiosity_optimizer.step()
+                stats["Loss"]["curiosity_total_loss"] = float(curiosity_loss.detach().cpu().item())
             stats["Gradient"] = {
                 "norm_before_clip": float(gradient_norm.detach().cpu().item()),
                 "clipped": float(gradient_norm.detach().cpu().item() > float(flags.clip_grads))
-                if flags.clip_grads is not None else 0.0,
+                if flags.clip_grads is not None
+                else 0.0,
+                "curiosity_norm_before_clip": float(curiosity_gradient_norm.detach().cpu().item()),
             }
             if lr_scheduler is not None:
                 with warnings.catch_warnings():
@@ -1580,6 +1894,8 @@ def learn(
 
         # noinspection PyTypeChecker
         sync_actor_model(actor_model, learner_model, verify=verify_actor_sync)
+        if intrinsic_enabled and not curiosity_frozen:
+            sync_actor_model(actor_curiosity_model, learner_curiosity_model, verify=verify_actor_sync)
         apply_rule_prior_schedule(actor_model, flags, learner_step)
         return stats, total_games_played
 
@@ -1587,6 +1903,24 @@ def learn(
 def train(flags):
     # Necessary for multithreading and multiprocessing
     os.environ["OMP_NUM_THREADS"] = "1"
+
+    validate_training_tta_contract(flags)
+
+    if getattr(flags, "intrinsic_reward_enabled", False):
+        if str(getattr(flags, "intrinsic_mode", "e3b_controllable")) != "e3b_controllable":
+            raise ValueError("Only intrinsic_mode=e3b_controllable is supported")
+        schedule = [
+            int(getattr(flags, "intrinsic_pretrain_steps", 16000)),
+            int(getattr(flags, "intrinsic_ramp_end_step", 25000)),
+            int(getattr(flags, "intrinsic_decay_start_step", 40000)),
+            int(getattr(flags, "intrinsic_decay_end_step", 50000)),
+        ]
+        if schedule != sorted(schedule) or schedule[0] < 0:
+            raise ValueError(f"Invalid intrinsic schedule: {schedule}")
+        if getattr(flags, "actor_mixed_precision", False):
+            raise ValueError("Controllable curiosity requires actor_mixed_precision=false")
+        if int(getattr(flags, "num_learner_threads", 1)) != 1:
+            raise ValueError("Controllable curiosity currently requires num_learner_threads=1")
 
     if flags.num_buffers < flags.num_actors:
         raise ValueError("num_buffers should >= num_actors")
@@ -1602,16 +1936,20 @@ def train(flags):
     if training_stop_step <= 0:
         raise ValueError("stop_after_step must be positive")
 
-    league_opponents = opponents_from_config(flags.league_opponents) if flags.league_enabled else (
-        opponents_from_config([{"name": "selfplay", "kind": "selfplay", "weight": 1.0}])
+    league_opponents = (
+        opponents_from_config(flags.league_opponents)
+        if flags.league_enabled
+        else (opponents_from_config([{"name": "selfplay", "kind": "selfplay", "weight": 1.0}]))
     )
     legacy_opponents = [opponent for opponent in league_opponents if opponent.kind == "teacher"]
 
     if flags.use_teacher:
         teacher_flags = OmegaConf.load(Path(flags.teacher_load_dir) / "config.yaml")
         teacher_flags = flags_to_namespace(OmegaConf.to_container(teacher_flags))
+        teacher_uses_student_observation = online_teacher_uses_student_observation(flags, teacher_flags)
     else:
         teacher_flags = None
+        teacher_uses_student_observation = False
 
     league_obs_flags = teacher_flags
     if legacy_opponents:
@@ -1619,12 +1957,15 @@ def train(flags):
         league_obs_flags = flags_to_namespace(OmegaConf.to_container(first_legacy_config))
         for opponent in legacy_opponents[1:]:
             other_config = OmegaConf.load(opponent.config)
-            if (
-                other_config.obs_space != first_legacy_config.obs_space
-                or other_config.get("obs_space_kwargs", {}) != first_legacy_config.get("obs_space_kwargs", {})
-            ):
+            if other_config.obs_space != first_legacy_config.obs_space or other_config.get(
+                "obs_space_kwargs", {}
+            ) != first_legacy_config.get("obs_space_kwargs", {}):
                 raise ValueError("All teacher-kind league opponents must use the same observation space")
-        if teacher_flags is not None and teacher_flags.obs_space != league_obs_flags.obs_space:
+        if (
+            teacher_flags is not None
+            and not teacher_uses_student_observation
+            and teacher_flags.obs_space != league_obs_flags.obs_space
+        ):
             raise ValueError("Online KL teacher and league teacher must use the same observation space")
 
     if flags.load_dir:
@@ -1632,9 +1973,7 @@ def train(flags):
     else:
         checkpoint_state = None
     schedule_start_step = (
-        int(checkpoint_state.get("step", 0))
-        if checkpoint_state is not None and not flags.weights_only
-        else 0
+        int(checkpoint_state.get("step", 0)) if checkpoint_state is not None and not flags.weights_only else 0
     )
     restored_outcomes = checkpoint_state.get("league_outcomes", {}) if checkpoint_state is not None else {}
     restored_wins = [float(restored_outcomes.get(opponent.name, {}).get("wins", 0.0)) for opponent in league_opponents]
@@ -1652,13 +1991,40 @@ def train(flags):
         else 0
     )
     reward_game_counter = mp.Value("q", restored_games)
-    actor_policy_version = mp.Value("q", 0)
+    actor_policy_version = mp.Value("q", schedule_start_step)
+    restored_intrinsic_gate_state = (
+        dict(checkpoint_state.get("intrinsic_gate_state", {}))
+        if checkpoint_state is not None and not flags.weights_only
+        else {}
+    )
+    intrinsic_gate_state = {
+        "worker_correct": float(restored_intrinsic_gate_state.get("worker_correct", 0.0)),
+        "worker_majority": float(restored_intrinsic_gate_state.get("worker_majority", 0.0)),
+        "worker_count": float(restored_intrinsic_gate_state.get("worker_count", 0.0)),
+        "city_tile_correct": float(restored_intrinsic_gate_state.get("city_tile_correct", 0.0)),
+        "city_tile_majority": float(restored_intrinsic_gate_state.get("city_tile_majority", 0.0)),
+        "city_tile_count": float(restored_intrinsic_gate_state.get("city_tile_count", 0.0)),
+        "own_bonus_sum": float(restored_intrinsic_gate_state.get("own_bonus_sum", 0.0)),
+        "own_bonus_count": float(restored_intrinsic_gate_state.get("own_bonus_count", 0.0)),
+        "enemy_bonus_sum": float(restored_intrinsic_gate_state.get("enemy_bonus_sum", 0.0)),
+        "enemy_bonus_count": float(restored_intrinsic_gate_state.get("enemy_bonus_count", 0.0)),
+    }
+    restored_gate_passed = bool(
+        checkpoint_state.get("intrinsic_gate_passed", False)
+        if checkpoint_state is not None and not flags.weights_only
+        else False
+    )
+    intrinsic_gate_passed = mp.Value("b", restored_gate_passed)
 
     example_env = create_env(flags, torch.device("cpu"), teacher_flags=league_obs_flags)
     example_output = example_env.reset(force=True)
     example_output["info"]["learner_player_mask"] = torch.ones((flags.n_actor_envs, 2), dtype=torch.bool)
     example_output["info"]["league_opponent_id"] = torch.zeros(flags.n_actor_envs, dtype=torch.int64)
+    if getattr(flags, "intrinsic_reward_enabled", False):
+        example_output["intrinsic_reward"] = torch.zeros((flags.n_actor_envs, 2), dtype=torch.float32)
+        example_output["intrinsic_condition"] = torch.ones((flags.n_actor_envs, 2), dtype=torch.float32)
     buffers = create_buffers(flags, example_env.unwrapped[0].obs_space, example_output["info"])
+    student_obs_spec = example_env.unwrapped[0].obs_space.get_obs_spec()
     example_env.close()
     del example_env
 
@@ -1670,11 +2036,19 @@ def train(flags):
             allow_new_intent_head=getattr(flags, "intent_aux_enabled", False),
         )
     apply_rule_prior_schedule(actor_model, flags, schedule_start_step)
-    configure_trainable_parameters(
-        actor_model, intent_head_only=getattr(flags, "intent_head_only_finetune", False)
-    )
+    configure_trainable_parameters(actor_model, intent_head_only=getattr(flags, "intent_head_only_finetune", False))
     actor_model.eval()
     actor_model.share_memory()
+    if getattr(flags, "intrinsic_reward_enabled", False):
+        actor_curiosity_model = ControllableEpisodicCuriosity(
+            student_obs_spec, int(getattr(flags, "intrinsic_embedding_dim", 32))
+        ).to(flags.actor_device)
+        if checkpoint_state is not None and not flags.weights_only and checkpoint_state.get("curiosity_model_state_dict"):
+            actor_curiosity_model.load_state_dict(checkpoint_state["curiosity_model_state_dict"])
+        actor_curiosity_model.eval()
+        actor_curiosity_model.share_memory()
+    else:
+        actor_curiosity_model = None
     snapshot_lock = mp.Lock()
     snapshot_state_dicts = checkpoint_state.get("learner_snapshot_state_dicts", {}) if checkpoint_state else {}
     snapshot_slots = sorted({opponent.slot for opponent in league_opponents if opponent.kind == "learner_snapshot"})
@@ -1711,6 +2085,8 @@ def train(flags):
                 snapshot_lock,
                 reward_game_counter,
                 actor_policy_version,
+                actor_curiosity_model,
+                intrinsic_gate_passed,
                 buffers,
             ),
         )
@@ -1741,6 +2117,42 @@ def train(flags):
     if not flags.disable_wandb:
         wandb.watch(learner_model, flags.model_log_freq, log="all", log_graph=True)
 
+    if getattr(flags, "intrinsic_reward_enabled", False):
+        learner_curiosity_model = ControllableEpisodicCuriosity(
+            student_obs_spec, int(getattr(flags, "intrinsic_embedding_dim", 32))
+        ).to(flags.learner_device)
+        if checkpoint_state is not None and not flags.weights_only and checkpoint_state.get("curiosity_model_state_dict"):
+            learner_curiosity_model.load_state_dict(checkpoint_state["curiosity_model_state_dict"])
+        curiosity_optimizer = torch.optim.Adam(
+            learner_curiosity_model.parameters(),
+            lr=float(getattr(flags, "intrinsic_optimizer_lr", 1.0e-4)),
+        )
+        if checkpoint_state is not None and not flags.weights_only and checkpoint_state.get("curiosity_optimizer_state_dict"):
+            curiosity_optimizer.load_state_dict(checkpoint_state["curiosity_optimizer_state_dict"])
+        intrinsic_normalizer = RunningMoments.from_state_dict(
+            checkpoint_state.get("intrinsic_reward_normalizer")
+            if checkpoint_state is not None and not flags.weights_only
+            else None
+        )
+        curiosity_frozen = bool(
+            checkpoint_state.get("curiosity_frozen", schedule_start_step >= flags.intrinsic_pretrain_steps)
+            if checkpoint_state is not None and not flags.weights_only
+            else False
+        )
+        if curiosity_frozen:
+            for parameter in (
+                list(learner_curiosity_model.input_layer.parameters())
+                + list(learner_curiosity_model.encoder.parameters())
+                + list(learner_curiosity_model.inverse_heads.parameters())
+            ):
+                parameter.requires_grad_(False)
+        sync_actor_model(actor_curiosity_model, learner_curiosity_model)
+    else:
+        learner_curiosity_model = None
+        curiosity_optimizer = None
+        intrinsic_normalizer = None
+        curiosity_frozen = False
+
     optimizer = flags.optimizer_class(trainable_parameters, **flags.optimizer_kwargs)
     if checkpoint_state is not None and not flags.weights_only:
         saved_trainable_names = checkpoint_state.get("trainable_parameter_names")
@@ -1758,9 +2170,20 @@ def train(flags):
             raise ValueError(
                 "It does not make sense to use teacher when teacher_kl_cost <= 0 and teacher_baseline_cost <= 0"
             )
-        teacher_model = create_model(
-            flags, flags.learner_device, teacher_model_flags=teacher_flags, is_teacher_model=True
-        )
+        if teacher_uses_student_observation:
+            # A reference checkpoint of the learner architecture consumes the
+            # student branch, while league teachers may still require another
+            # observation space in the same environment.
+            teacher_model = create_model(
+                flags,
+                flags.learner_device,
+                teacher_model_flags=league_obs_flags,
+                is_teacher_model=False,
+            )
+        else:
+            teacher_model = create_model(
+                flags, flags.learner_device, teacher_model_flags=teacher_flags, is_teacher_model=True
+            )
         teacher_model.load_state_dict(
             torch.load(Path(flags.teacher_load_dir) / flags.teacher_checkpoint_file, map_location=torch.device("cpu"))[
                 "model_state_dict"
@@ -1814,7 +2237,8 @@ def train(flags):
     behavior_kl_controller = BehaviorKLController.from_flags(
         flags,
         checkpoint_state.get("behavior_kl_controller")
-        if checkpoint_state is not None and not flags.weights_only else None,
+        if checkpoint_state is not None and not flags.weights_only
+        else None,
     )
     initial_learner_state = model_state_dict_cpu(learner_model)
     verify_model_updates = bool(getattr(flags, "verify_model_updates", True))
@@ -1824,6 +2248,49 @@ def train(flags):
     max_support_outside_fraction = float(
         checkpoint_state.get("max_support_outside_fraction", 0.0) if checkpoint_state else 0.0
     )
+
+    def update_intrinsic_gate_state(current_stats: Mapping) -> None:
+        intrinsic_stats = current_stats.get("Intrinsic", {})
+        for entity in ("worker", "city_tile"):
+            count = float(intrinsic_stats.get(f"{entity}_count", 0.0))
+            intrinsic_gate_state[f"{entity}_correct"] += float(
+                intrinsic_stats.get(f"{entity}_accuracy", 0.0)
+            ) * count
+            intrinsic_gate_state[f"{entity}_majority"] += float(
+                intrinsic_stats.get(f"{entity}_majority", 0.0)
+            ) * count
+            intrinsic_gate_state[f"{entity}_count"] += count
+        for prefix in ("own", "enemy"):
+            count = float(intrinsic_stats.get(f"{prefix}_change_count", 0.0))
+            median = float(intrinsic_stats.get(f"{prefix}_change_bonus_median", float("nan")))
+            if count > 0 and math.isfinite(median):
+                intrinsic_gate_state[f"{prefix}_bonus_sum"] += median * count
+                intrinsic_gate_state[f"{prefix}_bonus_count"] += count
+
+    def evaluate_intrinsic_gate() -> Tuple[bool, Dict[str, float]]:
+        metrics = {}
+        passed = True
+        for entity in ("worker", "city_tile"):
+            count = intrinsic_gate_state[f"{entity}_count"]
+            accuracy = intrinsic_gate_state[f"{entity}_correct"] / max(count, 1.0)
+            majority = intrinsic_gate_state[f"{entity}_majority"] / max(count, 1.0)
+            metrics[f"{entity}_accuracy"] = accuracy
+            metrics[f"{entity}_majority"] = majority
+            passed &= count > 0 and accuracy >= majority + 0.05
+        own_mean = intrinsic_gate_state["own_bonus_sum"] / max(intrinsic_gate_state["own_bonus_count"], 1.0)
+        enemy_mean = intrinsic_gate_state["enemy_bonus_sum"] / max(
+            intrinsic_gate_state["enemy_bonus_count"], 1.0
+        )
+        ratio = own_mean / max(enemy_mean, 1e-8)
+        metrics["own_enemy_bonus_ratio"] = ratio
+        passed &= (
+            intrinsic_gate_state["own_bonus_count"] > 0
+            and intrinsic_gate_state["enemy_bonus_count"] > 0
+            and ratio >= 1.5
+        )
+        if not bool(getattr(flags, "intrinsic_gate_enforced", True)):
+            passed = True
+        return bool(passed), metrics
 
     def maybe_update_learner_snapshot(current_step: int) -> None:
         nonlocal snapshot_last_step, snapshot_next_slot
@@ -1843,7 +2310,7 @@ def train(flags):
 
     def batch_and_learn(learner_idx, lock=threading.Lock()):
         """Thread target for the learning process."""
-        nonlocal step, total_games_played, stats, max_support_outside_fraction
+        nonlocal step, total_games_played, stats, max_support_outside_fraction, curiosity_frozen
         timings = prof.Timings()
         while step < training_stop_step:
             timings.reset()
@@ -1859,6 +2326,27 @@ def train(flags):
             else:
                 batches = [full_batch]
             for batch in batches:
+                if (
+                    learner_curiosity_model is not None
+                    and not curiosity_frozen
+                    and step >= int(getattr(flags, "intrinsic_pretrain_steps", 16000))
+                ):
+                    for parameter in (
+                        list(learner_curiosity_model.input_layer.parameters())
+                        + list(learner_curiosity_model.encoder.parameters())
+                        + list(learner_curiosity_model.inverse_heads.parameters())
+                    ):
+                        parameter.requires_grad_(False)
+                    curiosity_frozen = True
+                    gate_passed, gate_metrics = evaluate_intrinsic_gate()
+                    intrinsic_gate_passed.value = gate_passed
+                    sync_actor_model(actor_curiosity_model, learner_curiosity_model, verify=verify_model_updates)
+                    logging.info(
+                        "Froze curiosity encoder at step %d; intrinsic gate passed=%s metrics=%s",
+                        step,
+                        gate_passed,
+                        gate_metrics,
+                    )
                 stats, total_games_played = learn(
                     flags=flags,
                     actor_model=actor_model,
@@ -1872,15 +2360,21 @@ def train(flags):
                     learner_step=step,
                     baseline_only=step / (t * b) < flags.n_value_warmup_batches,
                     behavior_kl_controller=behavior_kl_controller,
+                    learner_curiosity_model=learner_curiosity_model,
+                    actor_curiosity_model=actor_curiosity_model,
+                    curiosity_optimizer=curiosity_optimizer,
+                    intrinsic_normalizer=intrinsic_normalizer,
+                    curiosity_frozen=curiosity_frozen,
+                    intrinsic_gate_passed=bool(intrinsic_gate_passed.value),
                     model_update_reference=(
-                        initial_learner_state
-                        if verify_model_updates and step == training_start_step
-                        else None
+                        initial_learner_state if verify_model_updates and step == training_start_step else None
                     ),
                     verify_actor_sync=verify_model_updates and step == training_start_step,
                     lock=learner_lock,
                 )
                 with lock:
+                    if learner_curiosity_model is not None and not curiosity_frozen:
+                        update_intrinsic_gate_state(stats)
                     max_support_outside_fraction = max(
                         max_support_outside_fraction,
                         float(stats.get("Value", {}).get("support_outside_fraction", 0.0)),
@@ -1943,6 +2437,23 @@ def train(flags):
                     "evaluation_eligible": max_support_outside_fraction <= 0.001,
                     "behavior_kl_controller": (
                         behavior_kl_controller.state_dict() if behavior_kl_controller is not None else None
+                    ),
+                    "curiosity_model_state_dict": (
+                        model_state_dict_cpu(learner_curiosity_model)
+                        if learner_curiosity_model is not None
+                        else None
+                    ),
+                    "curiosity_optimizer_state_dict": (
+                        curiosity_optimizer.state_dict() if curiosity_optimizer is not None else None
+                    ),
+                    "curiosity_frozen": curiosity_frozen,
+                    "intrinsic_gate_passed": bool(intrinsic_gate_passed.value),
+                    "intrinsic_gate_state": dict(intrinsic_gate_state),
+                    "curiosity_freeze_step": (
+                        int(getattr(flags, "intrinsic_pretrain_steps", 16000)) if curiosity_frozen else None
+                    ),
+                    "intrinsic_reward_normalizer": (
+                        intrinsic_normalizer.state_dict() if intrinsic_normalizer is not None else None
                     ),
                     "value_head_metadata": {
                         "type": getattr(flags, "value_critic", "scalar"),

@@ -1,0 +1,113 @@
+defaults:
+- beat_first_place_v10_from_distill
+- _self_
+
+name: beat_first_place_v12_safe_from_distill
+group: safe_distill_impala
+
+# Fresh policy-only start from the evaluated distilled checkpoint.  The
+# train/eval coordinator overrides stop_after_step at 25k/50k/100k.
+load_dir: /home/ueda/workspace/Kaggle_Lux_AI_2021_Fork/outputs/distill_v10_firstplace
+checkpoint_file: best.pt
+weights_only: true
+total_steps: 100000
+stop_after_step: null
+verify_model_updates: true
+
+# Distillation does not provide a trained critic for this RL objective.
+# Warm only the value head for 250 * 16 * 4 = 16k environment steps. The
+# shared backbone and policy, including spectral-normalisation buffers, remain
+# bitwise fixed until policy/teacher-KL training begins.
+n_value_warmup_batches: 250
+value_head_only_warmup: true
+
+# Conservative policy updates with decay over this 100k pilot.  The distilled
+# policy is already sharp, so retain its low entropy regularisation instead of
+# inheriting the generic RL value (0.003).
+optimizer_kwargs:
+  lr: 5.0e-7
+  eps: 3.0e-4
+lr_schedule: cosine
+min_lr_mod: 0.10
+entropy_cost: 0.0002
+
+# Keep a stronger, fixed first-place anchor than v10 during the pilot.
+teacher_kl_cost: 0.01
+teacher_kl_cost_start: 0.01
+teacher_kl_cost_end: 0.01
+teacher_kl_cost_floor: 0.01
+teacher_kl_decay_steps: 100000
+teacher_kl_delay_steps: 0
+
+# Distillation did not consume environment rewards.  Prefer V2 over
+# RelativeDifferencePotentialReward for this conservative handoff: its
+# map/army-normalised, zero-sum signal models city survival and deliverable
+# cargo, while per-step clipping and game-count decay limit policy drift.
+# RelativeDifference is simpler PBRS, but its fixed, unclipped count advantage
+# can keep pushing city/unit growth independently of safety.  This choice is
+# still an unverified RL proposal; the matched gates decide whether it is safe.
+reward_config_version: 8
+reward_space: StrategicPotentialRewardV2
+reward_space_kwargs:
+  shaping_weight: 0.015
+  shaping_floor: 0.003
+  decay_games: 20000
+  discounting: 0.999
+  max_step_shaping: 0.02
+
+# The distilled checkpoint already absorbed the teacher behavior.  Keep rule
+# priors disabled during both rollout and evaluation to isolate learned logits.
+rule_prior_alpha: 0.0
+rule_prior_alpha_worker: 0.0
+rule_prior_alpha_cart: 0.0
+rule_prior_alpha_city_tile: 0.0
+
+# Training is deliberately single-view.  Keep rollout behavior, learner target,
+# and online KL teacher aligned, and fail startup if a future override enables
+# any training-time TTA.  Evaluation/deployment still uses the Rot180 entry in
+# lux_ai/rl_agent/rl_agent_config.yaml.
+actor_policy_tta_rot180: false
+learner_policy_tta_rot180: false
+teacher_policy_tta_rot180: false
+require_training_tta_disabled: true
+
+# Reproduce the distilled checkpoint's conservative opponent distribution.
+# The two learner-snapshot slots start as frozen copies of best.pt and remain
+# unchanged during this 100k pilot, providing a 20% distilled-policy anchor.
+league_sampling: pfsp
+league_config_version: 9
+pfsp_power: 1.0
+pfsp_teacher_floor: 0.25
+pfsp_exploration: 0.05
+pfsp_prior_games: 20
+league_opponents:
+- name: first_place
+  kind: teacher
+  weight: 0.50
+  fixed_probability: 0.50
+  config: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml
+  checkpoint: internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt
+- name: selfplay
+  kind: selfplay
+  weight: 0.30
+- name: learner_snapshot_0
+  kind: learner_snapshot
+  slot: 0
+  weight: 0.10
+- name: learner_snapshot_1
+  kind: learner_snapshot
+  slot: 1
+  weight: 0.10
+learner_snapshot_interval_steps: 500000
+
+# Do not introduce another action-changing objective while handing off from
+# behavior cloning to RL.
+collision_penalty_cost: 0.0
+collision_penalty_ramp_start: 0.0
+collision_penalty_ramp_end: 0.0
+rule_aux_enabled: false
+intent_aux_enabled: false
+
+# Checkpoints are also forced at coordinator milestones; this limits loss if a
+# segment is interrupted before its target.
+checkpoint_freq: 5.0

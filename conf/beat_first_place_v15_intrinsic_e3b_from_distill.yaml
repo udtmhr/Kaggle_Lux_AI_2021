@@ -1,0 +1,27 @@
+defaults:
+- beat_first_place_v14_reference_kl_from_distill
+- _self_
+
+name: beat_first_place_v15_intrinsic_e3b_from_distill
+group: intrinsic_e3b_distill_impala
+
+# Preserve the complete v14 optimization, reward, teacher-KL, league and TTA
+# contract. Curiosity is policy-independent and affects only the V-trace policy
+# advantage during this explicitly bounded pilot.
+intrinsic_reward_enabled: true
+intrinsic_mode: e3b_controllable
+intrinsic_embedding_dim: 32
+intrinsic_inverse_cost: 0.1
+intrinsic_optimizer_lr: 1.0e-4
+intrinsic_discounting: 0.99
+intrinsic_reward_clip: 5.0
+intrinsic_beta_max: 0.10
+intrinsic_pretrain_steps: 16000
+intrinsic_ramp_end_step: 25000
+intrinsic_decay_start_step: 40000
+intrinsic_decay_end_step: 50000
+intrinsic_gate_enforced: true
+
+# The coordinator still owns the 25k/50k/100k quality-gated stops.
+total_steps: 100000
+stop_after_step: null

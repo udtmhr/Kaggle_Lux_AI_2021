@@ -12,8 +12,58 @@ The new student combines masked local ConvNeXt-style blocks with axial attention
 unit return, resource-control, and temporal observations. The original `conv_model` remains unchanged, and
 `conf/conv16_matched.yaml` is the parameter-matched architecture ablation (3.76M vs 3.80M parameters).
 
-Distillation cache schema v2 stores replay-level fp16/uint8 observations and only actionable entity logits using
-ragged positions and offsets. Schema v1 `.pt` shards are intentionally rejected; generate v2 into a new directory.
+### Large scratch distillation v2
+
+`conf/distill_v2_large_15m.yaml` defines a 15.03M-parameter student initialized only from its seeded random state.
+The first-place model is used as a black-box opponent and target generator; no checkpoint tensor is copied into the
+student. The streaming builder runs games in temporary batches, immediately converts each replay to a schema-v4 NPZ
+shard, atomically updates the manifest, and then discards the temporary raw replay.
+
+Generate the first 1,000 teacher-selfplay games as 250 seeds across all four map sizes. Both player sides are
+supervised, so orientation duplication is unnecessary. Rerunning the same command resumes from the manifest and
+skips completed seed/map cells:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync \
+  python -m lux_ai.strategic_rl.build_streaming_dataset \
+  --mode teacher_selfplay \
+  --output-dir outputs/datasets/distill_v2_large_stream_001 \
+  --student-config conf/distill_v2_large_15m.yaml \
+  --teacher-checkpoint internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt \
+  --teacher-config internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml \
+  --teacher-agent internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py \
+  --parity-report outputs/evaluation/distill_best_10seed_vs_first_place/backend.json \
+  --seed-start 30000 --seeds 250 --map-sizes 12 16 24 32 \
+  --batch-games 8 --device cuda:0
+```
+
+Train the large student from scratch. Do not pass `--load-weights`; its absence is recorded in `run_manifest.json`.
+The objective combines soft teacher KL, confidence-gated teacher top-1 CE, rare strategic-action weighting, paired
+Rot180 consistency, and replay-outcome prediction:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync \
+  python -m lux_ai.strategic_rl.train_distill \
+  --dataset-dir outputs/datasets/distill_v2_large_stream_001 \
+  --output-dir outputs/distill_v2_large_15m_teacher1000_001 \
+  --config conf/distill_v2_large_15m.yaml \
+  --epochs 5 --batch-size 8 --lr 1e-4 --weight-decay 1e-4 \
+  --temperature 2.0 \
+  --hard-label-weight 0.25 --teacher-margin-threshold 0.5 \
+  --rare-action-weight 2.0 \
+  --rot180-consistency-weight 0.1 --rot180-augmentation-prob 0 \
+  --outcome-weight 0.1 --selection-metric loss \
+  --samples-per-epoch 300000 --checkpoint-every-samples 100000 \
+  --num-workers 4 --device cuda:0
+```
+
+The 1,000-game dataset is the scaling pilot, not the final target. Require lower held-out loss/KL and a matched-game
+non-regression before extending the same streaming dataset to 5,000-10,000 games or adding a new DAgger source.
+
+Distillation cache schema v4 stores replay-level fp16/uint8 observations and only actionable entity logits using
+ragged positions and offsets. It also records source, seed, map size, and DAgger candidate orientation. Matched
+orientations share a split, and DAgger shards supervise only the candidate side. Schema v3 remains readable for old
+runs; generate v4 into a new directory when mixing replay sources.
 
 Install and run a small data smoke test:
 
@@ -30,6 +80,150 @@ uv run luxsr-prepare-data \
   --max-replays 1 --max-turns 2
 uv run luxsr-train-distill --dataset-dir data/distillation_v1 --output-dir outputs/distill_v1 --epochs 1
 uv run luxsr-validate-run outputs/distill_v1
+```
+
+### DAgger fine-tuning from the evaluated distilled checkpoint
+
+Generate stateful student-vs-first-place replays in both orientations with the internal batched backend. The exact
+checkpoint already passed official/internal outcome parity in the referenced formal evaluation. The backend batches
+candidate and first-place GPU forwards across eight games while retaining the deployment Rot180 ensemble and
+collision resolver. This does not enable learner TTA in the training forward pass;
+`--rot180-augmentation-prob` below is ordinary data augmentation.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync python -m lux_ai.strategic_rl.generate_dagger \
+  --candidate-checkpoint outputs/distill_v10_firstplace/best.pt \
+  --candidate-config outputs/distill_v10_firstplace/config.yaml \
+  --output-dir outputs/replays/distill_v10_vs_first_place_dagger_001 \
+  --source-name dagger \
+  --seed-start 20000 --seeds 20 --map-sizes 12 16 24 32 \
+  --backend internal --device cuda:0 --batch-games 8 \
+  --parity-report outputs/evaluation/distill_best_10seed_vs_first_place/backend.json \
+  --resume
+```
+
+`--resume` preserves any already completed official games and fills only missing games with the parity-gated internal
+backend. Use a new output directory and omit `--resume` when no previous attempt exists. The original official path
+remains available with `--backend official --workers 2 --timeout 1200`.
+
+Prepare a new schema-v4 dataset. Teacher self-play preserves broad coverage, while DAgger adds states induced by the
+deployed distilled policy. The teacher labels are Rot180-averaged in both sources.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync python -m lux_ai.strategic_rl.prepare_data \
+  --replay-source teacher_selfplay=/home/ueda/workspace/LuxPythonEnvGym/replay_datasets/first_place_selfplay \
+  --replay-source dagger=outputs/replays/distill_v10_vs_first_place_dagger_001 \
+  --output-dir outputs/datasets/distill_firstplace_dagger_v4_001 \
+  --teacher-checkpoint internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt \
+  --teacher-config internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml \
+  --student-config outputs/distill_v10_firstplace/config.yaml \
+  --legacy-prepared-cache-dir /home/ueda/workspace/LuxPythonEnvGym/models/teachers/lux_2021_first_place/prepared \
+  --device cuda
+```
+
+Fine-tune from the evaluated distilled weights. Sampling targets 40% teacher self-play and 60% candidate-side DAgger,
+balances maps and five turn bands within each source, and doubles night-state sampling. Per-entity KL, agreement,
+illegal mass, decision counts, and realized sample distributions are written to `run_manifest.json`.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync python -m lux_ai.strategic_rl.train_distill \
+  --dataset-dir outputs/datasets/distill_firstplace_dagger_v4_001 \
+  --output-dir outputs/distill_v11_dagger_ft_001 \
+  --config outputs/distill_v10_firstplace/config.yaml \
+  --load-weights outputs/distill_v10_firstplace/best.pt \
+  --epochs 3 --batch-size 16 --lr 3e-5 --weight-decay 1e-5 \
+  --source-weight teacher_selfplay=0.4 --source-weight dagger=0.6 \
+  --night-weight 2.0 --samples-per-epoch 60000 \
+  --rot180-augmentation-prob 0.5 --num-workers 2 --device cuda
+
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync luxsr-validate-run \
+  outputs/distill_v11_dagger_ft_001
+```
+
+After a full-policy DAgger run, use the worker-head-only safety pilot before changing the backbone or city policy.
+The frozen reference is evaluated with the same Rot180 ensemble as deployment. The run writes checkpoints every 5k
+samples, source/map/entity validation diagnostics, and an offline gate requiring 0.5-2.0% worker disagreement while
+keeping city actions exactly equal to the evaluated v10 policy.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync python -m lux_ai.strategic_rl.train_distill \
+  --dataset-dir outputs/datasets/distill_firstplace_dagger_v4_001 \
+  --output-dir outputs/distill_v13_worker_head_dagger_001 \
+  --config outputs/distill_v10_firstplace/config.yaml \
+  --load-weights outputs/distill_v10_firstplace/best.pt \
+  --reference-weights outputs/distill_v10_firstplace/best.pt \
+  --trainable-scope worker_head \
+  --epochs 1 --batch-size 4 --lr 3e-6 --weight-decay 1e-5 \
+  --source-weight teacher_selfplay=0.2 --source-weight dagger=0.8 \
+  --night-weight 1.0 --samples-per-epoch 20000 \
+  --checkpoint-every-samples 5000 \
+  --behavior-gate-source teacher_selfplay \
+  --worker-disagreement-min 0.005 --worker-disagreement-max 0.02 \
+  --require-city-exact --behavior-probe-tta-rot180 \
+  --rot180-augmentation-prob 0.5 --num-workers 2 --device cuda
+```
+
+`best.pt` remains the lowest validation-KL checkpoint for compatibility. `best_gated.pt` is written only when the
+offline behavior gate passes and is recorded as `promotion_checkpoint` in `run_manifest.json`. Passing this offline
+gate is not a strength result; compare the 5k/10k/15k/20k checkpoints with matched first-place evaluation before
+promotion.
+
+### One conservative on-policy distillation round
+
+After evaluating a scratch student, run one DAgger round with the student acting against the first-place agent and
+the first-place model used only to label the visited student-side states. The round appends both orientations for
+maps 24 and 32, then samples 40% teacher self-play and 60% DAgger turns for one 100k-sample update. It rejects configs
+with learner TTA or a rule prior, disables outcome regression, and writes `online_round.json` with checkpoint hashes
+and the exact collection/training commands.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync \
+  python -m lux_ai.strategic_rl.online_distill_round \
+  --dataset-dir outputs/datasets/distill_v2_large_stream_001 \
+  --dataset-config conf/distill_v2_large_15m.yaml \
+  --output-dir outputs/distill_v2_online_r01_map24_32_001 \
+  --candidate-checkpoint outputs/distill_v2_large_15m_teacher1000_001/epoch_005.pt \
+  --candidate-config outputs/distill_v2_large_15m_teacher1000_001/config.yaml \
+  --parity-report outputs/evaluation/distill_v2_large_15m_teacher1000_holdout_6seed_001/epoch_005/backend.json \
+  --teacher-checkpoint internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/062179520_weights.pt \
+  --teacher-config internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent/config.yaml \
+  --teacher-agent internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/main.py \
+  --seed-start 40000 --seeds 32 --map-sizes 24 32 \
+  --batch-games 8 --samples-per-round 100000 \
+  --checkpoint-every-samples 50000 --train-batch-size 8 \
+  --lr 2e-5 --num-workers 4 --device cuda:0
+```
+
+Use a new seed range and output directory for every later round. Reusing the same dataset is intentional: old
+teacher-self-play states prevent forgetting, while all DAgger shards retain the candidate checkpoint digest that
+generated them. A completed round is still experimental until a matched holdout evaluation passes.
+
+To screen several distillation checkpoints against the exact subset of the v10 baseline schedule, use the dedicated
+command. It writes a copied, schedule-matched baseline, one evaluation directory per checkpoint, and
+`screen_summary.json`. A passing screen is only a finalist selection; it is not promotion.
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync luxsr-screen-checkpoints \
+  --baseline-games outputs/evaluation/distill_best_10seed_vs_first_place/games.jsonl \
+  --checkpoints \
+    outputs/distill_v13_worker_head_dagger_001/sample_00010000.pt \
+    outputs/distill_v13_worker_head_dagger_001/sample_00015000.pt \
+  --config outputs/distill_v10_firstplace/config.yaml \
+  --output-dir outputs/evaluation/distill_v13_worker_head_screen_001 \
+  --seed-start 2021 --seeds 4 --map-sizes 12 16 24 32 \
+  --backend auto --device cuda:0 --batch-games 8 --parity-games 4
+```
+
+Run the selected `finalists[0].checkpoint` from `screen_summary.json` on a fresh 80-game directory before any
+promotion decision:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync luxsr-evaluate-checkpoint \
+  /absolute/path/from/screen_summary.json \
+  --config outputs/distill_v10_firstplace/config.yaml \
+  --output-dir outputs/evaluation/distill_v13_worker_head_final_001 \
+  --seed-start 2021 --seeds 10 --map-sizes 12 16 24 32 \
+  --backend auto --device cuda:0 --batch-games 8 --parity-games 4
 ```
 
 Continue with IMPALA from the evaluated distilled `best.pt` (policy weights only), first with
@@ -120,6 +314,133 @@ than 5 points above it. Results and decisions are written atomically to `evaluat
 `--seeds` for the final selection; auto evaluation uses eight-game GPU batches after its parity check. Lower
 `--eval-batch-games` if GPU memory is constrained. `--continue-on-fail` is available only for deliberate ablation
 runs.
+
+For the conservative 100k pilot from the evaluated distilled policy, use the dedicated configuration below. It
+uses the distilled checkpoint's prior-free inference, low entropy cost, and opponent mix. Actor, learner, and online
+teacher are all single-view during training; evaluation and deployment retain Rot180 TTA. The bounded
+`StrategicPotentialRewardV2` shaping is selected over `RelativeDifferencePotentialReward` because it normalizes
+for map/army scale, directly models city survival and deliverable cargo, clips each shaping step, and decays toward
+a small floor. The relative-difference alternative is simpler PBRS but applies a fixed, unclipped city/unit-count
+pressure that is less conservative for fine-tuning an already strong distilled policy. V2 remains an unverified RL
+proposal, not a distillation setting. RL uses LR `5e-7` with
+cosine decay, 250 value-head-only warmup batches (16k environment steps), and fixed teacher KL `0.01`. During
+warmup the shared backbone, policy head, and their spectral-normalisation buffers remain fixed. The coordinator
+evaluates at 25k/50k/100k, stops on a score-rate regression greater than 5 points or a
+city-extinction increase greater than 5 points, and records final promotion only when the paired score-delta LCB95
+is strictly positive and both city survival and city-extinction rate are non-regressing:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked luxsr-train-eval \
+  --base-checkpoint outputs/distill_v10_firstplace/best.pt \
+  --config-name beat_first_place_v12_safe_from_distill \
+  --run-root outputs/beat_first_place_v12_head_only_gated_001 \
+  --reuse-baseline-evaluation outputs/beat_first_place_v12_safe_gated_001/baseline_evaluation \
+  --total-steps 100000 \
+  --milestones 25000 50000 100000 \
+  --seeds 5 --map-sizes 12 16 24 32 \
+  --min-score-delta -0.05 \
+  --max-city-extinction-delta 0.05 \
+  --min-paired-score-delta-lcb95 0.0 \
+  --min-city-survival-delta 0.0 \
+  --max-promotion-city-extinction-delta 0.0
+```
+
+For the controlled GameResult-only ablation, keep the same distilled start,
+head-only value warmup, LR, KL, league, and single-view training contract. The
+formal 10-seed baseline can be reused after schedule/backend validation:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked luxsr-train-eval \
+  --base-checkpoint outputs/distill_v10_firstplace/best.pt \
+  --config-name beat_first_place_v13_game_result_from_distill \
+  --run-root outputs/beat_first_place_v13_game_result_gated_001 \
+  --reuse-baseline-evaluation outputs/evaluation/distill_best_10seed_vs_first_place \
+  --total-steps 25000 \
+  --milestones 25000 \
+  --seed-start 2021 --seeds 10 --map-sizes 12 16 24 32 \
+  --min-score-delta -0.05 \
+  --max-city-extinction-delta 0.05 \
+  --min-paired-score-delta-lcb95 0.0 \
+  --min-city-survival-delta 0.0 \
+  --max-promotion-city-extinction-delta 0.0 \
+  --min-map-score-delta 0.0 \
+  --max-map-city-extinction-delta 0.0
+```
+
+After the worker-head DAgger checkpoints fail their 32-game screens, use the
+v10 policy itself as a small online KL reference. This differs from the older
+handoff configs, whose KL teacher is the first-place model. The v14 config keeps
+`StrategicPotentialRewardV2`, LR `5e-7`, cosine decay, the 250-batch value-only
+warmup, prior-free actions, and disabled train-time TTA. `teacher_input_source:
+student` lets the v10 reference consume the learner observation while the
+first-place league opponent continues to use its own observation branch.
+
+The coordinator derives the 4-seed screen baseline from the validated 10-seed
+baseline, evaluates 25k/50k on 32 games, and evaluates the final 100k checkpoint
+on all 80 games. Map 24 and candidate-player 1 are mandatory safety slices at
+every milestone:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync \
+  luxsr-train-eval \
+  --base-checkpoint outputs/distill_v10_firstplace/best.pt \
+  --config-name beat_first_place_v14_reference_kl_from_distill \
+  --run-root outputs/beat_first_place_v14_reference_kl_001 \
+  --reuse-baseline-evaluation outputs/evaluation/distill_best_10seed_vs_first_place \
+  --total-steps 100000 \
+  --milestones 25000 50000 100000 \
+  --seed-start 2021 --seeds 4 --final-seeds 10 \
+  --map-sizes 12 16 24 32 \
+  --min-score-delta -0.05 \
+  --max-city-extinction-delta 0.05 \
+  --required-slice map=24 \
+  --required-slice player=1 \
+  --min-slice-score-delta -0.125 \
+  --max-slice-city-extinction-delta 0.125 \
+  --min-paired-score-delta-lcb95 0.0 \
+  --min-city-survival-delta 0.0 \
+  --max-promotion-city-extinction-delta 0.0 \
+  --eval-backend auto --eval-device cuda:0 --eval-batch-games 8 \
+  --parity-games 4
+```
+
+Do not add `--continue-on-fail` to the production pilot: a failed 25k or 50k
+aggregate/slice gate must stop before the next training segment.
+
+### Controllable episodic curiosity pilot
+
+`conf/beat_first_place_v15_intrinsic_e3b_from_distill.yaml` keeps the complete
+v14 contract and adds an opt-in, policy-independent curiosity module. The first
+16k steps train only its inverse-dynamics encoder while policy influence remains
+zero. The encoder is then frozen; intrinsic V-trace uses a separate scalar
+critic and E3B episode memory. The coefficient ramps to `0.10`, then returns to
+zero at 50k. If worker/city inverse accuracy or the own-vs-enemy change bonus
+gate fails at 16k, intrinsic influence stays disabled.
+
+Run the curiosity arm through the same coordinator and evaluation schedule as
+v14. Use the unchanged v14 config in a separate new run root as its control:
+
+```bash
+UV_CACHE_DIR=/tmp/lux-fork-uv-cache uv run --locked --no-sync \
+  luxsr-train-eval \
+  --base-checkpoint outputs/distill_v10_firstplace/best.pt \
+  --config-name beat_first_place_v15_intrinsic_e3b_from_distill \
+  --run-root outputs/beat_first_place_v15_intrinsic_e3b_001 \
+  --reuse-baseline-evaluation outputs/evaluation/distill_best_10seed_vs_first_place \
+  --total-steps 100000 --milestones 25000 50000 100000 \
+  --seed-start 2021 --seeds 4 --final-seeds 10 \
+  --map-sizes 12 16 24 32 \
+  --min-score-delta -0.05 --max-city-extinction-delta 0.05 \
+  --required-slice map=24 --required-slice player=1 \
+  --min-slice-score-delta -0.125 --max-slice-city-extinction-delta 0.125 \
+  --min-paired-score-delta-lcb95 0.0 --min-city-survival-delta 0.0 \
+  --max-promotion-city-extinction-delta 0.0 \
+  --eval-backend auto --eval-device cuda:0 --eval-batch-games 8 --parity-games 4
+```
+
+Full checkpoints retain curiosity optimizer, critic, normalization and gate
+state. Policy-only `*_weights.pt` files intentionally exclude all curiosity
+state, so evaluation and deployment remain unchanged.
 
 ### Pure Evolution Strategies fine-tuning
 

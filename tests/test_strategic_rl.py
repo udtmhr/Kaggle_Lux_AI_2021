@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,18 +10,25 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from lux_ai.lux.constants import Constants
+from lux_ai.lux.game import Game
+from lux_ai.lux.game_map import GameMap
+from lux_ai.lux.game_objects import City, Player, Unit
 from lux_ai.lux_gym import create_env, rule_prior_enabled
 from lux_ai.lux_gym.act_spaces import ACTION_MEANINGS
 from lux_ai.lux_gym.rule_prior import RulePriorEngine
 from lux_ai.lux_gym.wrappers import VecEnv
-from lux_ai.lux.constants import Constants
-from lux_ai.lux.game_map import GameMap
-from lux_ai.lux.game_objects import City, Player, Unit
 from lux_ai.nns import create_model
 from lux_ai.rl_agent.rl_agent import RLAgent, checkpoint_path, model_directory
 from lux_ai.strategic_rl.artifacts import atomic_torch_save
-from lux_ai.strategic_rl.evaluate import summarize
+from lux_ai.strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
+from lux_ai.strategic_rl.build_streaming_dataset import _schedule as streaming_dataset_schedule
+from lux_ai.strategic_rl.categorical_value import categorical_value, hl_gauss_encode, support_outside_fraction
+from lux_ai.strategic_rl.curriculum import SnapshotPool, turn_band
+from lux_ai.strategic_rl.es import MatchSpec
+from lux_ai.strategic_rl.evaluate import load_records, summarize
 from lux_ai.strategic_rl.evaluate_checkpoint import _opponent_model_files, _parity_passed, evaluate_checkpoint
+from lux_ai.strategic_rl.generate_dagger import annotate_dagger_replays, validate_internal_parity
 from lux_ai.strategic_rl.league import (
     LeagueSampler,
     Opponent,
@@ -32,11 +40,22 @@ from lux_ai.strategic_rl.league import (
     rule_based_guidance,
 )
 from lux_ai.strategic_rl.models import SurvivalStrategicBackbone
-from lux_ai.strategic_rl.behavior_kl import BehaviorKLController, masked_normalized_entropy, masked_policy_kl
-from lux_ai.strategic_rl.categorical_value import categorical_value, hl_gauss_encode, support_outside_fraction
-from lux_ai.strategic_rl.curriculum import SnapshotPool, turn_band
 from lux_ai.strategic_rl.obs import night_turns_between
-from lux_ai.strategic_rl.prepare_data import _discover_replays
+from lux_ai.strategic_rl.online_distill_round import (
+    collection_command as online_collection_command,
+    scheduled_dagger_count,
+    scheduled_dagger_digests,
+    training_command as online_training_command,
+    validate_candidate_config,
+)
+from lux_ai.strategic_rl.prepare_data import (
+    _discover_replays,
+    _split_for_group,
+    _supervised_positions,
+    replay_context,
+    replay_outcome,
+    stateful_updates,
+)
 from lux_ai.strategic_rl.prepare_eval_agent import checkpoint_label, prepare_eval_agent, sha256_file
 from lux_ai.strategic_rl.resume import merge_resume_config
 from lux_ai.strategic_rl.reward import (
@@ -53,13 +72,35 @@ from lux_ai.strategic_rl.schedules import (
     rule_prior_distill_coefficient,
     teacher_kl_coefficient,
 )
-from lux_ai.strategic_rl.train_distill import ShardDataset, _compact_collate
+from lux_ai.strategic_rl.train_distill import (
+    ShardDataset,
+    _compact_collate,
+    balanced_sample_weights,
+    configure_distillation_trainable_parameters,
+    distillation_loss,
+    evaluate_behavior_gate,
+    parse_source_weights,
+    rot180_consistency_loss,
+    set_distillation_train_mode,
+    stratified_behavior_probe_indices,
+)
+from lux_ai.strategic_rl.train_es import (
+    policy_state_digest,
+    stateful_replay_frame,
+    write_internal_stateful_replay,
+)
 from lux_ai.strategic_rl.train_eval import (
     checkpoint_model_max_abs_diff,
+    final_promotion_decision,
     full_checkpoint,
     load_reused_baseline_evaluation,
+    map_metric_deltas,
+    parse_required_slice,
+    paired_score_difference_lcb,
     promotion_decision,
     run_training_segment,
+    slice_metric_deltas,
+    subset_baseline_evaluation,
 )
 from lux_ai.strategic_rl.tta import (
     ROT180_ACTION_INDICES,
@@ -70,16 +111,20 @@ from lux_ai.strategic_rl.tta import (
     rotate_policy_180,
 )
 from lux_ai.torchbeast.monobeast import (
-    apply_rule_prior_schedule,
     actor_model_output,
+    apply_rule_prior_schedule,
     compute_baseline_loss,
-    compute_teacher_kl_loss,
     compute_rule_prior_ranking_loss,
+    compute_teacher_kl_loss,
     configure_trainable_parameters,
     model_state_dict_cpu,
+    online_teacher_uses_student_observation,
+    retain_value_head_gradients,
     state_dict_max_abs_diff,
     sync_actor_model,
     trajectory_weighted_mean,
+    validate_training_tta_contract,
+    value_head_only_warmup_mode,
 )
 from lux_ai.utils import flags_to_namespace
 
@@ -153,9 +198,7 @@ def test_cli_observation_player_attribute_survives_second_turn():
     player = SimpleNamespace(units=[], city_tiles=[])
     agent = object.__new__(RLAgent)
     game_state = SimpleNamespace(players=[player, player], turn=0, id=None)
-    agent.env = SimpleNamespace(
-        unwrapped=[SimpleNamespace(manual_step=lambda updates: None, game_state=game_state)]
-    )
+    agent.env = SimpleNamespace(unwrapped=[SimpleNamespace(manual_step=lambda updates: None, game_state=game_state)])
     agent.my_city_tile_mat = np.zeros((32, 32), dtype=np.bool_)
     agent.data_augmentations = []
     observation = CliObservation(step=1, updates=[], remainingOverageTime=60.0)
@@ -300,7 +343,9 @@ def test_run_matched_matches_runs_games_in_parallel(monkeypatch, tmp_path: Path)
     active = 0
     max_active = 0
 
-    def fake_run_match(candidate, opponent, candidate_player, seed, map_size, replay_path, python, timeout, opponent_name):
+    def fake_run_match(
+        candidate, opponent, candidate_player, seed, map_size, replay_path, python, timeout, opponent_name
+    ):
         nonlocal active, max_active
         with lock:
             active += 1
@@ -424,6 +469,19 @@ def test_rule_prior_bootstrap_schedules_decay_per_head():
     assert rule_prior_distill_coefficient(flags, 300) == 0.0
 
 
+def test_fixed_rule_prior_schedule_preserves_per_head_values():
+    flags = SimpleNamespace(
+        rule_prior_alpha=0.1,
+        rule_prior_alpha_worker=0.1,
+        rule_prior_alpha_cart=0.0,
+        rule_prior_alpha_city_tile=0.3,
+        rule_prior_decay_steps=0,
+    )
+    assert rule_prior_alpha(flags, "worker", 100000) == 0.1
+    assert rule_prior_alpha(flags, "cart", 100000) == 0.0
+    assert rule_prior_alpha(flags, "city_tile", 100000) == 0.3
+
+
 def test_rule_prior_ranking_loss_updates_pre_prior_preference():
     logits = torch.tensor([[[[[[[0.0, 0.0, 0.0, float("-inf")]]]]]]], requires_grad=True)
     prior = torch.tensor([[[[[[[0.0, 0.8, 0.2, 0.0]]]]]]])
@@ -450,9 +508,7 @@ def test_rule_prior_ranking_loss_preserves_tied_top_actions():
     prior = torch.tensor([[[[[[[0.0, 0.5, 0.5, -0.1]]]]]]])
     legal = torch.ones_like(prior, dtype=torch.bool)
     active = torch.ones(prior.shape[:-1], dtype=torch.bool)
-    losses, counts = compute_rule_prior_ranking_loss(
-        logits, prior, legal, active, minimum_score_gap=0.05, margin=1.0
-    )
+    losses, counts = compute_rule_prior_ranking_loss(logits, prior, legal, active, minimum_score_gap=0.05, margin=1.0)
     assert counts.item() == 2
     losses.sum().backward()
     assert logits.grad[..., 1].item() == pytest.approx(logits.grad[..., 2].item())
@@ -504,10 +560,12 @@ def test_rule_prior_blocks_unit_spawn_from_city_at_risk():
 def test_rule_prior_reserves_distinct_resource_destinations():
     engine = RulePriorEngine()
     player, _ = _rule_player_with_city(city_tiles=((0, 0),))
-    player.units.extend([
-        Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 1, 2, 0, 0, 0, 0),
-        Unit(0, Constants.UNIT_TYPES.WORKER, "u1", 2, 1, 0, 0, 0, 0),
-    ])
+    player.units.extend(
+        [
+            Unit(0, Constants.UNIT_TYPES.WORKER, "u0", 1, 2, 0, 0, 0, 0),
+            Unit(0, Constants.UNIT_TYPES.WORKER, "u1", 2, 1, 0, 0, 0, 0),
+        ]
+    )
     game_map = GameMap(5, 5)
     cells = [game_map.get_cell(x, y) for x, y in ((2, 2), (2, 3), (3, 2), (3, 3))]
     cluster = {"cells": cells, "amount": 400, "workers_assigned": 0, "incoming_workers": 0}
@@ -642,9 +700,9 @@ def test_rot180_ensemble_batches_both_views_in_one_forward():
                 "worker": torch.ones(2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"]), dtype=torch.bool)
             },
             "rule_prior": {
-                "worker": torch.arange(
-                    2 * 1 * 2 * 3 * 3 * len(ACTION_MEANINGS["worker"]), dtype=torch.float32
-                ).view(2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"]))
+                "worker": torch.arange(2 * 1 * 2 * 3 * 3 * len(ACTION_MEANINGS["worker"]), dtype=torch.float32).view(
+                    2, 1, 2, 3, 3, len(ACTION_MEANINGS["worker"])
+                )
             },
         },
     }
@@ -697,9 +755,7 @@ def test_legacy_resume_inherits_only_missing_league_config():
     assert merged.league_config_version == 2
     assert merged.league_opponents[0].name == "first"
 
-    saved_with_league = OmegaConf.create(
-        {"league_enabled": False, "league_config_version": 2, "league_opponents": []}
-    )
+    saved_with_league = OmegaConf.create({"league_enabled": False, "league_config_version": 2, "league_opponents": []})
     merged = merge_resume_config(saved_with_league, selected, OmegaConf.create({}))
     assert merged.league_enabled is False
     assert merged.league_opponents == []
@@ -882,16 +938,8 @@ def test_pfsp_reserves_fixed_first_place_probability():
 
 
 def test_quality_gate_and_full_checkpoint_selection(tmp_path: Path):
-    baseline = {
-        "opponents": {
-            "first_place": {"score_rate": 0.20, "candidate_city_extinction_rate": 0.10}
-        }
-    }
-    candidate = {
-        "opponents": {
-            "first_place": {"score_rate": 0.14, "candidate_city_extinction_rate": 0.18}
-        }
-    }
+    baseline = {"opponents": {"first_place": {"score_rate": 0.20, "candidate_city_extinction_rate": 0.10}}}
+    candidate = {"opponents": {"first_place": {"score_rate": 0.14, "candidate_city_extinction_rate": 0.18}}}
     decision = promotion_decision(
         baseline,
         candidate,
@@ -903,13 +951,480 @@ def test_quality_gate_and_full_checkpoint_selection(tmp_path: Path):
     assert len(decision["reasons"]) == 2
 
     atomic_torch_save({"model_state_dict": {"x": torch.tensor(1)}}, tmp_path / "200_weights.pt")
-    atomic_torch_save(
-        {"model_state_dict": {}, "optimizer_state_dict": {}, "step": 100}, tmp_path / "100.pt"
-    )
-    atomic_torch_save(
-        {"model_state_dict": {}, "optimizer_state_dict": {}, "step": 200}, tmp_path / "200.pt"
-    )
+    atomic_torch_save({"model_state_dict": {}, "optimizer_state_dict": {}, "step": 100}, tmp_path / "100.pt")
+    atomic_torch_save({"model_state_dict": {}, "optimizer_state_dict": {}, "step": 200}, tmp_path / "200.pt")
     assert full_checkpoint(tmp_path) == tmp_path / "200.pt"
+
+
+def test_final_promotion_requires_positive_paired_lcb_and_survival_nonregression():
+    baseline = {
+        "opponents": {
+            "first_place": {
+                "candidate_city_survival": 0.75,
+                "candidate_city_extinction_rate": 0.10,
+            }
+        }
+    }
+    candidate = {
+        "opponents": {
+            "first_place": {
+                "candidate_city_survival": 0.76,
+                "candidate_city_extinction_rate": 0.09,
+            }
+        }
+    }
+    passed = final_promotion_decision(
+        baseline,
+        candidate,
+        opponent_name="first_place",
+        paired_score_delta_lcb95=0.01,
+        min_paired_score_delta_lcb95=0.0,
+        min_city_survival_delta=0.0,
+        max_city_extinction_delta=0.0,
+    )
+    assert passed["passed"] is True
+
+    failed = final_promotion_decision(
+        baseline,
+        {
+            "opponents": {
+                "first_place": {
+                    "candidate_city_survival": 0.74,
+                    "candidate_city_extinction_rate": 0.11,
+                }
+            }
+        },
+        opponent_name="first_place",
+        paired_score_delta_lcb95=0.0,
+        min_paired_score_delta_lcb95=0.0,
+        min_city_survival_delta=0.0,
+        max_city_extinction_delta=0.0,
+    )
+    assert failed["passed"] is False
+    assert len(failed["reasons"]) == 3
+
+
+def test_train_eval_paired_score_lcb_uses_complete_matched_pairs(tmp_path: Path):
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+
+    def write(path: Path, winners: tuple[int, int]) -> None:
+        records = [
+            {
+                "opponent": "first_place",
+                "seed": 2021,
+                "map_size": 12,
+                "candidate_player": player,
+                "winner": winner,
+            }
+            for player, winner in enumerate(winners)
+        ]
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    write(baseline, (1, 0))
+    write(candidate, (0, 1))
+    assert paired_score_difference_lcb(baseline, candidate, bootstrap_samples=20) == 1.0
+
+
+def test_train_eval_map_gates_reject_map_specific_regressions(tmp_path: Path):
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+
+    def write(path: Path, map12_winners: tuple[int, int], map16_winners: tuple[int, int]) -> None:
+        records = []
+        for map_size, winners in ((12, map12_winners), (16, map16_winners)):
+            records.extend(
+                {
+                    "opponent": "first_place",
+                    "seed": 2021,
+                    "map_size": map_size,
+                    "candidate_player": player,
+                    "winner": winner,
+                    "candidate_final_city_tiles": int(winner == player),
+                }
+                for player, winner in enumerate(winners)
+            )
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    write(baseline, (0, 1), (1, 0))
+    write(candidate, (1, 0), (0, 1))
+    deltas = map_metric_deltas(baseline, candidate, opponent_name="first_place")
+    decision = final_promotion_decision(
+        {
+            "opponents": {
+                "first_place": {
+                    "candidate_city_survival": 0.75,
+                    "candidate_city_extinction_rate": 0.25,
+                }
+            }
+        },
+        {
+            "opponents": {
+                "first_place": {
+                    "candidate_city_survival": 0.76,
+                    "candidate_city_extinction_rate": 0.25,
+                }
+            }
+        },
+        opponent_name="first_place",
+        paired_score_delta_lcb95=0.01,
+        min_paired_score_delta_lcb95=0.0,
+        min_city_survival_delta=0.0,
+        max_city_extinction_delta=0.0,
+        map_deltas=deltas,
+        min_map_score_delta=0.0,
+        max_map_city_extinction_delta=0.0,
+    )
+    assert decision["passed"] is False
+    assert any("map_12_score_delta" in reason for reason in decision["reasons"])
+    assert any("map_12_city_extinction_delta" in reason for reason in decision["reasons"])
+
+
+def test_train_eval_required_slices_are_matched_and_gate_regressions(tmp_path: Path):
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    records = []
+    changed = []
+    for map_size in (12, 24):
+        for player in (0, 1):
+            record = {
+                "opponent": "first_place",
+                "seed": 2021,
+                "map_size": map_size,
+                "candidate_player": player,
+                "winner": player,
+                "candidate_city_survival": 0.8,
+                "candidate_final_city_tiles": 1,
+            }
+            records.append(record)
+            changed.append(
+                {
+                    **record,
+                    "winner": 1 - player if map_size == 24 else player,
+                    "candidate_final_city_tiles": 0 if map_size == 24 and player == 1 else 1,
+                }
+            )
+    baseline.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    candidate.write_text("".join(json.dumps(row) + "\n" for row in changed), encoding="utf-8")
+
+    required = [parse_required_slice("map=24"), parse_required_slice("player=1")]
+    deltas = slice_metric_deltas(
+        baseline,
+        candidate,
+        opponent_name="first_place",
+        required_slices=required,
+    )
+    assert deltas["map_24"]["score_delta"] == -1.0
+    assert deltas["player_1"]["city_extinction_delta"] == 0.5
+    decision = promotion_decision(
+        {"opponents": {"first_place": {"score_rate": 0.5, "candidate_city_extinction_rate": 0.0}}},
+        {"opponents": {"first_place": {"score_rate": 0.5, "candidate_city_extinction_rate": 0.0}}},
+        opponent_name="first_place",
+        min_score_delta=-0.05,
+        max_city_extinction_delta=0.05,
+        slice_deltas=deltas,
+        min_slice_score_delta=-0.25,
+        max_slice_city_extinction_delta=0.25,
+    )
+    assert not decision["passed"]
+    assert any("slice_map_24_score_delta" in reason for reason in decision["reasons"])
+    assert any("slice_player_1_city_extinction_delta" in reason for reason in decision["reasons"])
+
+
+def test_train_eval_subsets_a_validated_final_baseline(tmp_path: Path):
+    source = tmp_path / "full.jsonl"
+    records = [
+        {
+            "backend": "internal_batched",
+            "opponent": "first_place",
+            "seed": seed,
+            "map_size": 12,
+            "candidate_player": player,
+            "winner": player,
+            "candidate_city_survival": 0.8,
+            "candidate_final_city_tiles": 1,
+            "candidate_final_units": 1,
+        }
+        for seed in (2021, 2022)
+        for player in (0, 1)
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    output = tmp_path / "screen.jsonl"
+    subset = subset_baseline_evaluation(
+        {"games": str(source), "source": "formal", "backend": "internal"},
+        output,
+        opponent_name="first_place",
+        seed_start=2021,
+        seeds=1,
+        map_sizes=(12,),
+        bootstrap_samples=10,
+    )
+    assert len(load_records(output)) == 2
+    assert subset["summary"]["opponents"]["first_place"]["matched_pairs"] == 1
+    assert subset["subset_of"] == str(source)
+
+
+def test_v13_game_result_ablation_changes_only_reward_and_horizon():
+    config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "beat_first_place_v13_game_result_from_distill.yaml")
+    assert config.name == "beat_first_place_v13_game_result_from_distill"
+    assert config.total_steps == 25000
+    assert config.reward_config_version == 9
+    assert config.reward_space == "GameResultReward"
+    assert config.reward_space_kwargs is None
+
+
+def test_v14_uses_v10_as_small_single_view_reference_kl_teacher():
+    config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "beat_first_place_v14_reference_kl_from_distill.yaml")
+    assert config.teacher_input_source == "student"
+    assert config.teacher_checkpoint_file == "best.pt"
+    assert config.teacher_load_dir.endswith("outputs/distill_v10_firstplace")
+    assert config.teacher_kl_cost == 0.005
+    assert config.teacher_kl_cost_floor == 0.005
+    assert config.teacher_baseline_cost == 0.0
+
+
+def test_distill_v2_large_config_is_scratch_and_prior_free():
+    config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "distill_v2_large_15m.yaml")
+    assert config.hidden_dim == 192
+    assert config.embedding_dim == 32
+    assert config.load_dir is None
+    assert config.checkpoint_file is None
+    assert config.use_teacher is False
+    assert config.rule_prior_alpha == 0.0
+
+
+def test_replay_outcome_supports_official_and_stateful_formats():
+    official, valid = replay_outcome({"rewards": [0.0, 1.0]})
+    assert valid and np.array_equal(official, [-1.0, 1.0])
+    stateful, valid = replay_outcome({"results": {"ranks": [{"agentID": 0, "rank": 1}, {"agentID": 1, "rank": 2}]}})
+    assert valid and np.array_equal(stateful, [1.0, -1.0])
+    missing, valid = replay_outcome({})
+    assert not valid and np.array_equal(missing, [0.0, 0.0])
+
+
+def test_replay_context_preserves_dagger_candidate_digest(tmp_path: Path):
+    context = replay_context(
+        {
+            "distillation": {
+                "source": "dagger",
+                "seed": 42,
+                "map_size": 24,
+                "candidate_player": 1,
+                "candidate_checkpoint_sha256": "abc123",
+            }
+        },
+        tmp_path / "replay.json",
+        None,
+    )
+    assert context["candidate_checkpoint_sha256"] == "abc123"
+
+
+def test_streaming_dataset_schedule_uses_one_selfplay_and_two_dagger_orientations():
+    teacher = streaming_dataset_schedule("teacher_selfplay", "teacher", 10, 2, (12, 24))
+    dagger = streaming_dataset_schedule("dagger", "dagger", 10, 2, (12, 24))
+    assert len(teacher) == 4
+    assert len(dagger) == 8
+    assert {item.candidate_player for item in teacher} == {0}
+    assert {item.candidate_player for item in dagger} == {0, 1}
+
+
+def test_online_distillation_round_defaults_are_conservative_and_prior_free(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "learner_policy_tta_rot180: false\nrule_prior_alpha: 0.0\nrule_prior_alpha_worker: 0.0\n",
+        encoding="utf-8",
+    )
+    validate_candidate_config(config)
+    args = SimpleNamespace(
+        dataset_dir=tmp_path / "dataset",
+        dataset_config=config,
+        output_dir=tmp_path / "round",
+        candidate_checkpoint=tmp_path / "candidate.pt",
+        candidate_config=config,
+        parity_report=tmp_path / "backend.json",
+        teacher_checkpoint=tmp_path / "teacher.pt",
+        teacher_config=tmp_path / "teacher.yaml",
+        teacher_agent=tmp_path / "main.py",
+        expected_teacher_sha256="teacher-sha",
+        seed_start=40000,
+        seeds=32,
+        map_sizes=(24, 32),
+        batch_games=8,
+        device="cuda:0",
+        train_batch_size=8,
+        lr=2e-5,
+        weight_decay=1e-4,
+        samples_per_round=100000,
+        checkpoint_every_samples=50000,
+        num_workers=4,
+        train_seed=2021,
+    )
+    collect = online_collection_command(args)
+    train = online_training_command(args)
+    assert collect[collect.index("--map-sizes") + 1 : collect.index("--batch-games")] == ["24", "32"]
+    assert train[train.index("--outcome-weight") + 1] == "0"
+    assert train[train.index("--rot180-augmentation-prob") + 1] == "0"
+    assert "teacher_selfplay=0.4" in train and "dagger=0.6" in train
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("learner_policy_tta_rot180: true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="learner_policy_tta_rot180=false"):
+        validate_candidate_config(bad)
+
+
+def test_online_round_schedule_count_supports_partial_collection_resume():
+    manifest = {
+        "shards": [
+            {
+                "data_source": "dagger",
+                "seed": 40,
+                "map_size": 24,
+                "candidate_player": 0,
+                "candidate_checkpoint_sha256": "candidate",
+            },
+            {
+                "data_source": "dagger",
+                "seed": 40,
+                "map_size": 24,
+                "candidate_player": 1,
+                "candidate_checkpoint_sha256": "candidate",
+            },
+            {"data_source": "dagger", "seed": 40, "map_size": 12, "candidate_player": 0},
+            {"data_source": "teacher_selfplay", "seed": 40, "map_size": 24, "candidate_player": -1},
+        ]
+    }
+    assert scheduled_dagger_count(manifest, 40, 2, (24, 32)) == 2
+    assert scheduled_dagger_digests(manifest, 40, 2, (24, 32)) == {"candidate"}
+
+
+def test_confidence_hard_label_and_outcome_losses_are_finite():
+    action_count = 3
+    dense = torch.zeros(1, 1, 2, 1, 1, action_count, requires_grad=True)
+    batch = {
+        "input_mask": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "positions": {"worker": torch.tensor([[[0, 0, 0]]])},
+        "legal_mask": {"worker": torch.ones(1, 1, action_count, dtype=torch.bool)},
+        "teacher_logits": {"worker": torch.tensor([[[4.0, 0.0, -1.0]]])},
+        "outcome": torch.tensor([[1.0, -1.0]]),
+        "outcome_valid": torch.tensor([True]),
+    }
+    output = {"policy_logits": {"worker": dense}, "baseline": torch.zeros(1, 2, requires_grad=True)}
+    loss, metrics = distillation_loss(
+        output,
+        batch,
+        hard_label_weight=0.25,
+        teacher_margin_threshold=1.0,
+        outcome_weight=0.1,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert metrics["confident_fraction"].item() == 1.0
+    assert metrics["hard_label_loss"].item() > 0.0
+    assert metrics["outcome_loss"].item() == pytest.approx(1.0)
+
+
+def test_rot180_consistency_is_zero_for_equivariant_policy():
+    action_count = len(ACTION_MEANINGS["worker"])
+    original = torch.randn(1, 1, 2, 2, 2, action_count)
+    rotated = rotate_policy_180({"worker": original})
+    batch = {
+        "input_mask": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+        "positions": {"worker": torch.tensor([[[0, 0, 0], [1, 1, 1]]])},
+        "legal_mask": {"worker": torch.ones(1, 2, action_count, dtype=torch.bool)},
+    }
+    loss = rot180_consistency_loss(
+        {"policy_logits": {"worker": original}},
+        {"policy_logits": rotated},
+        batch,
+    )
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_online_reference_teacher_can_share_the_student_observation_branch():
+    flags = SimpleNamespace(
+        teacher_input_source="student",
+        obs_space="SurvivalStrategicObs",
+        obs_space_kwargs={},
+    )
+    teacher = SimpleNamespace(obs_space="SurvivalStrategicObs", obs_space_kwargs={})
+    assert online_teacher_uses_student_observation(flags, teacher)
+    teacher.obs_space = "FixedShapeContinuousObsV2"
+    with pytest.raises(ValueError, match="same observation space"):
+        online_teacher_uses_student_observation(flags, teacher)
+
+
+def test_v12_distill_handoff_is_prior_free_and_matches_distilled_contract():
+    config = OmegaConf.load(Path(__file__).parents[1] / "conf" / "beat_first_place_v12_safe_from_distill.yaml")
+    assert config.rule_prior_alpha == 0.0
+    assert config.rule_prior_alpha_worker == 0.0
+    assert config.rule_prior_alpha_cart == 0.0
+    assert config.rule_prior_alpha_city_tile == 0.0
+    assert config.reward_space == "StrategicPotentialRewardV2"
+    assert config.reward_space_kwargs.shaping_weight == 0.015
+    assert config.reward_space_kwargs.shaping_floor == 0.003
+    assert config.reward_space_kwargs.decay_games == 20000
+    assert config.entropy_cost == 0.0002
+    assert config.actor_policy_tta_rot180 is False
+    assert config.learner_policy_tta_rot180 is False
+    assert config.teacher_policy_tta_rot180 is False
+    assert config.require_training_tta_disabled is True
+    assert config.n_value_warmup_batches == 250
+    assert config.value_head_only_warmup is True
+    assert config.teacher_kl_cost == 0.01
+    assert [opponent.weight for opponent in config.league_opponents] == [0.5, 0.3, 0.1, 0.1]
+
+
+def test_single_view_training_contract_rejects_any_tta_override():
+    flags = SimpleNamespace(
+        require_training_tta_disabled=True,
+        actor_policy_tta_rot180=False,
+        learner_policy_tta_rot180=False,
+        teacher_policy_tta_rot180=False,
+    )
+    validate_training_tta_contract(flags)
+    for name in (
+        "actor_policy_tta_rot180",
+        "learner_policy_tta_rot180",
+        "teacher_policy_tta_rot180",
+    ):
+        setattr(flags, name, True)
+        with pytest.raises(ValueError, match=name):
+            validate_training_tta_contract(flags)
+        setattr(flags, name, False)
+
+
+def test_value_head_only_warmup_preserves_policy_backbone_and_buffers():
+    class WarmupModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_model = torch.nn.Linear(3, 3)
+            self.actor_base = torch.nn.utils.spectral_norm(torch.nn.Linear(3, 3))
+            self.actor = torch.nn.Linear(3, 2)
+            self.baseline_base = torch.nn.utils.spectral_norm(torch.nn.Linear(3, 3))
+            self.baseline = torch.nn.Linear(3, 1)
+
+        def forward(self, inputs):
+            features = self.base_model(inputs)
+            policy = self.actor(self.actor_base(features))
+            value = self.baseline(self.baseline_base(features))
+            return policy, value
+
+    torch.manual_seed(7)
+    model = WarmupModel().train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    before = model_state_dict_cpu(model)
+    with value_head_only_warmup_mode(model, enabled=True):
+        _, value = model(torch.randn(8, 3))
+    value.square().mean().backward()
+    retain_value_head_gradients(model)
+    optimizer.step()
+    after = model_state_dict_cpu(model)
+
+    changed = {name for name in before if not torch.equal(before[name], after[name])}
+    assert changed
+    assert all(name.startswith(("baseline_base.", "baseline.")) for name in changed)
+    assert any(name.startswith("baseline.") for name in changed)
+    assert model.training is True
+    assert model.actor_base.training is True
 
 
 def test_checkpoint_model_difference_detects_identical_and_updated_policy(tmp_path: Path):
@@ -942,8 +1457,8 @@ def test_training_segment_uses_hydra_append_for_resume_paths(monkeypatch, tmp_pa
         weights_only=False,
         python="python",
     )
-    assert f"+load_dir={checkpoint.parent}" in captured["command"]
-    assert "+checkpoint_file=500.pt" in captured["command"]
+    assert f"++load_dir={checkpoint.parent}" in captured["command"]
+    assert "++checkpoint_file=500.pt" in captured["command"]
     assert "weights_only=false" in captured["command"]
     assert "total_steps=1000" in captured["command"]
     assert "stop_after_step=250" in captured["command"]
@@ -1142,17 +1657,35 @@ def test_engine_snapshot_replay_round_trip_transition_matches():
 
         def signature():
             game = env.unwrapped[0].game_state
-            roads = tuple(
-                round(float(cell.road), 6) for row in game.map.map for cell in row
-            )
+            roads = tuple(round(float(cell.road), 6) for row in game.map.map for cell in row)
             players = tuple(
                 (
                     player.research_points,
-                    tuple(sorted((unit.id, unit.pos.x, unit.pos.y, unit.cooldown, unit.cargo.wood,
-                                  unit.cargo.coal, unit.cargo.uranium) for unit in player.units)),
-                    tuple(sorted((city.cityid, city.fuel, city.light_upkeep,
-                                  tuple(sorted((tile.pos.x, tile.pos.y, tile.cooldown) for tile in city.citytiles)))
-                                 for city in player.cities.values())),
+                    tuple(
+                        sorted(
+                            (
+                                unit.id,
+                                unit.pos.x,
+                                unit.pos.y,
+                                unit.cooldown,
+                                unit.cargo.wood,
+                                unit.cargo.coal,
+                                unit.cargo.uranium,
+                            )
+                            for unit in player.units
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                city.cityid,
+                                city.fuel,
+                                city.light_upkeep,
+                                tuple(sorted((tile.pos.x, tile.pos.y, tile.cooldown) for tile in city.citytiles)),
+                            )
+                            for city in player.cities.values()
+                        )
+                    ),
                 )
                 for player in game.players
             )
@@ -1174,8 +1707,7 @@ def test_intent_head_only_mode_freezes_every_other_parameter():
     assert names == ["intent_head.weight", "intent_head.bias"]
     assert parameters == [model.intent_head.weight, model.intent_head.bias]
     assert all(
-        parameter.requires_grad == name.startswith("intent_head.")
-        for name, parameter in model.named_parameters()
+        parameter.requires_grad == name.startswith("intent_head.") for name, parameter in model.named_parameters()
     )
 
 
@@ -1205,10 +1737,7 @@ def test_model_state_validation_detects_update_and_syncs_actor():
     sync_actor_model(actor, learner, verify=True)
 
     assert actor.loaded_state_devices == {"cpu"}
-    assert all(
-        actor.loaded_state_pointers[name] != tensor.data_ptr()
-        for name, tensor in learner.state_dict().items()
-    )
+    assert all(actor.loaded_state_pointers[name] != tensor.data_ptr() for name, tensor in learner.state_dict().items())
     assert state_dict_max_abs_diff(model_state_dict_cpu(actor), model_state_dict_cpu(learner)) == 0.0
 
 
@@ -1335,10 +1864,11 @@ def test_evaluation_reports_extinction_rates():
     assert teacher["candidate_unit_extinction_rate"] == 0.5
 
 
-def test_compact_shard_loads_ragged_entities_and_rebuilds_dense_mask(tmp_path: Path):
+@pytest.mark.parametrize("schema_version", (3, 4))
+def test_compact_shard_loads_ragged_entities_and_rebuilds_dense_mask(tmp_path: Path, schema_version: int):
     shard_name = "compact.npz"
     arrays = {
-        "schema_version": np.asarray(3),
+        "schema_version": np.asarray(schema_version),
         "teacher_tta_rot180": np.asarray(True),
         "turn_count": np.asarray(1),
         "input_mask": np.ones((1, 2, 2), dtype=np.bool_),
@@ -1356,7 +1886,7 @@ def test_compact_shard_loads_ragged_entities_and_rebuilds_dense_mask(tmp_path: P
         arrays[f"{entity}_teacher_logits"] = np.zeros((count, action_count), dtype=np.float16)
     np.savez_compressed(tmp_path / shard_name, **arrays)
     manifest = {
-        "schema_version": 3,
+        "schema_version": schema_version,
         "teacher_tta_rot180": True,
         "shards": [{"path": shard_name, "split": "train", "turn_count": 1}],
     }
@@ -1415,5 +1945,227 @@ def test_replay_discovery_accepts_file_and_ignores_metadata(tmp_path: Path):
     replay.write_text("{}", encoding="utf-8")
     (tmp_path / "agent_info.json").write_text("{}", encoding="utf-8")
     (tmp_path / "123_info.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "dagger_backend.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "backend_profile.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "report.json").write_text("{}", encoding="utf-8")
+    hidden_bundle = tmp_path / ".candidate_agent"
+    hidden_bundle.mkdir()
+    (hidden_bundle / "game_constants.json").write_text("{}", encoding="utf-8")
     assert _discover_replays(replay) == [replay]
     assert _discover_replays(tmp_path) == [replay]
+
+
+def test_stateful_updates_reconstruct_official_game_state():
+    state = {
+        "teamStates": {
+            "0": {
+                "researchPoints": 7,
+                "units": {
+                    "u_1": {
+                        "type": 0,
+                        "x": 1,
+                        "y": 0,
+                        "cooldown": 0,
+                        "cargo": {"wood": 12, "coal": 0, "uranium": 0},
+                    }
+                },
+            },
+            "1": {"researchPoints": 0, "units": {}},
+        },
+        "map": [
+            [{"road": 0, "resource": None}, {"road": 0, "resource": {"type": "wood", "amount": 100}}],
+            [{"road": 1.5, "resource": None}, {"road": 0, "resource": None}],
+        ],
+        "cities": {
+            "c_1": {
+                "team": 0,
+                "fuel": 20,
+                "lightupkeep": 10,
+                "cityCells": [{"x": 0, "y": 1, "cooldown": 0}],
+            }
+        },
+    }
+    updates = ["0", "2 2", *stateful_updates(state)]
+    game = Game()
+    game._initialize(updates)
+    game._update(updates[2:])
+
+    assert game.players[0].research_points == 7
+    assert game.players[0].units[0].cargo.wood == 12
+    assert game.map.get_cell(1, 0).resource.amount == 100
+    assert game.map.get_cell(0, 1).road == pytest.approx(1.5)
+    assert game.players[0].cities["c_1"].citytiles[0].pos.x == 0
+
+
+def test_dagger_context_groups_orientations_and_supervises_candidate_only(tmp_path: Path):
+    replay_path = tmp_path / "seed-42-size-12-p1.json"
+    replay = {
+        "seed": 42,
+        "width": 12,
+        "distillation": {"source": "dagger", "candidate_player": 1, "seed": 42, "map_size": 12},
+    }
+    context = replay_context(replay, replay_path, None)
+    positions = np.asarray([[0, 1, 2], [1, 3, 4], [1, 5, 6]], dtype=np.int16)
+
+    assert context == {"data_source": "dagger", "seed": 42, "map_size": 12, "candidate_player": 1}
+    assert _supervised_positions(positions, 1).tolist() == [[1, 3, 4], [1, 5, 6]]
+    assert _split_for_group("dagger", 42, "a") == _split_for_group("dagger", 42, "b")
+
+
+def test_balanced_sampler_honors_source_targets_and_balances_map_turn_cells():
+    dataset = SimpleNamespace(
+        samples=[
+            {"source": "teacher", "map_size": 12, "turn_band": 0, "is_night": False},
+            {"source": "teacher", "map_size": 12, "turn_band": 0, "is_night": True},
+            {"source": "teacher", "map_size": 32, "turn_band": 4, "is_night": False},
+            {"source": "dagger", "map_size": 12, "turn_band": 0, "is_night": False},
+            {"source": "dagger", "map_size": 32, "turn_band": 4, "is_night": False},
+        ]
+    )
+    targets = parse_source_weights(["teacher=0.4", "dagger=0.6"])
+    weights = balanced_sample_weights(dataset, targets, night_weight=2.0)
+    totals = {
+        source: sum(float(weight) for sample, weight in zip(dataset.samples, weights) if sample["source"] == source)
+        for source in targets
+    }
+
+    assert totals == pytest.approx(targets)
+    assert weights[1] == pytest.approx(weights[0] * 2.0)
+
+
+def test_worker_head_distillation_scope_freezes_every_other_parameter_and_mode():
+    model = torch.nn.Module()
+    model.base_model = torch.nn.Linear(3, 3)
+    model.actor_base = torch.nn.Linear(3, 3)
+    model.actor = torch.nn.Module()
+    model.actor.actors = torch.nn.ModuleDict(
+        {
+            "worker": torch.nn.Linear(3, 2),
+            "cart": torch.nn.Linear(3, 2),
+            "city_tile": torch.nn.Linear(3, 2),
+        }
+    )
+
+    names = configure_distillation_trainable_parameters(model, "worker_head")
+    set_distillation_train_mode(model, training=True, scope="worker_head")
+
+    assert names == ["actor.actors.worker.weight", "actor.actors.worker.bias"]
+    assert not model.training
+    assert model.actor.actors["worker"].training
+    assert not model.actor.actors["city_tile"].training
+    assert all(
+        parameter.requires_grad == name.startswith("actor.actors.worker.")
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_behavior_gate_requires_bounded_worker_drift_and_exact_city_policy():
+    diagnostics = {
+        "teacher_selfplay": {
+            "all": {
+                "worker": {"reference_disagreement": 0.012},
+                "city_tile": {"reference_disagreement": 0.0},
+            }
+        }
+    }
+    passed = evaluate_behavior_gate(diagnostics, "teacher_selfplay", 0.005, 0.02, True)
+    assert passed["passed"]
+
+    diagnostics["teacher_selfplay"]["all"]["city_tile"]["reference_disagreement"] = 0.001
+    failed = evaluate_behavior_gate(diagnostics, "teacher_selfplay", 0.005, 0.02, True)
+    assert not failed["passed"]
+    assert not failed["checks"]["city_exact"]["passed"]
+
+
+def test_behavior_probe_sampling_is_deterministic_and_balanced_by_source_map():
+    dataset = SimpleNamespace(
+        samples=[
+            {"source": source, "map_size": map_size}
+            for source in ("teacher", "dagger")
+            for map_size in (12, 32)
+            for _ in range(5)
+        ]
+    )
+    first = stratified_behavior_probe_indices(dataset, samples_per_cell=2, seed=7)
+    second = stratified_behavior_probe_indices(dataset, samples_per_cell=2, seed=7)
+    cells = Counter((dataset.samples[index]["source"], dataset.samples[index]["map_size"]) for index in first)
+
+    assert first == second
+    assert len(first) == 8
+    assert set(cells.values()) == {2}
+
+
+def test_dagger_annotation_writes_replay_metadata_and_manifest(tmp_path: Path):
+    replay_path = tmp_path / "seed-7-size-12-p0.json"
+    replay_path.write_text(json.dumps({"seed": 7, "width": 12, "stateful": [{}, {}]}), encoding="utf-8")
+    games_path = tmp_path / "games.jsonl"
+    games_path.write_text(
+        json.dumps({"seed": 7, "map_size": 12, "candidate_player": 0, "replay": replay_path.name}) + "\n",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    manifest = annotate_dagger_replays(
+        tmp_path,
+        games_path,
+        source_name="dagger",
+        candidate_checkpoint=checkpoint,
+    )
+    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+
+    assert manifest["games"] == 1
+    assert replay["distillation"]["candidate_player"] == 0
+    assert replay["distillation"]["source"] == "dagger"
+    assert (tmp_path / "dagger_info.json").is_file()
+
+
+def test_internal_stateful_replay_round_trip_and_parity_gate(tmp_path: Path):
+    initial = [
+        "0",
+        "2 2",
+        "rp 0 7",
+        "rp 1 0",
+        "u 0 0 u_1 1 0 0 12 0 0",
+        "r wood 1 1 100",
+        "c 0 c_1 20 10",
+        "ct 0 c_1 0 1 0",
+        "D_DONE",
+    ]
+    game = Game()
+    game._initialize(initial)
+    game._update(initial[2:])
+    frame = stateful_replay_frame(game)
+    restored_updates = ["0", "2 2", *stateful_updates(frame)]
+    restored = Game()
+    restored._initialize(restored_updates)
+    restored._update(restored_updates[2:])
+
+    assert restored.players[0].research_points == 7
+    assert restored.players[0].units[0].cargo.wood == 12
+    assert restored.map.get_cell(1, 1).resource.amount == 100
+    spec = MatchSpec("seed-7-size-2-p0", "first_place", 7, 2, 0)
+    replay_path = tmp_path / f"{spec.match_id}.json"
+    write_internal_stateful_replay(replay_path, spec, [frame, frame], winner=1)
+    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+    assert replay["width"] == replay["height"] == 2
+    assert len(replay["stateful"]) == 2
+    assert replay["results"]["ranks"][1] == {"rank": 1, "agentID": 1}
+
+    state = {"weight": torch.arange(3)}
+    checkpoint = tmp_path / "best.pt"
+    torch.save({"model_state_dict": state}, checkpoint)
+    parity_path = tmp_path / "backend.json"
+    parity_path.write_text(
+        json.dumps({"parity": "passed", "profile": {"candidate_digest": policy_state_digest(state)}}),
+        encoding="utf-8",
+    )
+    result = validate_internal_parity(checkpoint, parity_path)
+    assert result["candidate_digest"] == policy_state_digest(state)
+
+    parity_path.write_text(
+        json.dumps({"parity": "passed", "profile": {"candidate_digest": "wrong"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="candidate differs"):
+        validate_internal_parity(checkpoint, parity_path)

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -22,9 +23,16 @@ from .artifacts import sha256_file
 from .obs import SurvivalStrategicObs
 from .tta import rot180_ensemble_outputs
 
-DATASET_SCHEMA_VERSION = 3
+DATASET_SCHEMA_VERSION = 4
 LEGACY_PREPARED_CACHE_VERSION = 1
 FIRST_PLACE_TEACHER_SHA256 = "40248f0fbc9b8e1e1b1f7cc6fc674c041d8dac43b964ae45bd976d927cdffd22"
+NON_REPLAY_JSON_NAMES = {
+    "agent_info.json",
+    "backend.json",
+    "backend_profile.json",
+    "dagger_backend.json",
+    "report.json",
+}
 
 
 def _load_flags(path: Path, device: str):
@@ -41,7 +49,10 @@ def _discover_replays(path: Path) -> list[Path]:
         else sorted(
             p
             for p in path.rglob("*.json")
-            if p.is_file() and p.name != "agent_info.json" and not p.name.endswith("_info.json")
+            if p.is_file()
+            and not any(part.startswith(".") for part in p.relative_to(path).parts)
+            and p.name not in NON_REPLAY_JSON_NAMES
+            and not p.name.endswith("_info.json")
         )
     )
     if not replays:
@@ -63,6 +74,12 @@ def _actionable_masks(game, width: int, height: int) -> dict[str, np.ndarray]:
     return result
 
 
+def _supervised_positions(positions: np.ndarray, candidate_player: int) -> np.ndarray:
+    if candidate_player < 0:
+        return positions
+    return positions[positions[:, 0] == candidate_player]
+
+
 def _strip_prefix(values: dict[str, np.ndarray], prefix: str) -> dict[str, np.ndarray]:
     return {key[len(prefix) :]: value for key, value in values.items() if key.startswith(prefix)}
 
@@ -70,6 +87,104 @@ def _strip_prefix(values: dict[str, np.ndarray], prefix: str) -> dict[str, np.nd
 def _split_for_digest(digest: str) -> str:
     bucket = int(digest[:8], 16) % 100
     return "train" if bucket < 80 else "validation" if bucket < 90 else "test"
+
+
+def _split_for_group(source: str, seed: int | None, replay_sha: str) -> str:
+    if seed is None:
+        return _split_for_digest(replay_sha)
+    digest = hashlib.sha256(f"{source}:{seed}".encode()).hexdigest()
+    return _split_for_digest(digest)
+
+
+def _seed_from_name(path: Path) -> int | None:
+    match = re.search(r"seed[^0-9]*([0-9]+)", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def replay_context(replay: dict, replay_path: Path, source: str | None) -> dict:
+    distillation = replay.get("distillation", {})
+    configuration = replay.get("configuration", {})
+    info = replay.get("info", {})
+    resolved_source = source or distillation.get("source") or info.get("source") or "default"
+    seed_value = distillation.get("seed", configuration.get("seed", replay.get("seed")))
+    seed = int(seed_value) if seed_value is not None else _seed_from_name(replay_path)
+    width = distillation.get("map_size", configuration.get("width", replay.get("width")))
+    if width is None and replay.get("steps"):
+        width = replay["steps"][0][0].get("observation", {}).get("width")
+    if width is None:
+        raise ValueError(f"Cannot determine map size from replay: {replay_path}")
+    candidate_player = int(distillation.get("candidate_player", -1))
+    context = {
+        "data_source": str(resolved_source),
+        "seed": seed if seed is not None else -1,
+        "map_size": int(width),
+        "candidate_player": candidate_player,
+    }
+    if distillation.get("candidate_checkpoint_sha256"):
+        context["candidate_checkpoint_sha256"] = str(distillation["candidate_checkpoint_sha256"])
+    return context
+
+
+def replay_outcome(replay: dict) -> tuple[np.ndarray, bool]:
+    """Return zero-sum terminal outcomes without depending on one replay format."""
+    rewards = replay.get("rewards")
+    if isinstance(rewards, list) and len(rewards) == 2 and all(value is not None for value in rewards):
+        left, right = (float(value) for value in rewards)
+        if left == right:
+            return np.zeros(2, dtype=np.float32), True
+        winner = 0 if left > right else 1
+        result = np.full(2, -1.0, dtype=np.float32)
+        result[winner] = 1.0
+        return result, True
+    ranks = replay.get("results", {}).get("ranks")
+    if isinstance(ranks, list) and len(ranks) == 2:
+        by_player = {int(item["agentID"]): int(item["rank"]) for item in ranks}
+        if set(by_player) == {0, 1}:
+            if by_player[0] == by_player[1]:
+                return np.zeros(2, dtype=np.float32), True
+            winner = min(by_player, key=by_player.get)
+            result = np.full(2, -1.0, dtype=np.float32)
+            result[winner] = 1.0
+            return result, True
+    return np.zeros(2, dtype=np.float32), False
+
+
+def stateful_updates(state: dict) -> list[str]:
+    """Convert an official stateful replay frame to the Lux update protocol."""
+    updates = []
+    for team_text, team_state in sorted(state.get("teamStates", {}).items(), key=lambda item: int(item[0])):
+        team = int(team_text)
+        updates.append(f"rp {team} {int(team_state.get('researchPoints', 0))}")
+        for unit_id, unit in sorted(team_state.get("units", {}).items()):
+            cargo = unit.get("cargo", {})
+            updates.append(
+                "u {type} {team} {unit_id} {x} {y} {cooldown} {wood} {coal} {uranium}".format(
+                    type=int(unit["type"]),
+                    team=team,
+                    unit_id=unit_id,
+                    x=int(unit["x"]),
+                    y=int(unit["y"]),
+                    cooldown=float(unit.get("cooldown", 0.0)),
+                    wood=int(cargo.get("wood", 0)),
+                    coal=int(cargo.get("coal", 0)),
+                    uranium=int(cargo.get("uranium", 0)),
+                )
+            )
+    for y, row in enumerate(state.get("map", ())):
+        for x, cell in enumerate(row):
+            resource = cell.get("resource")
+            if resource is not None:
+                updates.append(f"r {resource['type']} {x} {y} {int(resource['amount'])}")
+            road = float(cell.get("road", 0.0))
+            if road:
+                updates.append(f"ccd {x} {y} {road}")
+    for city_id, city in sorted(state.get("cities", {}).items()):
+        team = int(city["team"])
+        updates.append(f"c {team} {city_id} {float(city['fuel'])} {float(city['lightupkeep'])}")
+        for tile in city.get("cityCells", ()):
+            updates.append(f"ct {team} {city_id} {int(tile['x'])} {int(tile['y'])} {float(tile.get('cooldown', 0.0))}")
+    updates.append("D_DONE")
+    return updates
 
 
 def _compact_observation(value: np.ndarray) -> np.ndarray:
@@ -128,7 +243,7 @@ def _load_legacy_prepared_targets(path: Path, turn_count: int) -> dict[str, dict
 
 def _shard_metadata(path: Path) -> dict:
     with np.load(path, allow_pickle=False) as shard:
-        return {
+        metadata = {
             "schema_version": int(shard["schema_version"]),
             "replay": str(shard["replay"]),
             "replay_sha256": str(shard["replay_sha256"]),
@@ -138,6 +253,15 @@ def _shard_metadata(path: Path) -> dict:
             "turn_count": int(shard["turn_count"]),
             "split": str(shard["split"]),
         }
+        for key, default in (
+            ("data_source", "default"),
+            ("seed", -1),
+            ("map_size", -1),
+            ("candidate_player", -1),
+            ("candidate_checkpoint_sha256", ""),
+        ):
+            metadata[key] = shard[key].item() if key in shard else default
+        return metadata
 
 
 def prepare_replay(
@@ -150,12 +274,17 @@ def prepare_replay(
     device: torch.device,
     max_turns: int | None,
     legacy_prepared_cache_dir: Path | None = None,
+    source: str | None = None,
 ) -> dict:
     replay_sha = sha256_file(replay_path)
+    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+    context = replay_context(replay, replay_path, source)
+    outcome, outcome_valid = replay_outcome(replay)
     cache_key = hashlib.sha256(
         (
             f"{DATASET_SCHEMA_VERSION}:{replay_sha}:{teacher_sha}:{student_flags.obs_space.__name__}:"
-            f"{max_turns if max_turns is not None else 'all'}:teacher_rot180_tta_v1"
+            f"{max_turns if max_turns is not None else 'all'}:teacher_rot180_tta_v1:"
+            f"{context['data_source']}:{context['seed']}:{context['candidate_player']}"
         ).encode()
     ).hexdigest()
     output_path = output_dir / f"{cache_key}.npz"
@@ -167,9 +296,9 @@ def prepare_replay(
             raise ValueError(f"Compact shard does not contain Rot180-TTA teacher targets: {output_path}")
         return metadata | {"path": output_path.name, "created": False, "size_bytes": output_path.stat().st_size}
 
-    replay = json.loads(replay_path.read_text(encoding="utf-8"))
     steps = replay.get("steps") or []
-    if len(steps) < 2:
+    states = replay.get("stateful") or []
+    if len(steps) < 2 and len(states) < 2:
         raise ValueError(f"Replay has no playable turns: {replay_path}")
     multi_obs = obs_spaces.MultiObs(
         {
@@ -180,33 +309,42 @@ def prepare_replay(
     raw_env = LuxEnv(BasicActionSpace(), multi_obs, run_game_automatically=False)
     obs_wrapper = multi_obs.wrap_env(raw_env)
 
-    initial_observation = steps[0][0]["observation"]
-    initial_updates = list(initial_observation["updates"])
-    try:
-        int(initial_updates[0])
-        has_initialization_header = True
-    except (IndexError, ValueError):
-        has_initialization_header = False
-    if not has_initialization_header:
-        player = int(initial_observation.get("player", 0))
-        width = int(initial_observation["width"])
-        height = int(initial_observation["height"])
-        initial_updates = [str(player), f"{width} {height}", *initial_updates]
+    if states:
+        width = int(replay["width"])
+        height = int(replay["height"])
+        initial_updates = ["0", f"{width} {height}", *stateful_updates(states[0])]
+    else:
+        initial_observation = steps[0][0]["observation"]
+        initial_updates = list(initial_observation["updates"])
+        try:
+            int(initial_updates[0])
+            has_initialization_header = True
+        except (IndexError, ValueError):
+            has_initialization_header = False
+        if not has_initialization_header:
+            player = int(initial_observation.get("player", 0))
+            width = int(initial_observation["width"])
+            height = int(initial_observation["height"])
+            initial_updates = [str(player), f"{width} {height}", *initial_updates]
     raw_env.reset(observation_updates=initial_updates)
     pad_wrapper = PadFixedShapeEnv(obs_wrapper)
     observations: dict[str, list[np.ndarray]] = {}
     entity_values = {entity: {"positions": [], "legal_mask": [], "teacher_logits": []} for entity in ACTION_MEANINGS}
     entity_offsets = {entity: [0] for entity in ACTION_MEANINGS}
     input_mask = None
-    turn_count = min(len(steps) - 1, max_turns if max_turns is not None else len(steps) - 1)
+    # Official stateful replays contain the state before every action plus one
+    # terminal state. The terminal state has no policy decision to supervise.
+    available_turns = len(states) - 1 if states else len(steps) - 1
+    turn_count = min(available_turns, max_turns if max_turns is not None else available_turns)
     legacy_targets = None
     if legacy_prepared_cache_dir is not None:
         legacy_path = _legacy_prepared_cache_path(replay_path, legacy_prepared_cache_dir)
-        legacy_targets = _load_legacy_prepared_targets(legacy_path, turn_count)
+        if legacy_path.is_file():
+            legacy_targets = _load_legacy_prepared_targets(legacy_path, turn_count)
     with torch.inference_mode():
         for turn in range(turn_count):
             if turn:
-                updates = steps[turn][0]["observation"]["updates"]
+                updates = stateful_updates(states[turn]) if states else steps[turn][0]["observation"]["updates"]
                 raw_env.manual_step(updates)
                 raw_env.game_state.turn = turn
                 raw_env._update_internal_state()
@@ -238,6 +376,11 @@ def prepare_replay(
                     positions = np.concatenate(position_parts, axis=0)
                     legal = np.concatenate(legal_parts, axis=0)
                     logits = np.concatenate(logits_parts, axis=0)
+                    if context["candidate_player"] >= 0:
+                        keep = positions[:, 0] == context["candidate_player"]
+                        positions = positions[keep]
+                        legal = legal[keep]
+                        logits = logits[keep]
                     entity_values[entity]["positions"].append(positions)
                     entity_values[entity]["legal_mask"].append(legal.astype(np.bool_, copy=False))
                     entity_values[entity]["teacher_logits"].append(logits.astype(np.float16, copy=False))
@@ -258,12 +401,15 @@ def prepare_replay(
                     },
                 },
             }
+            if teacher_model is None:
+                raise RuntimeError(f"Teacher inference is required but no model was loaded for {replay_path}")
             teacher_output = rot180_ensemble_outputs(teacher_model, teacher_input)
             masks = pad_wrapper._pad(
                 _actionable_masks(raw_env.game_state, raw_env.game_state.map_width, raw_env.game_state.map_height)
             )
             for entity, dense_logits in teacher_output["policy_logits"].items():
                 positions = np.argwhere(masks[entity][0]).astype(np.int16, copy=False)
+                positions = _supervised_positions(positions, context["candidate_player"])
                 legal_dense = padded_info["available_actions_mask"][entity][0]
                 logits_dense = dense_logits[0, 0].detach().to(dtype=torch.float16).cpu().numpy()
                 if len(positions):
@@ -286,10 +432,17 @@ def prepare_replay(
         "observation_space": student_flags.obs_space.__name__,
         "teacher_tta_rot180": True,
         "turn_count": turn_count,
-        "split": _split_for_digest(replay_sha),
+        "split": _split_for_group(
+            context["data_source"],
+            None if context["seed"] < 0 else context["seed"],
+            replay_sha,
+        ),
+        **context,
     }
     arrays = {key: np.asarray(value) for key, value in metadata.items()}
     arrays["input_mask"] = input_mask
+    arrays["outcome"] = outcome
+    arrays["outcome_valid"] = np.asarray(outcome_valid, dtype=np.bool_)
     for key, values in observations.items():
         arrays[f"obs__{key}"] = np.stack(values)
     for entity in ACTION_MEANINGS:
@@ -302,8 +455,15 @@ def prepare_replay(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create content-addressed scratch-distillation shards.")
-    parser.add_argument("--replay-dir", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Create content-addressed offline-distillation shards.")
+    parser.add_argument("--replay-dir", type=Path, action="append", help="Replay path; can be repeated.")
+    parser.add_argument(
+        "--replay-source",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Named replay source for balanced sampling; can be repeated.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--teacher-checkpoint", type=Path, required=True)
     parser.add_argument("--teacher-config", type=Path, required=True)
@@ -318,7 +478,31 @@ def parse_args() -> argparse.Namespace:
         help="Reuse LuxPythonEnvGym prepared teacher logits and recompute only strategic observations.",
     )
     parser.add_argument("--seed", type=int, default=2021)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.replay_dir and not args.replay_source:
+        parser.error("at least one --replay-dir or --replay-source is required")
+    return args
+
+
+def _requested_replays(args: argparse.Namespace) -> list[tuple[str | None, Path]]:
+    requested = [(None, path) for path in args.replay_dir or ()]
+    for value in args.replay_source:
+        name, separator, path_text = value.partition("=")
+        if not separator or not name or not path_text:
+            raise ValueError(f"--replay-source must be NAME=PATH, got {value!r}")
+        requested.append((name, Path(path_text)))
+    replays = []
+    seen = set()
+    for source, root in requested:
+        for replay in _discover_replays(root):
+            identity = (source, replay.resolve())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            replays.append((source, replay))
+    if args.max_replays is not None:
+        replays = replays[: args.max_replays]
+    return replays
 
 
 def main() -> None:
@@ -338,8 +522,12 @@ def main() -> None:
     teacher_flags = _load_flags(args.teacher_config, args.device)
     if student_flags.obs_space is not SurvivalStrategicObs:
         raise ValueError("student config must use SurvivalStrategicObs")
+    replay_requests = _requested_replays(args)
+    teacher_required = args.legacy_prepared_cache_dir is None or any(
+        not _legacy_prepared_cache_path(path, args.legacy_prepared_cache_dir).is_file() for _, path in replay_requests
+    )
     teacher_model = None
-    if args.legacy_prepared_cache_dir is None:
+    if teacher_required:
         teacher_model = create_model(student_flags, device, teacher_model_flags=teacher_flags, is_teacher_model=True)
         checkpoint = torch.load(args.teacher_checkpoint, map_location=device, weights_only=False)
         teacher_model.load_state_dict(checkpoint["model_state_dict"])
@@ -347,13 +535,10 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    replays = _discover_replays(args.replay_dir)
-    if args.max_replays is not None:
-        replays = replays[: args.max_replays]
     records = []
     created_count = 0
-    replay_progress = tqdm(replays, desc="Preparing replays", unit="replay", dynamic_ncols=True)
-    for path in replay_progress:
+    replay_progress = tqdm(replay_requests, desc="Preparing replays", unit="replay", dynamic_ncols=True)
+    for source, path in replay_progress:
         record = prepare_replay(
             path,
             output_dir,
@@ -364,6 +549,7 @@ def main() -> None:
             device,
             args.max_turns,
             args.legacy_prepared_cache_dir,
+            source,
         )
         records.append(record)
         created_count += int(record["created"])
@@ -384,6 +570,13 @@ def main() -> None:
         "sample_count": sum(record["turn_count"] for record in records),
         "size_bytes": sum(record["size_bytes"] for record in records),
         "shards": records,
+        "sources": {
+            source: {
+                "replays": sum(record["data_source"] == source for record in records),
+                "samples": sum(record["turn_count"] for record in records if record["data_source"] == source),
+            }
+            for source in sorted({record["data_source"] for record in records})
+        },
     }
     temporary = output_dir / "manifest.json.tmp"
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

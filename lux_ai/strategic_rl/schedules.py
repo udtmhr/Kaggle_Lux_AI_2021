@@ -42,6 +42,8 @@ def rule_prior_alpha(flags, entity: str, step: int) -> float:
     end = float(getattr(flags, f"rule_prior_alpha_{entity}_end", global_end))
     duration = int(float(getattr(flags, "rule_prior_decay_steps", 0)))
     delay = int(float(getattr(flags, "rule_prior_decay_delay_steps", 0)))
+    if duration <= 0:
+        return start
     return LinearSchedule(start, end, duration, delay)(step)
 
 

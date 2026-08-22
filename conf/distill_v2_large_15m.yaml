@@ -1,0 +1,118 @@
+name: distill_v2_large_15m
+project: Lux_AI_2021_strategic
+entity: null
+group: scratch_distillation_v2
+
+# This student is always initialized from its own seeded random state. The
+# first-place checkpoint is a target generator only and is never loaded here.
+act_space: BasicActionSpace
+obs_space: SurvivalStrategicObs
+obs_space_kwargs: {}
+reward_space: GameResultReward
+reward_space_kwargs: {}
+
+total_steps: 50000000
+num_actors: 4
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+
+model_arch: survival_strategic
+n_blocks: 12
+attention_blocks: 4
+n_heads: 6
+hidden_dim: 192
+embedding_dim: 32
+n_merge_layers: 1
+normalize: false
+sum_player_embeddings: false
+use_index_select: false
+rescale_value_input: true
+rescale_se_input: true
+kernel_size: 5
+
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 0.000001
+  eps: 0.0003
+min_lr_mod: 0.1
+lr_schedule: cosine
+entropy_cost: 0.0002
+baseline_cost: 1.0
+teacher_kl_cost: 0.0
+teacher_baseline_cost: 0.0
+lmb: 0.9
+reduction: sum
+
+# Deployment/evaluation may use the established two-view ensemble. Offline
+# training uses paired consistency rather than loading any teacher parameters.
+actor_policy_tta_rot180: true
+learner_policy_tta_rot180: false
+teacher_policy_tta_rot180: true
+use_teacher: false
+teacher_load_dir: null
+teacher_checkpoint_file: null
+
+league_enabled: false
+league_config_version: 0
+league_opponents: []
+league_sampling: fixed
+pfsp_power: 1.0
+pfsp_teacher_floor: 0.0
+pfsp_exploration: 0.0
+pfsp_prior_games: 20
+learner_snapshot_interval_steps: 500000
+
+actor_device: cuda:0
+learner_device: cuda:0
+disable_wandb: true
+model_log_freq: 100
+sharing_strategy: file_descriptor
+seed: 2021
+num_buffers: 8
+use_mixed_precision: true
+actor_mixed_precision: false
+clip_grads: 10.0
+checkpoint_freq: 120.0
+num_learner_threads: 1
+debug: false
+weights_only: true
+n_value_warmup_batches: 0
+
+behavior_kl_target: null
+behavior_kl_auto_steps: 20000
+behavior_kl_dual_lr: 0.05
+behavior_kl_abort_multiplier: 4.0
+value_critic: scalar
+value_num_bins: 101
+value_support_min: -2.0
+value_support_max: 2.0
+value_hl_gauss_sigma_ratio: 0.75
+state_curriculum_enabled: false
+snapshot_start_probability: 0.3
+snapshot_pool_capacity: 2048
+snapshot_capture_interval: 16
+collision_penalty_cost: 0.0
+collision_penalty_ramp_start: 0.0
+collision_penalty_ramp_end: 0.0
+collision_penalty_ramp_steps: 50000
+reward_config_version: 9
+objective_config_version: 2
+loss_normalization: trajectory
+normalize_advantages: true
+advantage_clip: 5.0
+rule_prior_alpha: 0.0
+rule_prior_alpha_worker: 0.0
+rule_prior_alpha_cart: 0.0
+rule_prior_alpha_city_tile: 0.0
+rule_aux_enabled: false
+rule_aux_cost: 0.0
+rule_aux_strategy: economy
+intent_aux_enabled: false
+intent_aux_cost: 0.0
+intent_head_only_finetune: false
+stop_after_step: null
+verify_model_updates: true
+load_dir: null
+checkpoint_file: null

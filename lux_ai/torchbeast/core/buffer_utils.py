@@ -109,6 +109,9 @@ def create_buffers(
         policy_version=dict(size=(t + 1, n), dtype=torch.int64),
         actions={},
     )
+    if getattr(flags, "intrinsic_reward_enabled", False):
+        specs["intrinsic_reward"] = dict(size=(t + 1, n, p), dtype=torch.float32)
+        specs["intrinsic_condition"] = dict(size=(t + 1, n, p), dtype=torch.float32)
     act_space = flags.act_space()
     for key, expanded_shape in act_space.get_action_space_expanded_shape().items():
         specs["policy_logits"][key] = dict(size=(t + 1, n, *expanded_shape), dtype=torch.float32)

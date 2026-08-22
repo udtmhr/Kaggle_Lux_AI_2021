@@ -413,6 +413,90 @@ class GameTracker:
         }
 
 
+def stateful_replay_frame(game_state) -> dict:
+    """Serialize the internal Lux state using the official CLI stateful schema."""
+    team_states = {}
+    for player in game_state.players:
+        team_states[str(player.team)] = {
+            "researchPoints": int(player.research_points),
+            "units": {
+                unit.id: {
+                    "cargo": {
+                        "wood": int(unit.cargo.wood),
+                        "coal": int(unit.cargo.coal),
+                        "uranium": int(unit.cargo.uranium),
+                    },
+                    "cooldown": float(unit.cooldown),
+                    "x": int(unit.pos.x),
+                    "y": int(unit.pos.y),
+                    "type": int(unit.type),
+                }
+                for unit in player.units
+            },
+        }
+    board = []
+    for y in range(game_state.map_height):
+        row = []
+        for x in range(game_state.map_width):
+            cell = game_state.map.get_cell(x, y)
+            resource = cell.resource
+            row.append(
+                {
+                    "road": float(cell.road),
+                    "resource": (
+                        None
+                        if resource is None
+                        else {"type": str(resource.type), "amount": int(resource.amount)}
+                    ),
+                }
+            )
+        board.append(row)
+    cities = {}
+    for player in game_state.players:
+        for city_id, city in player.cities.items():
+            cities[city_id] = {
+                "id": city_id,
+                "fuel": float(city.fuel),
+                "lightupkeep": float(city.get_light_upkeep()),
+                "team": int(city.team),
+                "cityCells": [
+                    {
+                        "x": int(tile.pos.x),
+                        "y": int(tile.pos.y),
+                        "cooldown": float(tile.cooldown),
+                    }
+                    for tile in city.citytiles
+                ],
+            }
+    return {
+        "turn": int(game_state.turn),
+        "teamStates": team_states,
+        "map": board,
+        "cities": cities,
+    }
+
+
+def write_internal_stateful_replay(path: Path, spec: MatchSpec, states: Sequence[Mapping], winner: int) -> None:
+    ranks = [
+        {
+            "rank": 1 if winner < 0 or player == winner else 2,
+            "agentID": player,
+        }
+        for player in (0, 1)
+    ]
+    _write_json(
+        path,
+        {
+            "seed": int(spec.seed),
+            "mapType": "random",
+            "width": int(spec.map_size),
+            "height": int(spec.map_size),
+            "stateful": list(states),
+            "results": {"ranks": ranks},
+        },
+    )
+
+
 class InternalMatchEvaluator:
     """Evaluate deterministic policies in the repository's official Dimensions-backed LuxEnv."""
 
@@ -461,9 +545,21 @@ class InternalMatchEvaluator:
             return list(executor.map(evaluate_one, candidate_states))
 
     @torch.inference_mode()
-    def evaluate(self, candidate_state: Mapping[str, torch.Tensor], schedule: Sequence[MatchSpec]) -> list[dict]:
+    def evaluate(
+        self,
+        candidate_state: Mapping[str, torch.Tensor],
+        schedule: Sequence[MatchSpec],
+        replay_dir: Path | None = None,
+    ) -> list[dict]:
         evaluation_started = time.monotonic()
         self.last_profile = defaultdict(float)
+        self.last_profile["candidate_policy_tta_rot180"] = float(
+            self.candidate_action_config.use_rot180
+        )
+        for opponent_name, action_config in self.opponent_action_configs.items():
+            self.last_profile[f"opponent.{opponent_name}.policy_tta_rot180"] = float(
+                action_config.use_rot180
+            )
         records = []
         self.candidate_digest = policy_state_digest(candidate_state)
         self.rng_scheme = INTERNAL_RNG_SCHEME
@@ -471,7 +567,7 @@ class InternalMatchEvaluator:
         for spec in schedule:
             grouped[spec.opponent].append(spec)
         for opponent_name, specs in grouped.items():
-            records.extend(self._evaluate_group(candidate_state, opponent_name, specs))
+            records.extend(self._evaluate_group(candidate_state, opponent_name, specs, replay_dir))
         total = time.monotonic() - evaluation_started
         self.last_profile["evaluation_seconds"] = total
         forward = self.last_profile["candidate_forward_seconds"] + self.last_profile[
@@ -482,7 +578,11 @@ class InternalMatchEvaluator:
         return sorted(records, key=lambda record: record["match_id"])
 
     def _evaluate_group(
-        self, candidate_state: Mapping[str, torch.Tensor], opponent_name: str, specs: Sequence[MatchSpec]
+        self,
+        candidate_state: Mapping[str, torch.Tensor],
+        opponent_name: str,
+        specs: Sequence[MatchSpec],
+        replay_dir: Path | None,
     ) -> list[dict]:
         opponent_flags = self.opponent_flags[opponent_name]
         env_flags = copy.copy(self.candidate_flags)
@@ -531,6 +631,10 @@ class InternalMatchEvaluator:
             opponent.eval()
             output = env.reset(force=True)
             trackers = [GameTracker(spec.candidate_player) for spec in specs]
+            replay_states = [
+                [stateful_replay_frame(env.unwrapped[index].game_state)] if replay_dir is not None else []
+                for index in range(len(specs))
+            ]
             completed = [False] * len(specs)
             records: list[dict] = []
             for index, tracker in enumerate(trackers):
@@ -547,19 +651,44 @@ class InternalMatchEvaluator:
                 )
                 self.last_profile["opponent_forward_seconds"] += time.monotonic() - forward_started
                 action_postprocess_started = time.monotonic()
-                merged = _ranked_actions(candidate_output)
+                candidate_ranked = _ranked_actions(candidate_output)
+                opponent_ranked = _ranked_actions(opponent_output)
+                merged = {entity: actions.clone() for entity, actions in candidate_ranked.items()}
+                candidate_logits_cpu = (
+                    {
+                        entity: logits.detach().cpu()
+                        for entity, logits in candidate_output["policy_logits"].items()
+                    }
+                    if self.candidate_action_config.use_collision_detection
+                    else None
+                )
+                opponent_action_config = self.opponent_action_configs[opponent_name]
+                opponent_logits_cpu = (
+                    {
+                        entity: logits.detach().cpu()
+                        for entity, logits in opponent_output["policy_logits"].items()
+                    }
+                    if opponent_action_config.use_collision_detection
+                    else None
+                )
                 for index, spec in enumerate(specs):
                     players = (
-                        (spec.candidate_player, candidate_output, self.candidate_action_config),
+                        (
+                            spec.candidate_player,
+                            candidate_ranked,
+                            candidate_logits_cpu,
+                            self.candidate_action_config,
+                        ),
                         (
                             1 - spec.candidate_player,
-                            opponent_output,
-                            self.opponent_action_configs[opponent_name],
+                            opponent_ranked,
+                            opponent_logits_cpu,
+                            opponent_action_config,
                         ),
                     )
-                    for player, policy_output, action_config in players:
+                    for player, ranked_output, policy_logits_cpu, action_config in players:
                         if action_config.use_collision_detection:
-                            unresolved = _ranked_actions(policy_output)
+                            unresolved = ranked_output
                             collision_candidates, collision_active = friendly_collision_candidates(
                                 env.unwrapped[index].game_state,
                                 player,
@@ -569,8 +698,8 @@ class InternalMatchEvaluator:
                                 env.unwrapped[index].game_state,
                                 player,
                                 {
-                                    entity: logits[index : index + 1].detach().cpu()
-                                    for entity, logits in policy_output["policy_logits"].items()
+                                    entity: logits[index : index + 1]
+                                    for entity, logits in policy_logits_cpu.items()
                                 },
                                 must_research=action_config.must_research,
                                 can_build_carts=action_config.can_build_carts,
@@ -600,7 +729,7 @@ class InternalMatchEvaluator:
                         else:
                             rankings = {
                                 entity: actions[index : index + 1]
-                                for entity, actions in _ranked_actions(policy_output).items()
+                                for entity, actions in ranked_output.items()
                             }
                         for entity, actions in merged.items():
                             actions[index, :, player] = (
@@ -617,12 +746,13 @@ class InternalMatchEvaluator:
                     if completed[index]:
                         continue
                     tracker.observe(env.unwrapped[index].game_state)
+                    if replay_dir is not None:
+                        replay_states[index].append(stateful_replay_frame(env.unwrapped[index].game_state))
                     if not bool(output["done"][index]):
                         continue
                     rewards = output["reward"][index].detach().cpu().numpy()
                     winner = -1 if rewards[0] == rewards[1] else int(rewards.argmax())
-                    records.append(
-                        {
+                    record = {
                             "match_id": spec.match_id,
                             "opponent": spec.opponent,
                             "seed": spec.seed,
@@ -634,7 +764,16 @@ class InternalMatchEvaluator:
                             "rng_id": internal_match_rng_id(spec),
                             **tracker.summary(),
                         }
-                    )
+                    if replay_dir is not None:
+                        replay_path = replay_dir / f"{spec.match_id}.json"
+                        serialization_started = time.monotonic()
+                        write_internal_stateful_replay(replay_path, spec, replay_states[index], winner)
+                        self.last_profile["replay_serialization_seconds"] += (
+                            time.monotonic() - serialization_started
+                        )
+                        self.last_profile["replay_bytes"] += replay_path.stat().st_size
+                        record["replay"] = replay_path.name
+                    records.append(record)
                     completed[index] = True
                 if any(bool(value) for value in output["done"]):
                     output = env.reset()
